@@ -37,7 +37,7 @@
 
 ## 3. Установить приложение
 
-Образ должен быть опубликован в GHCR и доступен для загрузки. Для первой публикации проверьте результат сборки в [Actions](https://github.com/zhalenik/mail_cloud/actions). До её успешного завершения `ghcr.io/zhalenik/mail_cloud:stable` может отсутствовать; ошибка получения образа в таком случае не связана с настройкой dataset.
+Образ `ghcr.io/zhalenik/mail_cloud:stable` опубликован и доступен без учётных данных registry. Выпуск [v0.4.1](https://github.com/zhalenik/mail_cloud/releases/tag/v0.4.1) прошёл [сборку и проверку перезапуска контейнера](https://github.com/zhalenik/mail_cloud/actions/runs/41363384562). Для установки этого образа токен GitHub не нужен.
 
 1. Откройте [готовый deploy/truenas-compose.yaml](../deploy/truenas-compose.yaml).
 2. Замените оба `source: /mnt/CHANGE_ME/...` на существующие пути NAS.
