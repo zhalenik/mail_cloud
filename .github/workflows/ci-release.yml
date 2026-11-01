@@ -1,0 +1,98 @@
+name: Test and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Pull requests only run the read-only jobs. Publication is restricted to main.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Installed package and release safeguards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Build and install the actual wheel
+        run: |
+          python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/wheels" .
+          python -m pip install "$RUNNER_TEMP"/wheels/*.whl -r requirements-web.txt
+          python -m pip check
+      - name: Verify installed metadata, static assets, and entry points
+        run: |
+          python -I scripts/check_package.py
+          mailru-photos --help
+          mailru-photos-web --help
+      - name: Run the application tests against the installed package
+        run: python -I -m unittest discover -s tests -v
+      - name: Test release immutability and ordering safeguards
+        run: python -m unittest discover -s scripts/tests -v
+
+  container-pr:
+    name: Pull request container smoke test
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tested pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the real Dockerfile
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          version=$(python3 scripts/release.py version)
+          docker build --pull --platform linux/amd64 \
+            --build-arg "VERSION=$version" --build-arg "VCS_REF=$COMMIT_SHA" \
+            --tag mail-cloud:ci .
+      - name: Test default user and mounted state with a non-root user
+        run: python3 scripts/smoke_container.py mail-cloud:ci
+
+  release:
+    name: Publish immutable version and promote stable
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      packages: write
+    # Do not interrupt publication after an image/tag has been created.
+    # The script also checks main HEAD and numeric release versions because
+    # GitHub does not guarantee the order of queued concurrency runs.
+    concurrency:
+      group: ghcr-release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the tested main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate both Compose deployment templates
+        env:
+          STATE_DIRECTORY: /tmp/mail-cloud-state
+          PHOTO_LIBRARY: /tmp/mail-cloud-photos
+          MAILRU_ALLOWED_HOSTS: 192.168.68.106
+        run: |
+          docker compose -f compose.yaml config --quiet
+          docker compose -f deploy/truenas-compose.yaml config --quiet
+      - name: Build, smoke test, publish, and create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py publish

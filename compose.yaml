@@ -1,0 +1,38 @@
+# Regular Docker Compose host: copy .env.example to .env and replace paths.
+# TrueNAS Apps uses deploy/truenas-compose.yaml instead.
+services:
+  mailru-photos:
+    image: "${MAILRU_IMAGE:-ghcr.io/zhalenik/mail_cloud:stable}"
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 120s
+    ports:
+      - "${MAILRU_PORT:-31800}:8787"
+    environment:
+      MAILRU_ALLOWED_HOSTS: "${MAILRU_ALLOWED_HOSTS:?Set MAILRU_ALLOWED_HOSTS in .env}"
+      MAILRU_PUBLIC_ORIGIN: "${MAILRU_PUBLIC_ORIGIN:-}"
+    volumes:
+      - type: bind
+        source: "${STATE_DIRECTORY:?Set STATE_DIRECTORY to an existing local state directory in .env}"
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${PHOTO_LIBRARY:?Set PHOTO_LIBRARY to an existing absolute photo directory in .env}"
+        target: /photos
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

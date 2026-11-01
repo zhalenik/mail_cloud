@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailru-photo-client"
+version = "0.4.1"
+description = "Experimental resumable personal photo import for Mail Cloud unlimited autoupload"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+web = ["waitress==3.0.2"]
+
+[project.scripts]
+mailru-photos = "mailru_photos.cli:main"
+mailru-photos-web = "mailru_photos.web:main"
+
+[tool.setuptools.packages.find]
+include = ["mailru_photos*"]
+
+[tool.setuptools.package-data]
+mailru_photos = ["web_static/*.html", "web_static/*.css", "web_static/*.js"]

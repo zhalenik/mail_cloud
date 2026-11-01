@@ -1,0 +1,510 @@
+"""Offline tests for the UI controller using the real upload/queue state machine."""
+from __future__ import annotations
+
+from dataclasses import asdict
+import json
+import sqlite3
+from pathlib import Path
+import tempfile
+import threading
+import time
+import unittest
+
+from mailru_photos.api import PROTOCOL_VERSION, ProtocolError, cloud_hash
+from mailru_photos.auth import TokenStore, Tokens
+from mailru_photos.cli import write_json
+from mailru_photos.queue import Queue, QueueBusyError
+from mailru_photos.runner import process_job
+from mailru_photos.transport import Cancelled, TransportError
+from mailru_photos.web_service import WebService
+from test_runner import EMAIL, FakeCloud, InstantEvent
+
+
+class EventFactory:
+    cancel_next = None
+    def __call__(self):
+        value = InstantEvent(cancel_on_wait=self.cancel_next)
+        self.cancel_next = None
+        return value
+
+
+class UICloud(FakeCloud):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.block_upload = False
+        self.stop_error = None
+        self.upload_started = threading.Event()
+    def account_info(self):
+        return self.require_account()
+    def _upload_blob(self, path, digest, identity, *, progress=None, is_retried=False):
+        self.upload_started.set()
+        while self.block_upload:
+            if self.stop.is_set() and self.stop_error is not None:
+                raise self.stop_error
+            self._check_stopped()
+            time.sleep(0.002)
+        if progress:
+            progress(identity.size)
+        return super()._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried)
+
+
+class WebServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.photos = self.root / 'photos'
+        self.photos.mkdir()
+        self.state = self.root / 'state'
+        self.state.mkdir()
+        self.cloud = UICloud()
+        self.events = EventFactory()
+        self.services = []
+        TokenStore(self.state / 'auth.dat').save(Tokens('offline-access', 'offline-refresh', EMAIL))
+        self.service = self.make_service()
+        self.service.setup('/Archive')
+        self.service.add_folder(str(self.photos), 'Photos')
+
+    def tearDown(self):
+        for service in self.services:
+            service.close(timeout=2)
+        self.tmp.cleanup()
+
+    def make_service(self, **kwargs):
+        def factory(tokens, *, stop):
+            self.cloud.stop = stop
+            return self.cloud
+        service = WebService(self.state, [self.photos], api_factory=factory,
+                             event_factory=self.events, **kwargs)
+        self.services.append(service)
+        return service
+
+    def photos_count(self, count):
+        for i in range(count):
+            (self.photos / f'{i:03}.jpg').write_bytes(b'offline-image-' + str(i).encode() + b'x' * 64)
+
+    def done(self, service=None):
+        service = service or self.service
+        deadline = time.monotonic() + 5
+        while service._operation is not None and time.monotonic() < deadline:
+            service._thread.join(timeout=0.05)
+        self.assertIsNone(service._operation, 'Background operation did not finish')
+        return service.snapshot()
+
+    def test_start_scans_automatically_probes_and_uploads_all_files(self):
+        self.photos_count(3)
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'completed', state)
+        self.assertEqual(state['stats']['uploaded'], 3)
+        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertEqual(len(self.cloud.commits), 3)
+        self.assertTrue(all(p['unlimited_upload'] is True for p in self.cloud.commits))
+        activity = json.loads((self.state / 'web_activity.json').read_text())
+        self.assertFalse(activity['resume_upload'])
+        self.service.start()
+        self.assertEqual(self.done()['stats']['uploaded'], 3)
+        self.assertEqual(len(self.cloud.commits), 3, 'Repeated start must not upload completed work again')
+
+    def test_container_lifecycle_logs_do_not_echo_private_messages(self):
+        private_message = "test-only-sensitive-value"
+        with self.assertLogs("mailru_photos.service", level="INFO") as captured:
+            self.service._phase("error", private_message, error=private_message)
+        logs = "\n".join(captured.output)
+        self.assertIn("phase=error", logs)
+        self.assertNotIn(private_message, logs)
+
+    def test_quota_change_blocks_mass_upload_and_keeps_confirmed_sample(self):
+        self.photos_count(3)
+        self.cloud.quota_values = [100, 101, 101]
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertEqual(state['probe']['result'], 'quota_changed')
+        self.assertEqual(state['stats']['uploaded'], 1)
+        self.assertEqual(state['stats']['pending'], 2)
+        self.assertEqual(len(self.cloud.commits), 1)
+
+    def test_pause_during_probe_settling_reuses_same_sample_even_if_queue_empty(self):
+        self.photos_count(1)
+        self.events.cancel_next = 1
+        self.service.start()
+        interrupted = self.done()
+        self.assertEqual(interrupted['probe']['result'], 'interrupted')
+        self.assertEqual(interrupted['stats']['uploaded'], 1)
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'completed', state)
+        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertEqual(len(self.cloud.commits), 1)
+        self.assertEqual(len(self.cloud.upload_calls), 1)
+
+    def test_pause_after_positive_add_before_stat_recovers_same_probe(self):
+        self.photos_count(2)
+        self.service.scan()
+        self.done()
+        first_job = self.service.jobs(limit=1)['jobs'][0]
+        path = first_job['remote_path']
+        self.cloud.after_confirmation_stat_failures[path] = Cancelled('Pause after positive add')
+        self.service.start()
+        paused = self.done()
+        self.assertEqual(paused['activity']['phase'], 'paused')
+        self.assertEqual(paused['stats']['pending'], 2)
+        self.assertEqual(len(self.cloud.commits), 1)
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'completed', state)
+        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertEqual(state['stats']['uploaded'], 2)
+        self.assertEqual(len(self.cloud.commits), 2)
+        self.assertEqual(self.cloud.upload_calls.count(first_job['local_path']), 1)
+
+    def test_crash_between_mark_uploaded_and_probe_report_uses_durable_history(self):
+        self.photos_count(1)
+        with Queue(self.state / 'queue.sqlite3', destination='/Archive', account_id=EMAIL) as queue:
+            queue.set_metadata('last_scan', asdict(queue.scan()))
+            started = time.time()
+            job = queue.claim()
+            process_job(queue, self.cloud, job)
+            queue.set_metadata('probe', {
+                'result': 'incomplete', 'protocol': PROTOCOL_VERSION, 'account': EMAIL,
+                'destination': '/Archive', 'started_at': started, 'before': {'used_bytes': 100},
+                'samples': [], 'active_job_id': job.id, 'measurements': [],
+            })
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'completed', state)
+        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertEqual(len(self.cloud.commits), 1)
+
+    def test_old_confirmation_cannot_be_used_as_new_probe_sample(self):
+        self.photos_count(1)
+        with Queue(self.state / 'queue.sqlite3', destination='/Archive', account_id=EMAIL) as queue:
+            queue.set_metadata('last_scan', asdict(queue.scan()))
+            job = queue.claim()
+            digest, identity = cloud_hash(job.local_path)
+            queue.save_commit_intent(job, digest)
+            queue.confirm_unlimited_commit(job, digest)
+            self.cloud.remote[job.remote_path] = {'hash': digest, 'size': identity.size}
+            started = time.time()
+            process_job(queue, self.cloud, job)
+            queue.set_metadata('probe', {
+                'result': 'incomplete', 'protocol': PROTOCOL_VERSION, 'account': EMAIL,
+                'destination': '/Archive', 'started_at': started, 'before': {'used_bytes': 100},
+                'samples': [], 'active_job_id': job.id, 'measurements': [],
+            })
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertNotEqual(state['probe']['result'], 'provisional_pass')
+        self.assertEqual(len(self.cloud.commits), 0)
+
+    def test_manual_pause_preserves_queue_but_does_not_auto_resume_on_restart(self):
+        self.photos_count(1)
+        self.cloud.block_upload = True
+        self.service.start()
+        self.assertTrue(self.cloud.upload_started.wait(2))
+        with self.assertRaises(QueueBusyError):
+            self.service.scan()
+        self.service.pause()
+        self.assertEqual(self.done()['activity']['phase'], 'paused')
+        self.service.close()
+        replacement = self.make_service()
+        self.assertFalse(replacement.resume_if_requested())
+        self.assertEqual(replacement.snapshot()['stats']['pending'], 1)
+        self.assertEqual(len(self.cloud.commits), 0)
+        self.cloud.block_upload = False
+        replacement.start()
+        self.assertEqual(self.done(replacement)['stats']['uploaded'], 1)
+
+    def test_shutdown_retains_active_intention_and_restart_resumes_automatically(self):
+        self.photos_count(2)
+        self.cloud.block_upload = True
+        self.service.start()
+        self.assertTrue(self.cloud.upload_started.wait(2))
+        self.service.close(timeout=2)
+        state = json.loads((self.state / 'web_activity.json').read_text())
+        self.assertTrue(state['resume_upload'])
+        self.cloud.block_upload = False
+        replacement = self.make_service()
+        self.assertTrue(replacement.resume_if_requested())
+        final = self.done(replacement)
+        self.assertEqual(final['activity']['phase'], 'completed', final)
+        self.assertEqual(final['stats']['uploaded'], 2)
+        self.assertEqual(len(self.cloud.commits), 2)
+
+    def test_shutdown_at_success_boundary_does_not_forget_remaining_work(self):
+        self.photos_count(1)
+        self.service.scan()
+        self.done()
+        def shutdown_before_result_is_committed():
+            self.service.close(timeout=0)
+            return "completed", "Result raced with shutdown"
+        self.service._pipeline = shutdown_before_result_is_committed
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'paused')
+        saved = json.loads((self.state / 'web_activity.json').read_text())
+        self.assertTrue(saved['resume_upload'])
+        replacement = self.make_service()
+        self.assertTrue(replacement.resume_if_requested())
+        self.assertEqual(self.done(replacement)['stats']['uploaded'], 1)
+
+    def test_pipeline_holds_token_lock_between_preflight_probe_and_run(self):
+        self.photos_count(2)
+        phases = []
+        original_phase = self.service._phase
+        def phase(name, message, **kwargs):
+            if name in {'probing', 'uploading'}:
+                with Queue(self.state / 'queue.sqlite3', destination='/Archive') as competing_cli:
+                    with self.assertRaises(QueueBusyError):
+                        with competing_cli.exclusive_run():
+                            self.fail('CLI could rotate a cached token between web phases')
+                phases.append(name)
+            original_phase(name, message, **kwargs)
+        self.service._phase = phase
+        self.service.start()
+        self.assertEqual(self.done()['activity']['phase'], 'completed')
+        self.assertEqual(phases, ['probing', 'uploading'])
+
+    def test_shutdown_timeout_in_probe_is_interruption_not_permanent_failure(self):
+        self.photos_count(1)
+        self.cloud.block_upload = True
+        self.cloud.stop_error = TransportError('Offline timeout after stop', category='timeout')
+        self.service.start()
+        self.assertTrue(self.cloud.upload_started.wait(2))
+        self.service.close(timeout=2)
+        state = self.service.snapshot()
+        self.assertEqual(state['activity']['phase'], 'paused')
+        self.assertEqual(state['probe']['result'], 'interrupted')
+        self.assertEqual(state['stats']['pending'], 1)
+        self.assertEqual(state['stats']['permanent_failures'], 0)
+        self.assertTrue(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
+        self.cloud.block_upload = False
+        self.cloud.stop_error = None
+        replacement = self.make_service()
+        self.assertTrue(replacement.resume_if_requested())
+        self.assertEqual(self.done(replacement)['stats']['uploaded'], 1)
+        self.assertEqual(len(self.cloud.commits), 1)
+
+    def test_shutdown_timeout_during_probe_quota_keeps_original_sample(self):
+        self.photos_count(1)
+        reached_quota = threading.Event()
+        original_quota = self.cloud.quota
+        calls = 0
+        def quota():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                reached_quota.set()
+                while not self.cloud.stop.is_set():
+                    time.sleep(0.002)
+                raise TransportError('Offline quota timeout after shutdown', category='timeout')
+            return original_quota()
+        self.cloud.quota = quota
+        self.service.start()
+        self.assertTrue(reached_quota.wait(2))
+        self.service.close(timeout=2)
+        state = self.service.snapshot()
+        self.assertEqual(state['activity']['phase'], 'paused')
+        self.assertEqual(state['probe']['result'], 'interrupted')
+        self.assertEqual(state['stats']['uploaded'], 1)
+        self.assertTrue(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
+        self.cloud.quota = original_quota
+        replacement = self.make_service()
+        self.assertTrue(replacement.resume_if_requested())
+        final = self.done(replacement)
+        self.assertEqual(final['probe']['result'], 'provisional_pass')
+        self.assertEqual(len(self.cloud.commits), 1)
+
+    def test_shutdown_does_not_hide_protocol_failure_as_user_pause(self):
+        self.photos_count(1)
+        self.cloud.block_upload = True
+        self.cloud.stop_error = ProtocolError('Offline server confirmation failure')
+        self.service.start()
+        self.assertTrue(self.cloud.upload_started.wait(2))
+        self.service.close(timeout=2)
+        state = self.service.snapshot()
+        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertEqual(state['stats']['permanent_failures'], 1)
+        self.assertFalse(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
+
+    def test_disabled_auto_resume_keeps_queue_available_for_manual_continue(self):
+        self.service.settings(workers=3, auto_resume=False)
+        self.service.close()
+        write_json(self.state / 'web_activity.json', {'version': 1, 'resume_upload': True, 'phase': 'uploading'})
+        replacement = self.make_service()
+        self.assertFalse(replacement.resume_if_requested())
+        state = replacement.snapshot()
+        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False})
+        self.assertEqual(state['activity']['phase'], 'paused')
+
+    def test_paginated_tasks_never_expose_claims_or_confirmation_blob(self):
+        self.photos_count(4)
+        self.service.scan()
+        self.done()
+        first = self.service.jobs(limit=2)
+        second = self.service.jobs(limit=2, offset=2)
+        self.assertEqual(first['total'], 4)
+        self.assertEqual(len(first['jobs']), 2)
+        self.assertNotEqual(first['jobs'][0]['id'], second['jobs'][0]['id'])
+        self.assertNotIn('claim_token', first['jobs'][0])
+        self.assertNotIn('verified_metadata', first['jobs'][0])
+        with self.assertRaises(ValueError):
+            self.service.jobs(status="uploaded' OR 1=1")
+        with self.assertRaises(ValueError):
+            self.service.jobs(limit=10000)
+
+    def test_folders_are_confined_to_allowed_roots_including_symlink_escape(self):
+        child = self.photos / 'family'
+        child.mkdir()
+        outside = self.root / 'private'
+        outside.mkdir()
+        (self.photos / 'escape').symlink_to(outside, target_is_directory=True)
+        names = [d['name'] for d in self.service.folders(str(self.photos))['directories']]
+        self.assertEqual(names, ['family'])
+        self.assertIsNone(self.service.folders(str(self.photos))['parent'])
+        for path in [str(outside), str(self.photos / 'escape'), str(self.photos / '..')]:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.service.add_folder(path, 'Private')
+        self.assertEqual(self.service.snapshot()['stats']['roots'], 1)
+
+    def test_login_remembers_tokens_and_never_persists_password(self):
+        secret = 'unique-offline-test-password-never-persist'
+        class Auth:
+            def login(self, email, password):
+                if email != EMAIL or password != secret:
+                    raise AssertionError('Wrong fixture credentials')
+                return Tokens('new-offline-access', 'new-offline-refresh', EMAIL)
+        self.service._auth_client_factory = Auth
+        self.service.login(EMAIL, secret)
+        state = self.done()
+        self.assertTrue(state['authenticated'])
+        self.assertEqual(state['account'], EMAIL)
+        for path in self.state.iterdir():
+            if path.is_file():
+                self.assertNotIn(secret.encode(), path.read_bytes(), str(path))
+        serialized = json.dumps(state)
+        self.assertNotIn('new-offline-access', serialized)
+        self.assertNotIn('new-offline-refresh', serialized)
+        self.service.close()
+        replacement = self.make_service()
+        self.assertTrue(replacement.snapshot()['authenticated'])
+
+    def test_multiworker_pause_resume_with_concurrent_dashboard_polling(self):
+        self.photos_count(126)
+        original_upload = self.cloud._upload_blob
+        def slow_upload(path, digest, identity, *, progress=None, is_retried=False):
+            for _ in range(4):
+                self.cloud._check_stopped()
+                time.sleep(0.003)
+            return original_upload(path, digest, identity, progress=progress, is_retried=is_retried)
+        self.cloud._upload_blob = slow_upload
+        polling_stop = threading.Event()
+        polling_errors = []
+        polls = []
+        def poll_dashboard():
+            while not polling_stop.is_set():
+                try:
+                    self.service.snapshot()
+                    self.service.jobs(limit=50)
+                    polls.append(1)
+                except Exception as error:
+                    polling_errors.append(type(error).__name__ + ': ' + str(error))
+                    polling_stop.set()
+                time.sleep(0.001)
+        threads = [threading.Thread(target=poll_dashboard) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.service.start()
+            deadline = time.monotonic() + 10
+            while self.service.snapshot()['stats']['uploaded'] < 3:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.002)
+            self.service.pause()
+            self.service._thread.join(timeout=10)
+            self.assertIsNone(self.service._operation)
+            paused = self.service.snapshot()
+            self.assertEqual(paused['stats']['running'], 0)
+            self.assertGreater(paused['stats']['pending'], 0)
+            self.service.settings(workers=3)
+            self.service.start()
+            self.service._thread.join(timeout=15)
+            self.assertIsNone(self.service._operation)
+        finally:
+            polling_stop.set()
+            for thread in threads:
+                thread.join(timeout=5)
+        state = self.service.snapshot()
+        self.assertFalse(polling_errors, polling_errors)
+        self.assertGreater(len(polls), 5)
+        self.assertEqual(state['activity']['phase'], 'completed', state)
+        self.assertEqual(state['stats']['uploaded'], 126)
+        self.assertEqual(state['stats']['running'], 0)
+        self.assertEqual(state['stats']['failed'], 0)
+        self.assertEqual(len(self.cloud.commits), 126)
+        self.assertEqual(len({item['path'] for item in self.cloud.commits}), 126)
+        self.service.close()
+        with sqlite3.connect(self.state / 'queue.sqlite3') as database:
+            self.assertEqual(database.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
+            self.assertEqual(database.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0], 126)
+            self.assertEqual(database.execute('SELECT COUNT(*) FROM commit_intents').fetchone()[0], 0)
+
+    def test_second_controller_cannot_open_same_state_while_first_is_running(self):
+        with self.assertRaises(QueueBusyError):
+            WebService(self.state, [self.photos])
+
+
+class ScanCancellationTests(unittest.TestCase):
+    def test_nested_run_lock_allows_only_owning_thread_and_connection(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'queue.db'
+            with Queue(path, destination='/Archive') as queue:
+                with queue.exclusive_run():
+                    with queue.exclusive_run():
+                        queue.recover_running()
+                    def another_thread():
+                        with self.assertRaises(QueueBusyError):
+                            with queue.exclusive_run():
+                                pass
+                        with self.assertRaises(QueueBusyError):
+                            queue.recover_running()
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pool.submit(another_thread).result(timeout=2)
+                    with Queue(path, destination='/Archive') as other:
+                        with self.assertRaises(QueueBusyError):
+                            with other.exclusive_run():
+                                pass
+                with Queue(path, destination='/Archive') as other, other.exclusive_run():
+                    pass
+
+    def test_cancelled_scan_never_marks_unseen_files_missing(self):
+        class CountStop:
+            calls = 0
+            def is_set(self):
+                self.calls += 1
+                return self.calls > 8
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'photos'
+            source.mkdir()
+            for i in range(20):
+                (source / f'{i:02}.jpg').write_bytes(b'x' * 50)
+            with Queue(root / 'queue.db', destination='/Archive') as queue:
+                queue.add_root(source, 'Photos')
+                queue.scan()
+                (source / '19.jpg').unlink()
+                result = queue.scan(batch_size=2, stop=CountStop())
+                self.assertTrue(result.cancelled)
+                self.assertFalse(result.complete)
+                self.assertEqual(result.missing, 0)
+                self.assertEqual(queue.stats()['pending'], 20)
+                self.assertFalse(queue.stats()['scan_active'])
+                completed = queue.scan()
+                self.assertTrue(completed.complete)
+                self.assertEqual(completed.missing, 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

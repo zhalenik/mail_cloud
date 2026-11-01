@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!requirements-web.txt
+!mailru_photos/
+!mailru_photos/*.py
+!mailru_photos/web_static/
+!mailru_photos/web_static/*.html
+!mailru_photos/web_static/*.css
+!mailru_photos/web_static/*.js
