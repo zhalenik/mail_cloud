@@ -123,6 +123,9 @@ def smoke(image: str, *, version: str | None = None) -> None:
                     # Preserve both the session cookie and the persisted access
                     # settings across the application's real shutdown/restart.
                     docker("restart", "--time", "15", name)
+                    # An automatically assigned host port can change on restart.
+                    bound = json.loads(docker("inspect", name))[0]["NetworkSettings"]["Ports"]["8787/tcp"][0]
+                    origin = f"http://127.0.0.1:{bound['HostPort']}"
                     deadline = time.monotonic() + 60
                     while True:
                         try:
