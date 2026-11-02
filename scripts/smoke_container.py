@@ -19,6 +19,58 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 import uuid
 
 
+SQLITE_SMOKE = r"""
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import sqlite3
+import tempfile
+import threading
+
+assert sqlite3.sqlite_version == '3.54.1', sqlite3.sqlite_version
+assert sqlite3.threadsafety == 3, sqlite3.threadsafety
+expected_source = '2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76'
+with tempfile.TemporaryDirectory(prefix='sqlite-smoke-', dir='/state') as directory:
+    database = str(Path(directory) / 'check.sqlite3')
+    def connect():
+        connection = sqlite3.connect(database, timeout=30, isolation_level=None)
+        assert connection.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
+        connection.execute('PRAGMA synchronous=FULL')
+        assert connection.execute('PRAGMA synchronous').fetchone()[0] == 2
+        connection.execute('PRAGMA wal_autocheckpoint=1')
+        return connection
+    reader = connect()
+    assert reader.execute('SELECT sqlite_source_id()').fetchone()[0] == expected_source
+    reader.execute('CREATE TABLE checks (id INTEGER PRIMARY KEY, value TEXT NOT NULL)')
+    start = threading.Barrier(5)
+    def writer(worker):
+        connection = connect()
+        try:
+            start.wait(timeout=30)
+            for offset in range(25):
+                row = worker * 25 + offset
+                connection.execute('INSERT INTO checks VALUES (?, ?)', (row, str(row)))
+        finally:
+            connection.close()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(writer, worker) for worker in range(4)]
+        start.wait(timeout=30)
+        while not all(future.done() for future in futures):
+            reader.execute('SELECT COUNT(*) FROM checks').fetchone()
+            reader.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchone()
+            threading.Event().wait(0.01)
+        for future in futures:
+            future.result()
+    assert reader.execute('SELECT COUNT(*), SUM(id) FROM checks').fetchone() == (100, 4950)
+    assert reader.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
+    reader.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+    reader.close()
+    restored = sqlite3.connect(database)
+    assert restored.execute('SELECT COUNT(*) FROM checks').fetchone()[0] == 100
+    restored.close()
+print('Verified loaded SQLite 3.54.1, concurrent WAL writes, FULL durability, and reopened data')
+"""
+
+
 def docker(*args: str) -> str:
     return subprocess.check_output(["docker", *args], text=True).strip()
 
@@ -97,6 +149,7 @@ def smoke(image: str, *, version: str | None = None) -> None:
                 require(process_uid != 0, "The application process is running as root")
                 if mounted:
                     require(process_uid == uid, "Explicit mounted-state UID was not honored")
+                print(docker("exec", name, "python", "-c", SQLITE_SMOKE))
                 for path in ("/", "/static/app.js", "/static/style.css"):
                     page, _ = request(path)
                     require(bool(page), f"Empty static asset: {path}")
@@ -111,7 +164,12 @@ def smoke(image: str, *, version: str | None = None) -> None:
                 password = secrets.token_urlsafe(24)
                 session, _ = request("/api/session/setup", {"password": password}, session["csrf"])
                 require(session["authenticated"] is True, "Panel setup did not establish a session")
-                request("/api/state")
+                initial, _ = request("/api/state")
+                require(initial["authenticated"] is False, "A fresh image must not claim Mail account authorization")
+                require(initial["settings"]["preflight_check"] is True, "Preflight must default to enabled")
+                changed, _ = request("/api/settings", {"workers": 2, "auto_resume": True,
+                                                        "preflight_check": False}, session["csrf"])
+                require(changed["settings"]["preflight_check"] is False, "The preflight setting was not saved")
                 if mounted:
                     saved = docker("exec", name, "python", "-c",
                                    "from pathlib import Path; import json, stat; "
@@ -137,7 +195,9 @@ def smoke(image: str, *, version: str | None = None) -> None:
                             time.sleep(0.5)
                     require(session["authenticated"] is True and session["setup_required"] is False,
                             "Mounted state or panel session did not survive a restart")
-                    request("/api/state")
+                    restored, _ = request("/api/state")
+                    require(restored["settings"]["preflight_check"] is False,
+                            "The preflight setting did not survive a container restart")
                 # Execute the Dockerfile's health command as the configured user,
                 # rather than waiting for the scheduled interval.
                 check = config["Config"]["Healthcheck"]["Test"]

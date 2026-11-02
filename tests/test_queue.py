@@ -59,6 +59,97 @@ class QueueTests(unittest.TestCase):
             self.queue.set_metadata("_account_id", "another-account")
         self.assertEqual(self.queue.account_id, "test-account")
 
+    def test_reopening_initialized_queue_commits_no_changes(self):
+        self.photo()
+        self.queue.scan()
+        version_before = self.queue._db.execute("PRAGMA data_version").fetchone()[0]
+        for account in (None, "test-account"):
+            with self.subTest(account=account), Queue(self.db, destination="/Archive", account_id=account) as other:
+                self.assertEqual(other.stats()["total"], 1)
+                self.assertEqual(other.account_id, "test-account")
+                self.assertEqual(other._db.total_changes, 0)
+                self.assertEqual(other._db.execute("PRAGMA synchronous").fetchone()[0], 2)
+                self.assertEqual(other._db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            self.assertEqual(self.queue._db.execute("PRAGMA data_version").fetchone()[0], version_before)
+
+    def test_reader_can_open_and_validate_queue_while_another_connection_is_writing(self):
+        self.photo()
+        self.queue.scan()
+
+        def read():
+            with Queue(self.db, destination="/Archive", account_id="test-account") as other:
+                return other.stats()["total"]
+
+        def reject_destination():
+            with self.assertRaises(QueueConfigurationError):
+                Queue(self.db, destination="/Other", account_id="test-account")
+
+        def reject_account():
+            with self.assertRaises(QueueConfigurationError):
+                Queue(self.db, destination="/Archive", account_id="other-account")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Release the transaction before waiting for the executor on a
+            # failure, so a regression fails promptly rather than taking 30 s.
+            with self.queue._transaction():
+                self.assertEqual(executor.submit(read).result(timeout=2), 1)
+                executor.submit(reject_destination).result(timeout=2)
+                executor.submit(reject_account).result(timeout=2)
+
+    def test_older_schema_one_queue_installs_missing_objects_once(self):
+        self.photo()
+        self.queue.scan()
+        self.queue._db.execute("DROP INDEX jobs_status")
+        self.queue._db.execute("DROP TABLE commit_intents")
+        with Queue(self.db, destination="/Archive", account_id="test-account") as upgraded:
+            self.assertEqual(upgraded.stats()["pending"], 1)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 1)
+            names = {row[0] for row in upgraded._db.execute("SELECT name FROM sqlite_master")}
+            self.assertIn("jobs_status", names)
+            self.assertIn("commit_intents", names)
+        after_upgrade = self.queue._db.execute("PRAGMA data_version").fetchone()[0]
+        with Queue(self.db, destination="/Archive"):
+            pass
+        self.assertEqual(self.queue._db.execute("PRAGMA data_version").fetchone()[0], after_upgrade)
+
+    def test_account_binding_is_persisted_on_first_open_with_account(self):
+        other_path = self.base / "unbound.sqlite3"
+        with Queue(other_path, destination="/New") as unbound:
+            self.assertIsNone(unbound.account_id)
+        with Queue(other_path, destination="/New", account_id="first-account") as bound:
+            self.assertEqual(bound.account_id, "first-account")
+        with self.assertRaises(QueueConfigurationError):
+            Queue(other_path, destination="/New", account_id="different-account")
+        with Queue(other_path, destination="/New") as reopened:
+            self.assertEqual(reopened.account_id, "first-account")
+
+    def test_unsupported_schema_is_rejected_without_altering_it(self):
+        self.queue._db.execute("PRAGMA user_version=999")
+        with self.assertRaisesRegex(QueueConfigurationError, "Unsupported queue schema"):
+            Queue(self.db, destination="/Archive")
+        self.assertEqual(self.queue._db.execute("PRAGMA user_version").fetchone()[0], 999)
+
+    def test_filtered_pages_and_summary_preserve_order_without_loading_evidence(self):
+        for n in range(6):
+            self.photo(f"{n}.jpg")
+        self.queue.scan()
+        first = self.queue.claim()
+        self.queue.mark_uploaded(first, remote_hash="example", verified_metadata={"proof": "x" * 10000})
+        second = self.queue.claim()
+        self.queue.mark_failed(second, "test failure", retry_delay=None)
+        all_rows = self.queue.list_jobs()
+        uploaded = self.queue.list_jobs("uploaded", summary=True)
+        self.assertEqual([row["id"] for row in uploaded], [first.id])
+        self.assertNotIn("verified_metadata", uploaded[0])
+        self.assertNotIn("remote_hash", uploaded[0])
+        self.assertEqual(uploaded[0]["size"], first.size)
+        self.assertIn("proof", all_rows[0]["verified_metadata"])
+        pending = self.queue.list_jobs("pending", limit=2, offset=1, summary=True)
+        self.assertEqual([row["id"] for row in pending], [row["id"] for row in all_rows[3:5]])
+        self.assertEqual(self.queue.list_jobs("failed", limit=2, offset=1), [])
+        self.assertEqual([row["id"] for row in self.queue.list_jobs(limit=2, offset=2)],
+                         [row["id"] for row in all_rows[2:4]])
+
     def test_root_alias_and_overlap_cannot_overwrite_another_mapping(self):
         nested = self.source / "nested"
         nested.mkdir()

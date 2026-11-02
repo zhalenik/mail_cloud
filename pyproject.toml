@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mailru-photo-client"
-version = "0.4.1"
-description = "Experimental resumable personal photo import for Mail Cloud unlimited autoupload"
+version = "0.4.2"
+description = "Photo uploader for Mail Cloud with a persistent queue and browser interface"
 requires-python = ">=3.11"
 dependencies = []
 

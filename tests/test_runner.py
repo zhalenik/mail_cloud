@@ -186,6 +186,58 @@ class RunnerTests(unittest.TestCase):
             run(self.queue, api, workers=1)
         self.assertEqual(api.commits, [])
 
+    def test_explicitly_skipped_probe_uploads_without_fabricating_probe_evidence(self):
+        self.make_photos(3)
+        api = FakeCloud(stop=InstantEvent())
+        result = run(self.queue, api, workers=2, require_probe=False)
+        self.assertEqual(result["outcome"], "complete")
+        self.assertEqual(result["stats"]["uploaded"], 3)
+        self.assertIsNone(self.queue.get_metadata("probe"))
+        self.assertFalse(self.queue.get_metadata("last_run")["preflight_check"])
+        self.assertEqual(api.stop.waits, [])
+        for job in self.queue.list_jobs():
+            proof = self.queue.upload_history(job["id"])[-1]["verified_metadata"]
+            self.assertIs(proof["is_unlim_upload"], True)
+            self.assertIs(proof["stat_matched"], True)
+        with self.assertRaises(ProbeRequired):
+            run(self.queue, FakeCloud(), workers=1)
+
+    def test_skipping_probe_does_not_accept_missing_unlimited_confirmation(self):
+        self.make_photos(3)
+        api = FakeCloud()
+        request = api._request
+        def unconfirmed(*args, **kwargs):
+            response = request(*args, **kwargs)
+            payload = json.loads(response.body)
+            payload["is_unlim_upload"] = False
+            return Response(200, {}, json.dumps(payload).encode())
+        api._request = unconfirmed
+        result = run(self.queue, api, workers=1, require_probe=False)
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["stats"]["uploaded"], 0)
+        self.assertEqual(result["stats"]["failed"], 1)
+        self.assertEqual(result["stats"]["pending"], 2)
+        self.assertEqual(len(api.commits), 1)
+
+    def test_skipping_probe_keeps_quota_monitoring(self):
+        self.make_photos(5)
+        api = FakeCloud()
+        api.quota_rule = lambda client: 200 if len(client.commits) >= 2 else 100
+        with patch("mailru_photos.runner.QuotaGuard", EagerGuard):
+            result = run(self.queue, api, workers=1, require_probe=False)
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["stats"]["uploaded"], 2)
+        self.assertEqual(result["stats"]["pending"], 3)
+
+    def test_skipping_probe_still_requires_scan_and_explicit_boolean(self):
+        api = FakeCloud()
+        with self.assertRaises(ProbeRequired):
+            run(self.queue, api, require_probe=False)
+        for value in (None, 0, 1, "false"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                run(self.queue, api, require_probe=value)
+        self.assertEqual(api.commits, [])
+
     def test_full_commit_hash_size_and_two_quota_samples_qualify(self):
         self.make_photos(5)
         api = FakeCloud(stop=InstantEvent())

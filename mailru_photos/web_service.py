@@ -45,6 +45,8 @@ class WebService:
         self._event_factory = event_factory
         self._settle_seconds = probe_settle_seconds
         self._lock = threading.RLock()
+        self._stats_lock = threading.Lock()
+        self._stats_cache: tuple[float, dict] | None = None
         self._thread: threading.Thread | None = None
         self._operation: str | None = None
         self._stop = event_factory()
@@ -53,13 +55,15 @@ class WebService:
         self._closed = False
         self._files: dict[int, dict] = {}
         self._uploaded_in_run = 0
-        self._settings = {"workers": 2, "auto_resume": True}
+        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True}
         stored = self._read_json("web_settings.json", {})
         if isinstance(stored, dict):
             if type(stored.get("workers")) is int and 1 <= stored["workers"] <= 16:
                 self._settings["workers"] = stored["workers"]
             if type(stored.get("auto_resume")) is bool:
                 self._settings["auto_resume"] = stored["auto_resume"]
+            if type(stored.get("preflight_check")) is bool:
+                self._settings["preflight_check"] = stored["preflight_check"]
         previous = self._read_json("web_activity.json", {})
         self._resume_upload = isinstance(previous, dict) and previous.get("resume_upload") is True
         self._auto_pending = self._resume_upload and self._settings["auto_resume"]
@@ -117,6 +121,22 @@ class WebService:
         except AuthError:
             return False
 
+    def _display_stats(self, queue: Queue) -> dict:
+        """Share a bounded-lived display summary between dashboard requests.
+
+        Upload decisions always use Queue.stats() directly. Serializing cache
+        refreshes also avoids one full scan per browser tab at the same instant.
+        """
+        with self._stats_lock:
+            if self._stats_cache is None or time.monotonic() - self._stats_cache[0] >= 5:
+                stats = queue.stats()
+                self._stats_cache = (time.monotonic(), stats)
+            return copy.deepcopy(self._stats_cache[1])
+
+    def _invalidate_stats(self) -> None:
+        with self._stats_lock:
+            self._stats_cache = None
+
     def _persist_activity(self) -> None:
         write_json(self.state_dir / "web_activity.json", {
             "version": 1, "resume_upload": self._resume_upload,
@@ -131,6 +151,7 @@ class WebService:
             write_json(self.state_dir / "web_events.json", self._events)
 
     def _phase(self, phase: str, message: str, *, error: str | None = None) -> None:
+        self._invalidate_stats()
         with self._lock:
             # A worker must not overwrite a visible pause request while it drains.
             if self._pause_requested and phase in {"checking", "probing", "uploading", "scanning"}:
@@ -171,6 +192,7 @@ class WebService:
             with Queue(self.state_dir / "queue.sqlite3", destination=destination) as queue, queue.exclusive_run():
                 self._configuration = {"version": 1, "destination": queue.destination}
                 write_json(self.state_dir / "project.json", self._configuration)
+            self._invalidate_stats()
             self._event("Папка назначения сохранена.")
         return {"ok": True}
 
@@ -183,21 +205,29 @@ class WebService:
             with self._queue() as queue, queue.exclusive_run():
                 root = queue.add_root(source, alias)
                 queue.set_metadata("last_scan", {"complete": False, "reason": "source_added"})
+            self._invalidate_stats()
             self._event(f"Добавлена папка: {root.alias}.")
         return {"ok": True, "source": dataclasses.asdict(root)}
 
-    def settings(self, workers: int | None = None, auto_resume: bool | None = None) -> dict:
+    def settings(self, workers: int | None = None, auto_resume: bool | None = None,
+                 preflight_check: bool | None = None) -> dict:
         with self._lock:
             self._ensure_idle()
+            updated = dict(self._settings)
             if workers is not None:
                 if type(workers) is not int or not 1 <= workers <= 16:
                     raise ValueError("Число параллельных загрузок должно быть от 1 до 16.")
-                self._settings["workers"] = workers
+                updated["workers"] = workers
             if auto_resume is not None:
                 if type(auto_resume) is not bool:
                     raise ValueError("Автоматическое продолжение должно быть включено или выключено.")
-                self._settings["auto_resume"] = auto_resume
-            write_json(self.state_dir / "web_settings.json", self._settings)
+                updated["auto_resume"] = auto_resume
+            if preflight_check is not None:
+                if type(preflight_check) is not bool:
+                    raise ValueError("Предварительная проверка должна быть включена или выключена.")
+                updated["preflight_check"] = preflight_check
+            write_json(self.state_dir / "web_settings.json", updated)
+            self._settings = updated
             return {"ok": True, "settings": dict(self._settings)}
 
     def folders(self, path: str | None = None) -> dict:
@@ -235,8 +265,8 @@ class WebService:
         fields = {"id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
                   "last_error", "skip_reason", "next_attempt", "uploaded_at"}
         with self._queue() as queue:
-            rows = queue.list_jobs(status, limit=limit, offset=offset)
-            stats = queue.stats()
+            rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True)
+            stats = self._display_stats(queue)
         return {"jobs": [{k: v for k, v in row.items() if k in fields} for row in rows],
                 "total": stats[status] if status else stats["total"], "offset": offset, "limit": limit}
 
@@ -254,7 +284,7 @@ class WebService:
             with self._queue() as queue:
                 report = queue.get_metadata("probe", {})
                 result.update(destination=queue.destination, account=queue.account_id,
-                              sources=[dataclasses.asdict(r) for r in queue.roots()], stats=queue.stats(),
+                              sources=[dataclasses.asdict(r) for r in queue.roots()], stats=self._display_stats(queue),
                               last_scan=queue.get_metadata("last_scan"))
                 if isinstance(report, dict) and report:
                     result["probe"] = {k: report[k] for k in ("result", "started_at", "finished_at", "explanation", "error") if k in report}
@@ -273,6 +303,7 @@ class WebService:
             self._operation = name
             self._files.clear()
             self._uploaded_in_run = 0
+            self._invalidate_stats()
             self._resume_upload = upload_intent
             self._auto_pending = False
             self._activity.update(phase=name if name in {"login", "scanning"} else "checking",
@@ -319,6 +350,7 @@ class WebService:
                 self._phase("error", safe, error=safe)
         finally:
             with self._lock:
+                self._invalidate_stats()
                 self._files.clear()
                 self._activity["probe_wait_until"] = None
                 self._operation = None
@@ -410,7 +442,11 @@ class WebService:
 
     def _emit(self, event: str, data: dict) -> None:
         with self._lock:
-            if event == "file_started":
+            if event == "progress":
+                # The runner already computed this summary for CLI progress.
+                with self._stats_lock:
+                    self._stats_cache = (time.monotonic(), copy.deepcopy(data))
+            elif event == "file_started":
                 self._files[data["job_id"]] = {"id": data["job_id"], "path": data["path"], "size": data["size"], "sent": 0, "stage": "preparing"}
             elif event == "upload_progress":
                 item = self._files.get(data["job_id"])
@@ -582,7 +618,8 @@ class WebService:
             stats = queue.stats()
             remaining = stats["pending"] + stats["running"] + stats["failed"] - stats["permanent_failures"]
             old_probe = queue.get_metadata("probe", {})
-            resume_control = self._can_resume_probe(old_probe, queue.account_id, queue.destination)
+            preflight_check = self._settings["preflight_check"]
+            resume_control = preflight_check and self._can_resume_probe(old_probe, queue.account_id, queue.destination)
             if not remaining and not resume_control:
                 if stats["failed"]:
                     return "error", "Есть файлы с ошибками. Исправьте причину и нажмите «Повторить ошибки»."
@@ -594,16 +631,17 @@ class WebService:
                     account = api.require_account(queue.account_id)
                     queue.bind_account(account.email)
                     report = queue.get_metadata("probe", {})
-                    valid = self._valid_probe(report, account.email, queue.destination)
+                    valid = preflight_check and self._valid_probe(report, account.email, queue.destination)
                     if valid:
                         valid = api.quota()["used_bytes"] == report["before"]["used_bytes"]
-                if not valid:
+                if preflight_check and not valid:
                     self._phase("probing", "Проверяем безлимит на одном файле перед загрузкой архива…")
                     if self._can_resume_probe(report, account.email, queue.destination):
                         report = self._resume_probe(queue, api, report)
                     else:
-                        retry_at = queue.stats().get("next_retry_at")
-                        if queue.stats()["ready"] == 0 and retry_at is not None:
+                        stats = queue.stats()
+                        retry_at = stats.get("next_retry_at")
+                        if stats["ready"] == 0 and retry_at is not None:
                             self._phase("probing", "Ожидаем повторной попытки после временного сбоя…")
                             if api.stop.wait(max(0, retry_at - time.time())):
                                 raise Cancelled("Приостановлено.")
@@ -613,7 +651,8 @@ class WebService:
                         raise ProbeRequired("Квота изменилась во время проверки. Загрузка приостановлена; повторите запуск при стабильной квоте.")
                 self._check_stop()
                 self._phase("uploading", "Загружаем фотографии в безлимит…")
-                result = run(queue, api, workers=self._settings["workers"], emit=self._emit, file_progress=True)
+                result = run(queue, api, workers=self._settings["workers"], emit=self._emit,
+                             file_progress=True, require_probe=preflight_check)
                 if self._pause_requested or self._shutting_down:
                     raise Cancelled("Приостановлено.")
                 if result.get("stopped"):
@@ -651,6 +690,7 @@ class WebService:
             self._ensure_idle()
             with self._queue() as queue, queue.exclusive_run():
                 count = queue.retry_failed(include_permanent=include_permanent)
+            self._invalidate_stats()
             self._event(f"Возвращено в очередь: {count:,}.")
             return {"ok": True, "queued_again": count}
 

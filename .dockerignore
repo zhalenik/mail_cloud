@@ -1,6 +1,8 @@
 **
 !Dockerfile
 !requirements-web.txt
+!scripts/
+!scripts/build_sqlite.py
 !mailru_photos/
 !mailru_photos/*.py
 !mailru_photos/web_static/

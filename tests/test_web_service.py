@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from mailru_photos.api import PROTOCOL_VERSION, ProtocolError, cloud_hash
 from mailru_photos.auth import TokenStore, Tokens
@@ -104,6 +105,62 @@ class WebServiceTests(unittest.TestCase):
         self.service.start()
         self.assertEqual(self.done()['stats']['uploaded'], 3)
         self.assertEqual(len(self.cloud.commits), 3, 'Repeated start must not upload completed work again')
+
+    def test_disabled_preflight_is_persisted_and_skips_control_upload_wait(self):
+        self.photos_count(3)
+        self.service.settings(preflight_check=False)
+        self.service.close()
+        replacement = self.make_service()
+        self.assertFalse(replacement.snapshot()['settings']['preflight_check'])
+        with patch('mailru_photos.web_service.probe', side_effect=AssertionError('Probe must be skipped')):
+            replacement.start()
+            state = self.done(replacement)
+        self.assertEqual(state['activity']['phase'], 'completed', state)
+        self.assertEqual(state['stats']['uploaded'], 3)
+        self.assertIsNone(state['probe'])
+        self.assertEqual(self.cloud.stop.waits, [])
+        self.assertTrue(all(item['unlimited_upload'] is True for item in self.cloud.commits))
+
+    def test_disabling_preflight_can_continue_after_interrupted_settling(self):
+        self.photos_count(3)
+        self.events.cancel_next = 1
+        self.service.start()
+        self.assertEqual(self.done()['probe']['result'], 'interrupted')
+        self.service.settings(preflight_check=False)
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'completed', state)
+        self.assertEqual(state['stats']['uploaded'], 3)
+        self.assertEqual(len(self.cloud.commits), 3)
+        self.assertEqual(self.cloud.stop.waits, [])
+
+    def test_reenabled_preflight_runs_for_new_files_after_skipping_it(self):
+        self.photos_count(1)
+        self.service.settings(preflight_check=False)
+        self.service.start()
+        self.assertEqual(self.done()['stats']['uploaded'], 1)
+        (self.photos / '001.jpg').write_bytes(b'new-offline-photo-' + b'x' * 64)
+        self.service.scan()
+        self.done()
+        self.service.settings(preflight_check=True)
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertEqual(state['stats']['uploaded'], 2)
+        self.assertEqual(len(self.cloud.commits), 2)
+        self.assertEqual(self.cloud.stop.waits, [30, 30])
+
+    def test_old_settings_keep_preflight_enabled_and_invalid_update_is_atomic(self):
+        before = self.service.snapshot()['settings']
+        self.assertTrue(before['preflight_check'])
+        with self.assertRaises(ValueError):
+            self.service.settings(workers=4, preflight_check='false')
+        self.assertEqual(self.service.snapshot()['settings'], before)
+        self.service.close()
+        write_json(self.state / 'web_settings.json', {'workers': 3, 'auto_resume': False})
+        replacement = self.make_service()
+        self.assertEqual(replacement.snapshot()['settings'],
+                         {'workers': 3, 'auto_resume': False, 'preflight_check': True})
 
     def test_container_lifecycle_logs_do_not_echo_private_messages(self):
         private_message = "test-only-sensitive-value"
@@ -335,8 +392,42 @@ class WebServiceTests(unittest.TestCase):
         replacement = self.make_service()
         self.assertFalse(replacement.resume_if_requested())
         state = replacement.snapshot()
-        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False})
+        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'preflight_check': True})
         self.assertEqual(state['activity']['phase'], 'paused')
+
+    def test_dashboard_and_jobs_share_stats_until_expiry_without_sharing_mutable_data(self):
+        self.photos_count(4)
+        self.service.scan()
+        self.done()
+        self.service._invalidate_stats()
+        original = Queue.stats
+        with patch.object(Queue, 'stats', autospec=True, side_effect=original) as stats:
+            with patch('mailru_photos.web_service.time.monotonic', return_value=100):
+                state = self.service.snapshot()
+                state['stats']['total'] = -1
+                state['stats']['bytes_by_status']['pending'] = -1
+                self.assertEqual(self.service.jobs(limit=2)['total'], 4)
+                fresh = self.service.snapshot()['stats']
+                self.assertEqual(fresh['total'], 4)
+                self.assertGreater(fresh['bytes_by_status']['pending'], 0)
+                self.assertEqual(stats.call_count, 1)
+            with patch('mailru_photos.web_service.time.monotonic', return_value=106):
+                self.service.snapshot()
+                self.assertEqual(stats.call_count, 2)
+
+    def test_stats_refresh_after_scan_and_retry_controls(self):
+        self.assertEqual(self.service.snapshot()['stats']['total'], 0)
+        self.photos_count(2)
+        self.service.scan()
+        self.assertEqual(self.done()['stats']['total'], 2)
+        with self.service._queue() as queue:
+            job = queue.claim()
+            queue.mark_failed(job, 'offline fixture', retry_delay=None)
+        self.service._invalidate_stats()
+        self.assertEqual(self.service.snapshot()['stats']['failed'], 1)
+        self.service.retry_failed(include_permanent=True)
+        self.assertEqual(self.service.snapshot()['stats']['pending'], 2)
+        self.assertEqual(self.service.snapshot()['stats']['failed'], 0)
 
     def test_paginated_tasks_never_expose_claims_or_confirmation_blob(self):
         self.photos_count(4)
@@ -418,7 +509,9 @@ class WebServiceTests(unittest.TestCase):
         try:
             self.service.start()
             deadline = time.monotonic() + 10
-            while self.service.snapshot()['stats']['uploaded'] < 3:
+            # Display totals may be cached; synchronize with simulated commits
+            # to pause during real work rather than waiting for a UI refresh.
+            while len(self.cloud.commits) < 3:
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(0.002)
             self.service.pause()

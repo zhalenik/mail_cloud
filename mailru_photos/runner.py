@@ -190,9 +190,12 @@ class QuotaGuard:
 
 
 def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
-        emit: Callable[[str, dict], None] | None = None, file_progress: bool = False) -> dict[str, Any]:
+        emit: Callable[[str, dict], None] | None = None, file_progress: bool = False,
+        require_probe: bool = True) -> dict[str, Any]:
     if not 1 <= workers <= 16 or not 1 <= max_attempts <= 20:
         raise ValueError("workers must be 1..16, max_attempts 1..20")
+    if type(require_probe) is not bool:
+        raise ValueError("require_probe must be a boolean")
     emit = emit or (lambda event, data: None)
     started = time.time()
     errors: list[str] = []
@@ -216,18 +219,22 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
         account = api.require_account(queue.account_id)
         queue.bind_account(account.email)
         evidence = queue.get_metadata("probe", {})
-        finished_at = evidence.get("finished_at") if isinstance(evidence, dict) else None
-        valid_timestamp = (isinstance(finished_at, (int, float)) and not isinstance(finished_at, bool)
-                           and math.isfinite(finished_at) and 0 <= time.time() - finished_at <= 86400)
-        if (not isinstance(evidence, dict) or evidence.get("result") != "provisional_pass"
-                or evidence.get("protocol") != PROTOCOL_VERSION or evidence.get("account") != account.email
-                or evidence.get("destination") != queue.destination
-                or not valid_timestamp or not isinstance(evidence.get("before"), dict)
-                or not isinstance(evidence["before"].get("used_bytes"), int)
-                or isinstance(evidence["before"].get("used_bytes"), bool)):
-            raise ProbeRequired("Сначала выполните probe: требуется успешная предварительная проверка в этом аккаунте за последние 24 часа.")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        if require_probe:
+            finished_at = evidence.get("finished_at")
+            valid_timestamp = (isinstance(finished_at, (int, float)) and not isinstance(finished_at, bool)
+                               and math.isfinite(finished_at) and 0 <= time.time() - finished_at <= 86400)
+            if (evidence.get("result") != "provisional_pass"
+                    or evidence.get("protocol") != PROTOCOL_VERSION or evidence.get("account") != account.email
+                    or evidence.get("destination") != queue.destination
+                    or not valid_timestamp or not isinstance(evidence.get("before"), dict)
+                    or not isinstance(evidence["before"].get("used_bytes"), int)
+                    or isinstance(evidence["before"].get("used_bytes"), bool)):
+                raise ProbeRequired("Сначала выполните probe: требуется успешная предварительная проверка в этом аккаунте за последние 24 часа.")
+        # Skipping the settling probe does not disable per-file confirmation or
+        # quota monitoring. Use a fresh baseline without inventing probe proof.
         baseline = api.quota()["used_bytes"]
-        if baseline != evidence["before"]["used_bytes"]:
+        if require_probe and baseline != evidence["before"]["used_bytes"]:
             raise ProbeRequired("После probe квота изменилась. Нужна новая проверка перед массовой загрузкой.")
         guard = QuotaGuard(api, account.email, baseline)
 
@@ -332,7 +339,8 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                    "finished_with_skips" if final_stats["skipped"] else "complete")
         result = {"started_at": started, "finished_at": time.time(), "stopped": api.stop.is_set(),
                   "outcome": outcome, "errors": errors, "stats": final_stats, "baseline_cloud_bytes": baseline,
-                  "last_quota": guard.last_quota, "protocol": PROTOCOL_VERSION}
+                  "last_quota": guard.last_quota, "protocol": PROTOCOL_VERSION,
+                  "preflight_check": require_probe}
         queue.set_metadata("last_run", result)
         if needs_recheck:
             invalid = dict(evidence)

@@ -309,6 +309,7 @@ The image was checked with its default non-root user and with mounted state, an
 explicit non-root UID/GID, a read-only root filesystem, and a restart.
 
 See the [deployment instructions]({docker.source}/blob/{tag}/README.md).
+Changes in this version are listed in the [changelog]({docker.source}/blob/{tag}/CHANGELOG.md).
 For an exact, repeatable deployment, use the version tag or content digest above.
 GHCR package visibility is configured separately from repository visibility;
 the workflow summary reports whether anonymous pulls are available.

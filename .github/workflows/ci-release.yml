@@ -88,7 +88,7 @@ jobs:
         env:
           STATE_DIRECTORY: /tmp/mail-cloud-state
           PHOTO_LIBRARY: /tmp/mail-cloud-photos
-          MAILRU_ALLOWED_HOSTS: 192.168.68.106
+          MAILRU_ALLOWED_HOSTS: localhost
         run: |
           docker compose -f compose.yaml config --quiet
           docker compose -f deploy/truenas-compose.yaml config --quiet

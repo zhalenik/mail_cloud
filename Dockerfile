@@ -1,6 +1,16 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-trixie AS sqlite-build
 
-ARG VERSION=0.4.1
+# Debian's SQLite package can lag the WAL-reset fix. Build a verified upstream
+# release separately, so the runtime contains neither a compiler nor sources.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/build_sqlite.py /build/build_sqlite.py
+RUN python /build/build_sqlite.py /build/libsqlite3.so.0
+
+FROM python:3.12-slim-trixie
+
+ARG VERSION=0.4.2
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Mail Cloud Photo Client" \
       org.opencontainers.image.description="Resumable photo import with a browser interface" \
@@ -13,6 +23,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
+
+COPY --from=sqlite-build /build/libsqlite3.so.0 /usr/local/lib/libsqlite3.so.0
+# Check the library Python actually loaded, not the version in dpkg metadata.
+RUN ldconfig \
+    && python -c "import sqlite3; assert sqlite3.sqlite_version == '3.54.1', sqlite3.sqlite_version; assert sqlite3.threadsafety == 3"
 
 COPY requirements-web.txt /app/requirements-web.txt
 RUN pip install --no-cache-dir -r /app/requirements-web.txt \

@@ -104,21 +104,38 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request("/api/start", method="POST")["status"], 200)
         self.assertEqual(self.service.calls, [("start",)])
 
+    def test_settings_accept_explicit_preflight_boolean_and_preserve_omitted_value(self):
+        self.authenticate()
+        for enabled in (False, True):
+            response = self.request('/api/settings', method='POST', data={
+                'workers': 2, 'auto_resume': True, 'preflight_check': enabled})
+            self.assertEqual(response['status'], 200)
+            self.assertIs(self.service.calls[-1][1]['preflight_check'], enabled)
+        response = self.request('/api/settings', method='POST', data={'workers': 2, 'auto_resume': True})
+        self.assertEqual(response['status'], 200)
+        self.assertIsNone(self.service.calls[-1][1]['preflight_check'])
+        calls = len(self.service.calls)
+        for value in (None, 0, 1, 'false'):
+            response = self.request('/api/settings', method='POST', data={
+                'workers': 2, 'auto_resume': True, 'preflight_check': value})
+            self.assertEqual(response['status'], 400)
+        self.assertEqual(len(self.service.calls), calls)
+
     def test_dns_rebinding_host_is_rejected_even_for_session(self):
         for host in ("attacker.invalid:8787", "localhost@attacker.invalid", "localhost/evil", "localhost:bad"):
             self.assertEqual(self.request("/api/session", host=host)["status"], 403)
         self.assertEqual(self.request("/healthz")["status"], 200)
 
     def test_lan_published_port_uses_host_origin_without_public_origin_override(self):
-        self.app = WebApplication(self.service, self.path, allowed_hosts=["192.168.68.106"])
-        target = {"host": "192.168.68.106:31800", "origin": "http://192.168.68.106:31800"}
+        self.app = WebApplication(self.service, self.path, allowed_hosts=["192.0.2.10"])
+        target = {"host": "192.0.2.10:31800", "origin": "http://192.0.2.10:31800"}
         self.assertEqual(self.request("/api/session", **target)["status"], 200)
         self.assertEqual(self.request("/api/session/setup", method="POST",
                                      data={"password": "panel-test-only-password"}, **target)["status"], 200)
         self.assertEqual(self.request("/api/start", method="POST", **target)["status"], 200)
         self.assertEqual(self.service.calls, [("start",)])
         self.assertEqual(self.request("/api/start", method="POST", **{
-            **target, "origin": "http://192.168.68.106:8787"})["status"], 403)
+            **target, "origin": "http://192.0.2.10:8787"})["status"], 403)
         self.assertEqual(self.request("/api/session", host="unapproved.invalid:31800")["status"], 403)
 
     def test_tampered_cookie_does_not_authorize(self):

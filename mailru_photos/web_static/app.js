@@ -137,6 +137,8 @@
     setHidden("loading-screen", true);
     setHidden("app", true);
     setHidden("access-screen", false);
+    snapshot = null;
+    renderConnectivity();
     session.setup_required = Boolean(setup);
     setText("access-title", setup ? "Защитите свою панель" : "Вход в панель");
     setText("access-description", setup ? "Придумайте пароль для управления фотоархивом. Он понадобится при открытии панели в новом браузере." : "Введите пароль этой панели, чтобы управлять загрузкой.");
@@ -164,10 +166,29 @@
     return true;
   }
 
+  function renderConnectivity() {
+    let label = "Проверяем состояние…", status = "neutral", hint = "";
+    if (!connected) {
+      label = "Нет связи с сервером"; status = "offline";
+    } else if (!session.authenticated) {
+      label = "Войдите в панель";
+    } else if (snapshot && snapshot.activity && snapshot.activity.phase === "login") {
+      label = "Вход в Mail.ru…"; status = "checking";
+    } else if (snapshot && snapshot.authenticated === true) {
+      label = "Mail.ru подключён"; status = "";
+      hint = "Сессия Mail.ru сохранена. Доступ к Облаку проверяется при загрузке.";
+    } else if (snapshot) {
+      label = "Mail.ru не подключён";
+    }
+    const indicator = $("connection-status");
+    indicator.className = "connection-status" + (status ? " " + status : "");
+    indicator.lastElementChild.textContent = label;
+    indicator.title = hint;
+  }
+
   function setConnectivity(ok, message = "") {
     connected = ok;
-    $("connection-status").className = "connection-status" + (ok ? "" : " offline");
-    $("connection-status").lastElementChild.textContent = ok ? "Подключено" : "Нет связи";
+    renderConnectivity();
     setHidden("connection-banner", ok);
     if (!ok) setText("connection-message", message || "Нет связи с клиентом. Последнее полученное состояние сохранено на экране.");
     if (snapshot) updateControls();
@@ -228,10 +249,12 @@
     $("save-settings").disabled = busy || transient || !connected;
     $("workers").disabled = busy || transient;
     $("auto-resume").disabled = busy || transient;
+    $("preflight-check").disabled = busy || transient;
   }
 
   function renderState() {
     const state = snapshot || {};
+    renderConnectivity();
     const stats = state.stats || {};
     const sources = Array.isArray(state.sources) ? state.sources : [];
     const activity = state.activity || {};
@@ -390,8 +413,9 @@
     setText("settings-login", state.authenticated ? "Войти заново" : "Войти");
     setText("settings-destination", plain(state.destination, "Ещё не выбрана"));
     if (!settingsDirty && !pendingActions.has("settings")) {
-      $("workers").value = String(finite(state.settings && state.settings.workers, 4));
+      $("workers").value = String(finite(state.settings && state.settings.workers, 2));
       $("auto-resume").checked = !state.settings || state.settings.auto_resume !== false;
+      $("preflight-check").checked = !state.settings || state.settings.preflight_check !== false;
     }
   }
 
@@ -618,12 +642,12 @@
     try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задания возвращены в очередь." }); }
     finally { $("retry-submit").disabled = false; }
   });
-  ["workers", "auto-resume"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
+  ["workers", "auto-resume", "preflight-check"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
   $("settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const workers = Number($("workers").value);
     if (!Number.isInteger(workers) || workers < 1 || workers > 16) { setError("settings-error", "Укажите целое число потоков от 1 до 16."); return; }
-    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
+    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
     if (success) { settingsDirty = false; if (snapshot) renderSettings(snapshot); }
   });
 

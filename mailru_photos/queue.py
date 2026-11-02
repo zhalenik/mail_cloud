@@ -30,6 +30,17 @@ import uuid
 PHOTO_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif"})
 STATES = ("pending", "running", "uploaded", "failed", "skipped")
 SCHEMA_VERSION = 1
+_SCHEMA_OBJECTS = frozenset({
+    ("table", "metadata"), ("table", "roots"), ("table", "scans"),
+    ("table", "jobs"), ("table", "upload_results"), ("table", "commit_intents"),
+    ("index", "jobs_ready"), ("index", "jobs_pending"),
+    ("index", "jobs_root_scan"), ("index", "jobs_status"),
+    ("index", "upload_results_job"),
+})
+_JOB_SUMMARY_COLUMNS = (
+    "id,relative_path,local_path,remote_path,status,size,attempts,"
+    "last_error,skip_reason,next_attempt,uploaded_at"
+)
 
 
 class QueueError(RuntimeError):
@@ -193,13 +204,14 @@ class Queue:
         self._closed = False
         self._db = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA busy_timeout=30000")
-        self._db.execute("PRAGMA journal_mode=WAL")
-        # A committed intent must survive an OS/power failure before the
-        # network commit is attempted.  NORMAL is insufficient for that promise.
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute("PRAGMA foreign_keys=ON")
         try:
+            self._db.execute("PRAGMA busy_timeout=30000")
+            if self._db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                self._db.execute("PRAGMA journal_mode=WAL")
+            # A committed intent must survive an OS/power failure before the
+            # network commit is attempted. NORMAL is insufficient for that promise.
+            self._db.execute("PRAGMA synchronous=FULL")
+            self._db.execute("PRAGMA foreign_keys=ON")
             self._initialize(account_id)
         except BaseException:
             self._db.close()
@@ -209,7 +221,21 @@ class Queue:
         schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if schema_version not in (0, SCHEMA_VERSION):
             raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
-        self._db.executescript("""
+        objects = {(row["type"], row["name"]) for row in self._db.execute(
+            "SELECT type,name FROM sqlite_master WHERE type IN ('table','index')"
+        )}
+        has_schema = _SCHEMA_OBJECTS.issubset(objects)
+        if ("table", "metadata") in objects:
+            existing = self._get_meta("_destination")
+            self._check_destination(existing)
+            needs_account = account_id is not None and self._account_needs_binding(account_id)
+            # Browser reads and worker connections must not take the writer lock
+            # or checkpoint new metadata on every open. Older schema-1 queues
+            # still get missing tables/indexes installed once below.
+            if has_schema and schema_version == SCHEMA_VERSION and existing is not None and not needs_account:
+                return
+        if not has_schema:
+            self._db.executescript("""
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
@@ -238,6 +264,7 @@ class Queue:
             CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status, present, next_attempt, id);
             CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status='pending' AND present=1;
             CREATE INDEX IF NOT EXISTS jobs_root_scan ON jobs(root_id, seen_scan);
+            CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, id);
             CREATE TABLE IF NOT EXISTS upload_results (
                 id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
                 source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
@@ -252,18 +279,23 @@ class Queue:
                 remote_path TEXT NOT NULL, cloud_hash TEXT NOT NULL,
                 created_at REAL NOT NULL, intent_json TEXT NOT NULL
             );
-        """)
+            """)
         with self._transaction():
             existing = self._get_meta("_destination")
-            if existing is not None and existing != self.destination:
-                raise QueueConfigurationError(
-                    f"This database belongs to cloud destination {existing!r}, not {self.destination!r}. "
-                    "Use a separate database for another destination."
-                )
-            self._put_meta("_destination", self.destination)
-            self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._check_destination(existing)
+            if existing is None:
+                self._put_meta("_destination", self.destination)
+            if schema_version != SCHEMA_VERSION:
+                self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             if account_id is not None:
                 self._bind_account(account_id)
+
+    def _check_destination(self, existing: str | None) -> None:
+        if existing is not None and existing != self.destination:
+            raise QueueConfigurationError(
+                f"This database belongs to cloud destination {existing!r}, not {self.destination!r}. "
+                "Use a separate database for another destination."
+            )
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -347,13 +379,17 @@ class Queue:
     def account_id(self) -> str | None:
         return self.get_metadata("_account_id")
 
-    def _bind_account(self, account_id: str) -> None:
+    def _account_needs_binding(self, account_id: str) -> bool:
         if not isinstance(account_id, str) or not account_id.strip():
             raise QueueConfigurationError("A stable, nonempty account identifier is required.")
         existing = self._get_meta("_account_id")
         if existing is not None and existing != account_id:
             raise QueueConfigurationError("This queue is bound to a different account; use a separate database.")
-        self._put_meta("_account_id", account_id)
+        return existing is None
+
+    def _bind_account(self, account_id: str) -> None:
+        if self._account_needs_binding(account_id):
+            self._put_meta("_account_id", account_id)
 
     def bind_account(self, account_id: str) -> None:
         """Call with the authenticated account's stable ID before any network write."""
@@ -876,15 +912,21 @@ class Queue:
                 "roots": self._db.execute("SELECT COUNT(*) FROM roots").fetchone()[0],
             }
 
-    def list_jobs(self, status: str | None = None, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+    def list_jobs(self, status: str | None = None, *, limit: int = 100, offset: int = 0,
+                  summary: bool = False) -> list[dict[str, Any]]:
         if status is not None and status not in STATES:
             raise ValueError(f"Unknown status: {status}")
         if not 1 <= limit <= 10000 or offset < 0:
             raise ValueError("limit must be in 1..10000 and offset nonnegative")
+        # A fixed projection keeps persisted verification evidence out of UI
+        # polling. The default retains the complete records used by the CLI.
+        columns = _JOB_SUMMARY_COLUMNS if summary else "*"
+        where = " WHERE status=?" if status is not None else ""
+        parameters = (status, limit, offset) if status is not None else (limit, offset)
         with self._mutex:
             return [dict(row) for row in self._db.execute(
-                "SELECT * FROM jobs WHERE (? IS NULL OR status=?) ORDER BY id LIMIT ? OFFSET ?",
-                (status, status, limit, offset),
+                f"SELECT {columns} FROM jobs{where} ORDER BY id LIMIT ? OFFSET ?",
+                parameters,
             )]
 
     def upload_history(self, job_id: int) -> list[dict[str, Any]]:

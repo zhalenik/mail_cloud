@@ -1,11 +1,10 @@
 # TrueNAS with Docker Apps (24.10 or later).
 # Replace /mnt/CHANGE_ME/... with existing datasets before installing.
-# Change the LAN IP below if your NAS uses another address.
-# The GHCR image must have been published before TrueNAS can pull it.
+# 192.168.1.10 is an example: replace it with your NAS address.
 services:
   mailru-photos:
     image: ghcr.io/zhalenik/mail_cloud:stable
-    # Pin a release when needed: ghcr.io/zhalenik/mail_cloud:v0.4.1
+    # Pin a release when needed: ghcr.io/zhalenik/mail_cloud:v0.4.2
     user: "1000:1000"
     init: true
     restart: unless-stopped
@@ -13,7 +12,7 @@ services:
     ports:
       - "31800:8787"
     environment:
-      MAILRU_ALLOWED_HOSTS: "192.168.68.106"
+      MAILRU_ALLOWED_HOSTS: "192.168.1.10"
     volumes:
       - type: bind
         source: /mnt/CHANGE_ME/appdata/mail_cloud
