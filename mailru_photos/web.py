@@ -329,6 +329,8 @@ class WebApplication:
             self.service.setup(_text(data, "destination"))
         elif path == "/api/login":
             self.service.login(_text(data, "email", limit=320), _text(data, "password", limit=1024))
+        elif path == "/api/logout":
+            self.service.logout()
         elif path == "/api/sources":
             self.service.add_folder(_text(data, "path"), _text(data, "alias", limit=255))
         elif path == "/api/scan":
@@ -348,15 +350,17 @@ class WebApplication:
                 raise WebError(400, "Укажите настройку продолжения после перезапуска.")
             if "preflight_check" in data and type(data["preflight_check"]) is not bool:
                 raise WebError(400, "Предварительная проверка должна быть включена или выключена.")
+            if "upload_large_files" in data and type(data["upload_large_files"]) is not bool:
+                raise WebError(400, "Загрузка больших файлов должна быть включена или выключена.")
             self.service.settings(workers=workers, auto_resume=data["auto_resume"],
-                                  preflight_check=data.get("preflight_check"))
+                                  preflight_check=data.get("preflight_check"), upload_large_files=data.get("upload_large_files"))
         else:
             raise WebError(404, "Неизвестная команда.")
         return self.service.snapshot()
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Браузерная панель загрузки фотографий в Облако Mail")
+    parser = argparse.ArgumentParser(description="Браузерная панель загрузки фото и видео в Облако Mail")
     parser.add_argument("--state", type=Path, default=Path(os.environ.get("MAILRU_STATE", "state")))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)

@@ -10,9 +10,10 @@ import threading
 import time
 from typing import Any, Callable
 
-from .api import (PROTOCOL_VERSION, CloudAPI, FileIdentity, ProtocolError, RemoteConflict,
+from .api import (PROTOCOL_VERSION, AccountInfo, CloudAPI, FileIdentity, ProtocolError, RemoteConflict,
                   RemoteError, SourceChanged, UnsupportedPhoto)
 from .auth import AuthError
+from .media import UNLIMITED_MAX_BYTES
 from .queue import FileChangedError, Job, Queue
 from .transport import Cancelled, TransportError
 
@@ -25,45 +26,63 @@ class QuotaChanged(ProtocolError):
     pass
 
 
-def process_job(queue: Queue, api: CloudAPI, job: Job, *, emit=None) -> dict[str, Any]:
+def process_job(queue: Queue, api: CloudAPI, job: Job, *, emit=None,
+                storage_mode: str = "unlimited", account: AccountInfo | None = None) -> dict[str, Any]:
     """Optional UI events do not alter upload requests or verification rules."""
     if emit is None:
-        return _process_job(queue, api, job)
-    emit("file_started", {"job_id": job.id, "path": job.remote_path, "size": job.size})
+        return _process_job(queue, api, job, storage_mode=storage_mode, account=account)
+    emit("file_started", {"job_id": job.id, "path": job.remote_path, "size": job.size,
+                          "storage_mode": storage_mode})
     try:
-        return _process_job(queue, api, job, progress=lambda size: emit(
+        return _process_job(queue, api, job, storage_mode=storage_mode, account=account, progress=lambda size: emit(
             "upload_progress", {"job_id": job.id, "bytes": size}))
     finally:
         emit("file_finished", {"job_id": job.id})
 
 
-def _process_job(queue: Queue, api: CloudAPI, job: Job, *, progress=None) -> dict[str, Any]:
+def _process_job(queue: Queue, api: CloudAPI, job: Job, *, progress=None,
+                 storage_mode: str = "unlimited", account: AccountInfo | None = None) -> dict[str, Any]:
+    if storage_mode not in {"unlimited", "regular"}:
+        raise ValueError("Unknown storage mode")
+    if storage_mode == "regular" and job.size <= UNLIMITED_MAX_BYTES:
+        raise ProtocolError("Обычное хранение разрешено только для файлов больше 2 ГБ.")
     expected = FileIdentity(job.size, job.mtime_ns, job.device, job.inode)
-    result = api.upload_photo(job.local_path, job.remote_path, expected=expected,
-                              prior_intent=queue.get_commit_intent(job),
-                              save_intent=lambda digest: queue.save_commit_intent(job, digest),
-                              save_confirmation=lambda digest: queue.confirm_unlimited_commit(job, digest),
-                              is_retried=job.attempts > 1,
-                              **({"progress": progress} if progress is not None else {}))
+    prior = queue.get_commit_intent(job)
+    if prior and prior.get("storage_mode", "unlimited") != storage_mode:
+        raise ProtocolError("Сохранённое подтверждение относится к другому режиму хранения; файл не изменён.")
+    regular = storage_mode == "regular"
+    uploader = api.upload_regular if regular else api.upload_photo
+    confirm = queue.confirm_regular_commit if regular else queue.confirm_unlimited_commit
+    result = uploader(job.local_path, job.remote_path, expected=expected, prior_intent=prior,
+                      save_intent=lambda digest: queue.save_commit_intent(job, digest, storage_mode=storage_mode),
+                      save_confirmation=lambda digest: confirm(job, digest), is_retried=job.attempts > 1,
+                      **({"account": account} if regular else {}),
+                      **({"progress": progress} if progress is not None else {}))
+    evidence_key = "regular_evidence" if regular else "unlimited_evidence"
     if (not isinstance(result, dict) or result.get("stat_matched") is not True
             or not isinstance(result.get("hash"), str)
             or not re.fullmatch(r"[0-9A-Fa-f]{40}", result["hash"])
             or isinstance(result.get("size"), bool) or result.get("size") != job.size
             or result.get("path") != job.remote_path
-            or result.get("is_unlim_upload") is not True
+            or result.get("storage_mode", "unlimited") != storage_mode
+            or (not regular and result.get("is_unlim_upload") is not True)
+            or (regular and result.get("is_unlim_upload") is True)
             or not ((result.get("commit_accepted") is True and result.get("recovered_commit") is False
-                     and result.get("unlimited_evidence") == "commit_response")
+                     and result.get(evidence_key) == "commit_response")
                     or (result.get("commit_accepted") is False and result.get("recovered_commit") is True
-                        and result.get("unlimited_evidence") == "saved_commit_response"))):
-        raise ProtocolError("Не получено полное подтверждение безлимита, commit, пути, хеша и размера файла.")
+                        and result.get(evidence_key) == "saved_commit_response"))):
+        raise ProtocolError("Не получено полное подтверждение режима хранения, commit, пути, хеша и размера файла.")
     confirmation = queue.get_commit_intent(job)
-    if (not confirmation or confirmation.get("unlimited_confirmed") is not True
+    confirmation_key = "regular_confirmed" if regular else "unlimited_confirmed"
+    if (not confirmation or confirmation.get(confirmation_key) is not True
+            or confirmation.get("storage_mode", "unlimited") != storage_mode
             or not isinstance(confirmation.get("cloud_hash"), str)
             or confirmation["cloud_hash"].casefold() != result["hash"].casefold()):
-        raise ProtocolError("Подтверждение безлимита от сервера не сохранено для этого файла; завершение не отмечено.")
+        raise ProtocolError("Подтверждение режима хранения от сервера не сохранено для этого файла; завершение не отмечено.")
+    result = {**result, "storage_mode": storage_mode}
     queue.mark_uploaded(job, remote_hash=result["hash"], remote_id=result.get("nodeid"),
                         verified_metadata={"protocol": PROTOCOL_VERSION, **result,
-                                           "unlimited_confirmed_at": confirmation.get("unlimited_confirmed_at"),
+                                           confirmation_key + "_at": confirmation.get(confirmation_key + "_at"),
                                            "commit_intent_created_at": confirmation.get("created_at")})
     return {"job_id": job.id, **result}
 
@@ -101,7 +120,7 @@ def probe(queue: Queue, api: CloudAPI, *, count: int = 3, settle_seconds: float 
         queue.set_metadata("probe", report)
         try:
             for _ in range(count):
-                job = queue.claim(max_attempts=5)
+                job = queue.claim(max_attempts=5, storage_mode="unlimited")
                 if job is None:
                     break
                 report["active_job_id"] = job.id
@@ -165,7 +184,7 @@ def probe(queue: Queue, api: CloudAPI, *, count: int = 3, settle_seconds: float 
 
 
 class QuotaGuard:
-    def __init__(self, api: CloudAPI, account: str, baseline: int, *, seconds: float = 30, every_files: int = 50):
+    def __init__(self, api: CloudAPI, account: str, baseline: int | None, *, seconds: float = 30, every_files: int = 50):
         self.api, self.account, self.baseline = api, account, baseline
         self.seconds, self.every_files = seconds, every_files
         self._lock = threading.Lock()
@@ -184,14 +203,73 @@ class QuotaGuard:
             self.api.require_account(self.account)
             quota = self.api.quota()
             self.last_quota = quota
-            if quota["used_bytes"] != self.baseline:
+            if self.baseline is not None and quota["used_bytes"] != self.baseline:
                 raise QuotaChanged("Использование квоты Облака изменилось. Загрузка приостановлена; очередь сохранена.")
             self._last, self._completed = time.monotonic(), 0
 
 
 def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
         emit: Callable[[str, dict], None] | None = None, file_progress: bool = False,
-        require_probe: bool = True) -> dict[str, Any]:
+        require_probe: bool = True, upload_large_files: bool = False) -> dict[str, Any]:
+    """Finish the unchanged-quota phase before any explicitly billed uploads.
+
+    This keeps ordinary growth out of the unlimited quota check instead of
+    weakening that check for every file in a mixed archive.
+    """
+    if type(upload_large_files) is not bool or type(require_probe) is not bool:
+        raise ValueError("Upload settings must be booleans")
+    if not 1 <= workers <= 16 or not 1 <= max_attempts <= 20:
+        raise ValueError("workers must be 1..16, max_attempts 1..20")
+    emit = emit or (lambda event, data: None)
+    with queue.exclusive_run():
+        queue.recover_running()
+        require_scanned(queue)
+        if not upload_large_files:
+            skipped = queue.skip_large_disabled()
+            if skipped:
+                emit("large_files_skipped", {"count": skipped})
+        small = queue.stats(storage_mode="unlimited")
+        remaining_small = small["pending"] + small["running"] + small["failed"] - small["permanent_failures"]
+        large = queue.stats(storage_mode="regular") if upload_large_files else {}
+        remaining_large = (large["pending"] + large["running"] + large["failed"] - large["permanent_failures"]
+                           if large else 0)
+        phases = []
+        if remaining_small or not remaining_large:
+            phases.append(_run_phase(queue, api, workers=workers, max_attempts=max_attempts, emit=emit,
+                                     file_progress=file_progress, require_probe=require_probe and small["total"] > 0,
+                                     storage_mode="unlimited"))
+        if upload_large_files and not api.stop.is_set():
+            if remaining_large:
+                emit("regular_uploads", {"count": remaining_large})
+                regular = _run_phase(queue, api, workers=workers, max_attempts=max_attempts, emit=emit,
+                                     file_progress=file_progress, require_probe=False, storage_mode="regular")
+                phases.append(regular)
+                # Subsequent unlimited work needs a fresh baseline after this
+                # phase. Never reinterpret ordinary commits as probe samples.
+                report = queue.get_metadata("probe")
+                if isinstance(report, dict) and report:
+                    queue.set_metadata("probe", {**report, "result": "invalidated", "reason": "regular_uploads"})
+        if not phases:
+            raise Cancelled("Загрузка приостановлена.")
+        result = phases[0]
+        stats = queue.stats()
+        stopped = api.stop.is_set()
+        outcome = ("stopped" if stopped else
+                   "finished_with_errors" if stats["failed"] or stats["pending"] or stats["running"] else
+                   "finished_with_skips" if stats["skipped"] else "complete")
+        combined = {**result, "finished_at": time.time(), "stopped": stopped, "outcome": outcome,
+                    "stats": stats, "errors": [error for phase in phases for error in phase["errors"]],
+                    "last_quota": phases[-1]["last_quota"], "upload_large_files": upload_large_files,
+                    "preflight_check": require_probe,
+                    "phases": [{k: phase[k] for k in ("storage_mode", "outcome", "baseline_cloud_bytes", "last_quota")}
+                               for phase in phases]}
+        queue.set_metadata("last_run", combined)
+        return combined
+
+
+def _run_phase(queue: Queue, api: CloudAPI, *, workers: int, max_attempts: int,
+               emit: Callable[[str, dict], None], file_progress: bool,
+               require_probe: bool, storage_mode: str) -> dict[str, Any]:
     if not 1 <= workers <= 16 or not 1 <= max_attempts <= 20:
         raise ValueError("workers must be 1..16, max_attempts 1..20")
     if type(require_probe) is not bool:
@@ -236,7 +314,9 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
         baseline = api.quota()["used_bytes"]
         if require_probe and baseline != evidence["before"]["used_bytes"]:
             raise ProbeRequired("После probe квота изменилась. Нужна новая проверка перед массовой загрузкой.")
-        guard = QuotaGuard(api, account.email, baseline)
+        # Ordinary commits consume quota by design. Their account/quota is
+        # still refreshed; the server enforces available space and file limits.
+        guard = QuotaGuard(api, account.email, baseline if storage_mode == "unlimited" else None)
 
         def worker() -> None:
             local = Queue(queue.path, destination=queue.destination, account_id=account.email)
@@ -250,16 +330,17 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                     except (ProtocolError, AuthError, TransportError) as error:
                         stop_with(error, invalidate_probe=isinstance(error, (ProtocolError, AuthError)))
                         return
-                    job = local.claim(max_attempts=max_attempts)
+                    job = local.claim(max_attempts=max_attempts, storage_mode=storage_mode)
                     if job is None:
-                        state = local.stats()
+                        state = local.stats(storage_mode=storage_mode)
                         next_retry = state.get("next_retry_at")
                         if next_retry is None:
                             return
                         api.stop.wait(max(0.1, min(10, next_retry - time.time())))
                         continue
                     try:
-                        result = process_job(local, api, job, emit=emit if file_progress else None)
+                        result = process_job(local, api, job, emit=emit if file_progress else None,
+                                             storage_mode=storage_mode, account=account)
                         guard.completed()
                         emit("uploaded", {"job_id": job.id, "path": job.remote_path,
                                           "size": job.size, "recovered_commit": result["recovered_commit"]})
@@ -333,14 +414,14 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                 api.stop.set()
             except (ProtocolError, AuthError, TransportError) as error:
                 stop_with(error, invalidate_probe=isinstance(error, (ProtocolError, AuthError)))
-        final_stats = queue.stats()
+        final_stats = queue.stats(storage_mode=storage_mode)
         outcome = ("stopped" if api.stop.is_set() else
                    "finished_with_errors" if final_stats["failed"] or final_stats["pending"] or final_stats["running"] else
                    "finished_with_skips" if final_stats["skipped"] else "complete")
         result = {"started_at": started, "finished_at": time.time(), "stopped": api.stop.is_set(),
                   "outcome": outcome, "errors": errors, "stats": final_stats, "baseline_cloud_bytes": baseline,
                   "last_quota": guard.last_quota, "protocol": PROTOCOL_VERSION,
-                  "preflight_check": require_probe}
+                  "preflight_check": require_probe, "storage_mode": storage_mode}
         queue.set_metadata("last_run", result)
         if needs_recheck:
             invalid = dict(evidence)

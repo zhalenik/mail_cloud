@@ -4,7 +4,9 @@
 services:
   mailru-photos:
     image: ghcr.io/zhalenik/mail_cloud:stable
-    # Pin a release when needed: ghcr.io/zhalenik/mail_cloud:v0.4.2
+    # Fetch the current tag on install, Edit/Save, and TrueNAS app Start.
+    pull_policy: always
+    # Pin a release when needed: ghcr.io/zhalenik/mail_cloud:v0.4.3
     user: "1000:1000"
     init: true
     restart: unless-stopped

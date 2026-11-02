@@ -90,8 +90,17 @@ jobs:
           PHOTO_LIBRARY: /tmp/mail-cloud-photos
           MAILRU_ALLOWED_HOSTS: localhost
         run: |
-          docker compose -f compose.yaml config --quiet
-          docker compose -f deploy/truenas-compose.yaml config --quiet
+          python3 - <<'PY'
+          import json
+          import subprocess
+          for template in ("compose.yaml", "deploy/truenas-compose.yaml"):
+              rendered = subprocess.check_output(
+                  ["docker", "compose", "-f", template, "config", "--format", "json"], text=True)
+              service = json.loads(rendered)["services"]["mailru-photos"]
+              assert service["image"] == "ghcr.io/zhalenik/mail_cloud:stable", template
+              assert service["pull_policy"] == "always", template
+              print(f"Validated {template}: stable image is checked on deployment")
+          PY
       - name: Build, smoke test, publish, and create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

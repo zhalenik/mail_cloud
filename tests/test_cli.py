@@ -14,7 +14,7 @@ from unittest import mock
 from mailru_photos import cli
 from mailru_photos.api import ProtocolError
 from mailru_photos.auth import AuthError, Tokens, TokenStore
-from mailru_photos.queue import Queue, QueueBusyError
+from mailru_photos.queue import MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, Queue, QueueBusyError
 
 
 class CLITests(unittest.TestCase):
@@ -145,6 +145,38 @@ class CLITests(unittest.TestCase):
         self.assertEqual(status["last_scan"]["added"], 0)
         self.assertEqual(status["last_scan"]["unchanged"], 2)
 
+    def test_default_scan_includes_video_and_upgrades_legacy_default(self):
+        self.init()
+        self.photo('still.jpg')
+        self.photo('nested/clip.MOV')
+        self.photo('other.MP4')
+        self.photo('ignored.txt')
+        self.success('add-folder', self.source, '--alias', 'camera')
+        with Queue(self.db, destination='/Archive') as queue:
+            queue.set_metadata('extensions', sorted(PHOTO_EXTENSIONS))
+        self.success('scan')
+        with Queue(self.db, destination='/Archive') as queue:
+            self.assertEqual(queue.stats()['pending'], 3)
+            self.assertEqual(set(queue.get_metadata('extensions')), MEDIA_EXTENSIONS)
+        self.success('scan')
+        self.assertEqual(json.loads(self.success('status'))['last_scan']['unchanged'], 3)
+
+    def test_explicit_photo_only_filter_survives_interrupted_scan_and_restart(self):
+        self.init()
+        self.photo('still.jpg')
+        self.photo('clip.MOV')
+        self.success('add-folder', self.source, '--alias', 'camera')
+        with mock.patch.object(Queue, 'scan', side_effect=KeyboardInterrupt):
+            code, _, _ = self.invoke('scan', '--extensions', ','.join(sorted(PHOTO_EXTENSIONS)))
+        self.assertEqual(code, 130)
+        with Queue(self.db, destination='/Archive') as queue:
+            self.assertIs(queue.get_metadata('extensions_custom'), True)
+            self.assertEqual(queue.discovery_extensions(), PHOTO_EXTENSIONS)
+            with queue.exclusive_run():
+                self.assertFalse(queue.upgrade_media_discovery())
+        self.success('scan')
+        self.assertEqual(json.loads(self.success('status'))['stats']['total'], 1)
+
     def test_scan_reuses_saved_extensions_until_explicitly_replaced(self):
         self.init()
         self.photo("one.jpg")
@@ -158,12 +190,13 @@ class CLITests(unittest.TestCase):
         self.assertEqual(status["stats"]["pending"], 2)
         self.assertEqual(status["stats"]["skipped"], 0)
         with Queue(self.db, destination="/Archive") as queue:
-            self.assertEqual(queue.get_metadata("extensions"), ["cr3", "jpg"])
+            self.assertEqual(queue.get_metadata("extensions"), [".cr3", ".jpg"])
+            self.assertIs(queue.get_metadata('extensions_custom'), True)
             self.assertEqual({row["relative_path"] for row in queue.list_jobs("pending")}, {"one.jpg", "three.CR3"})
         self.success("scan", "--extensions", "png")
         self.success("scan")
         with Queue(self.db, destination="/Archive") as queue:
-            self.assertEqual(queue.get_metadata("extensions"), ["png"])
+            self.assertEqual(queue.get_metadata("extensions"), [".png"])
             self.assertEqual([row["relative_path"] for row in queue.list_jobs("pending")], ["two.png"])
 
     def test_init_cannot_retarget_an_existing_queue(self):

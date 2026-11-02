@@ -3,6 +3,8 @@
 services:
   mailru-photos:
     image: "${MAILRU_IMAGE:-ghcr.io/zhalenik/mail_cloud:stable}"
+    # Check the registry on Compose deployment, even if this tag is cached.
+    pull_policy: always
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true
     restart: unless-stopped

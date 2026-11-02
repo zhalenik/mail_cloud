@@ -1,13 +1,15 @@
 """Small, network-free encoders for the APK's metadata protocol.
 
-Grounding: Cloud Mail 5.117.0.10079902, CreateFolderRequest (operation 106),
-QuotaRequest (operation 23), DataEncoder, C3250v0 and MPR_NONE. Strings use
+Grounding: Cloud Mail 5.117.0.10079902, AddBlobRequest (operation 103),
+CreateFolderRequest (operation 106), QuotaRequest (operation 23), DataEncoder,
+C3250v0 and MPR_NONE. Strings use
 NFC-normalized UTF-8 *byte* lengths including a terminating NUL. Integer
 encoding is unsigned base-128 varint, least-significant group first.
 """
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 MAX_U64 = (1 << 64) - 1
@@ -94,6 +96,70 @@ def parse_mkdir_response(raw: bytes) -> int:
     if not raw:
         raise MetadataProtocolError("Empty mkdir response")
     return raw[0]
+
+
+def encode_add_file(path: str, size: int, mtime_seconds: int, digest: str) -> bytes:
+    """Encode an ordinary, create-only file commit (operation 103).
+
+    AddBlobRequest's default flags are 3. Bit 2 prevents replacement; the
+    separate autorename/autoupload flags (55) are deliberately not enabled.
+    The digest is the raw 20-byte Mail Cloud hash, not its ASCII spelling.
+    This operation consumes the account's ordinary storage quota.
+    """
+    if not isinstance(path, str):
+        raise TypeError("remote file path must be text")
+    if (not path.startswith("/") or "\x00" in path
+            or any(part in ("", ".", "..") for part in path.split("/")[1:])):
+        raise ValueError("remote file path must be canonical, absolute and contain no NUL")
+    encoded = unicodedata.normalize("NFC", path).encode("utf-8")
+    if len(encoded) + 1 > MAX_U32:
+        raise ValueError("remote file path exceeds the protocol string limit")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", digest):
+        raise ValueError("file hash must contain exactly 40 hexadecimal characters")
+    return (
+        encode_varint(103)
+        + b"\x00"  # MPR_NONE: no revision precondition.
+        + encode_varint(len(encoded) + 1) + encoded + b"\x00"
+        + encode_varint(size)
+        + encode_varint(mtime_seconds)
+        + b"\x00"
+        + bytes.fromhex(digest)
+        + b"\x03"  # Create only; no overwrite and no automatic renaming.
+    )
+
+
+def parse_add_file_response(raw: bytes) -> int:
+    """Read a create-only commit status and validate a positive revision.
+
+    Both the status and revision type are single bytes, including statuses
+    253/254. A success without the complete BaseRevision is not confirmation.
+    Flags 3 request neither an auto-renamed name nor a node-id section, so no
+    other trailing fields are expected. Nonzero statuses are left to the
+    caller; even NOT_MODIFIED (12) is not positive commit evidence here.
+    """
+    if not raw:
+        raise MetadataProtocolError("Empty add-file response")
+    status = raw[0]
+    if status != 0:
+        return status
+    if len(raw) < 2:
+        raise MetadataProtocolError("Missing add-file revision")
+    revision_type, offset = raw[1], 2
+    if revision_type not in range(6):
+        raise MetadataProtocolError("Unknown add-file revision type")
+    revision_count = 2 if revision_type in (3, 4) else 1 if revision_type in (1, 2, 5) else 0
+    for _ in range(revision_count):
+        # TreeID is always 12 bytes, followed by one unsigned revision value.
+        if len(raw) < offset + 12:
+            raise MetadataProtocolError("Truncated add-file tree id")
+        _, offset = read_varint(raw, offset + 12)
+    if revision_type == 5:
+        if len(raw) < offset + 12:
+            raise MetadataProtocolError("Truncated add-file redirect tree id")
+        offset += 12
+    if offset != len(raw):
+        raise MetadataProtocolError("Unexpected trailing add-file fields")
+    return status
 
 
 def encode_quota() -> bytes:

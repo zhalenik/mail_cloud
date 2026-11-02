@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from mailru_photos.media import UNLIMITED_MAX_BYTES
 from mailru_photos.queue import (
     FileChangedError, Queue, QueueBusyError, QueueConfigurationError, QueueError,
-    ScanCollisionError, StaleClaimError,
+    MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, ScanCollisionError, StaleClaimError,
 )
 
 
@@ -34,6 +37,12 @@ class QueueTests(unittest.TestCase):
         path.write_bytes(contents)
         return path
 
+    def sparse_media(self, name, size):
+        path = self.photo(name)
+        with path.open("r+b") as stream:
+            stream.truncate(size)
+        return path
+
     def test_multiple_roots_preserve_paths_and_rescan_is_idempotent(self):
         other = self.base / "other"
         other.mkdir()
@@ -49,6 +58,115 @@ class QueueTests(unittest.TestCase):
             "/Archive/camera/2020/photo.jpg", "/Archive/old_phone/2020/photo.jpg",
         })
         self.assertEqual(self.queue.stats()["total"], 2)
+
+    def test_default_scan_discovers_nested_photos_and_videos_case_insensitively(self):
+        for suffix in MEDIA_EXTENSIONS:
+            self.photo('nested/clip' + suffix.upper())
+        self.photo('ignored.mp3')
+        self.photo('ignored.txt')
+        first = self.queue.scan()
+        self.assertTrue(first.complete)
+        self.assertEqual(first.added, len(MEDIA_EXTENSIONS))
+        self.assertEqual(self.queue.stats()['pending'], len(MEDIA_EXTENSIONS))
+        self.assertEqual({Path(job['relative_path']).suffix.casefold() for job in self.queue.list_jobs()},
+                         MEDIA_EXTENSIONS)
+        second = self.queue.scan()
+        self.assertEqual((second.added, second.unchanged), (0, len(MEDIA_EXTENSIONS)))
+
+    def test_explicit_photo_filter_remains_photo_only_until_expanded(self):
+        self.photo('original.JPG')
+        self.photo('camera/clip.MOV')
+        self.photo('camera/clip.MP4')
+        self.assertEqual(self.queue.scan(PHOTO_EXTENSIONS).added, 1)
+        original_id = self.queue.list_jobs()[0]['id']
+        expanded = self.queue.scan(MEDIA_EXTENSIONS)
+        self.assertEqual((expanded.added, expanded.unchanged), (2, 1))
+        self.assertEqual(self.queue.list_jobs()[0]['id'], original_id)
+        self.assertEqual(self.queue.stats()['total'], 3)
+        self.assertTrue({'.mp4', '.mov', '.mkv', '.webm', '.avi', '.3gp'} <= VIDEO_EXTENSIONS)
+
+    def test_media_upgrade_preserves_uploaded_jobs_and_history_and_rescans_once(self):
+        self.photo('done.jpg')
+        self.photo('nested/new.MOV')
+        previous = self.queue.scan(PHOTO_EXTENSIONS)
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash='offline-confirmed-photo',
+                                 verified_metadata={'is_unlim_upload': True})
+        self.queue.set_metadata('extensions', sorted(suffix.lstrip('.').upper() for suffix in PHOTO_EXTENSIONS))
+        self.queue.set_metadata('last_scan', asdict(previous))
+        jobs_before = self.queue.list_jobs()
+        history_before = self.queue.upload_history(job.id)
+        with self.queue.exclusive_run():
+            self.assertTrue(self.queue.upgrade_media_discovery())
+        self.assertEqual(self.queue.discovery_extensions(), MEDIA_EXTENSIONS)
+        self.assertEqual(self.queue.list_jobs(), jobs_before)
+        self.assertEqual(self.queue.upload_history(job.id), history_before)
+        self.assertFalse(self.queue.get_metadata('last_scan')['complete'])
+        self.assertEqual(self.queue.get_metadata('last_scan')['reason'], 'media_formats_added')
+        with Queue(self.db, destination='/Archive') as observer:
+            version = observer._db.execute('PRAGMA data_version').fetchone()[0]
+            with self.queue.exclusive_run():
+                for _ in range(3):
+                    self.assertFalse(self.queue.upgrade_media_discovery())
+            self.assertEqual(observer._db.execute('PRAGMA data_version').fetchone()[0], version)
+        current = self.queue.scan(self.queue.discovery_extensions())
+        self.assertEqual((current.added, current.unchanged), (1, 1))
+        self.queue.set_metadata('last_scan', asdict(current))
+        self.assertEqual(self.queue.stats()['uploaded'], 1)
+        self.assertEqual(self.queue.stats()['pending'], 1)
+        self.assertEqual(self.queue.list_jobs('uploaded')[0]['id'], job.id)
+        self.assertEqual(self.queue.upload_history(job.id), history_before)
+        with self.queue.exclusive_run():
+            self.assertFalse(self.queue.upgrade_media_discovery())
+        self.assertTrue(self.queue.get_metadata('last_scan')['complete'])
+
+    def test_media_upgrade_handles_legacy_complete_scan_without_saved_filter(self):
+        self.photo('old.jpg')
+        self.queue.set_metadata('last_scan', asdict(self.queue.scan(PHOTO_EXTENSIONS)))
+        with self.queue.exclusive_run():
+            self.assertTrue(self.queue.upgrade_media_discovery())
+            self.assertFalse(self.queue.upgrade_media_discovery())
+        self.assertEqual(set(self.queue.get_metadata('extensions')), MEDIA_EXTENSIONS)
+        self.assertFalse(self.queue.get_metadata('last_scan')['complete'])
+
+    def test_fresh_queue_needs_no_discovery_migration_write(self):
+        before = self.queue._db.total_changes
+        with self.queue.exclusive_run():
+            self.assertFalse(self.queue.upgrade_media_discovery())
+            self.assertFalse(self.queue.upgrade_media_discovery())
+        self.assertEqual(self.queue._db.total_changes, before)
+        self.assertEqual(self.queue.discovery_extensions(), MEDIA_EXTENSIONS)
+        self.assertIsNone(self.queue.get_metadata('last_scan'))
+
+    def test_media_upgrade_preserves_custom_filters_including_explicit_old_default(self):
+        for extensions, custom in [([' JPG ', 'MP4'], None), (sorted(PHOTO_EXTENSIONS), True)]:
+            with self.subTest(extensions=extensions):
+                self.queue.set_metadata('extensions', extensions)
+                if custom is not None:
+                    self.queue.set_metadata('extensions_custom', custom)
+                self.queue.set_metadata('last_scan', {'complete': True})
+                before = self.queue._db.total_changes
+                with self.queue.exclusive_run():
+                    self.assertFalse(self.queue.upgrade_media_discovery())
+                self.assertEqual(self.queue._db.total_changes, before)
+                self.assertTrue(self.queue.get_metadata('last_scan')['complete'])
+                expected = PHOTO_EXTENSIONS if custom else frozenset({'.jpg', '.mp4'})
+                self.assertEqual(self.queue.discovery_extensions(), expected)
+                self.assertEqual(self.queue.get_metadata('extensions'), extensions)
+
+    def test_media_upgrade_filter_and_scan_invalidation_are_atomic(self):
+        self.queue.set_metadata('extensions', sorted(PHOTO_EXTENSIONS))
+        self.queue.set_metadata('last_scan', {'complete': True})
+        original = self.queue._put_meta
+        def fail_invalidation(key, value):
+            if key == 'last_scan':
+                raise OSError('offline interrupted migration')
+            return original(key, value)
+        with self.queue.exclusive_run(), patch.object(self.queue, '_put_meta', side_effect=fail_invalidation):
+            with self.assertRaises(OSError):
+                self.queue.upgrade_media_discovery()
+        self.assertEqual(self.queue.get_metadata('extensions'), sorted(PHOTO_EXTENSIONS))
+        self.assertTrue(self.queue.get_metadata('last_scan')['complete'])
 
     def test_database_cannot_be_reused_for_another_destination_or_account(self):
         with self.assertRaises(QueueConfigurationError):
@@ -185,7 +303,8 @@ class QueueTests(unittest.TestCase):
         self.photo("b.jpg")
         self.queue.scan()
         done = self.queue.claim()
-        self.queue.mark_uploaded(done, remote_hash="verified-a", verified_metadata={"mode": "confirmed-test"})
+        self.queue.mark_uploaded(done, remote_hash="verified-a",
+                                 verified_metadata={"storage_mode": "unlimited", "proof": "confirmed-test"})
         interrupted = self.queue.claim()
         with self.queue.exclusive_run():
             self.assertEqual(self.queue.recover_running(), 1)
@@ -497,6 +616,373 @@ class QueueTests(unittest.TestCase):
         self.assertIsNotNone(third)
         self.assertEqual(third.attempts, 1)
         self.assertEqual(self.queue.get_commit_intent(third)["cloud_hash"], "saved-hash")
+
+    def test_storage_mode_migration_preserves_legacy_intents_and_read_only_reopens(self):
+        self.photo()
+        self.queue.scan()
+        original = self.queue.claim()
+        self.queue.save_commit_intent(original, "old-hash")
+        self.queue.confirm_unlimited_commit(original, "old-hash")
+        legacy = self.queue.get_commit_intent(original)
+        legacy.pop("storage_mode")
+        self.queue._db.execute("UPDATE commit_intents SET intent_json=?", (json.dumps(legacy),))
+        self.queue.release(original)
+        for name in ("jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry_unlimited", "jobs_retry_regular"):
+            self.queue._db.execute(f"DROP INDEX {name}")
+        self.queue._db.execute("ALTER TABLE jobs DROP COLUMN storage_mode")
+        with Queue(self.db, destination="/Archive", account_id="test-account") as upgraded:
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertIsNone(upgraded.list_jobs(summary=True)[0]["storage_mode"])
+            resumed = upgraded.claim(storage_mode="unlimited")
+            self.assertIsNone(resumed.storage_mode)
+            restored = upgraded.get_commit_intent(resumed)
+            self.assertEqual(restored, {"storage_mode": "unlimited", **legacy})
+            with self.assertRaises(QueueError):
+                upgraded.confirm_regular_commit(resumed, "old-hash")
+            upgraded.confirm_unlimited_commit(resumed, "old-hash")
+            upgraded.mark_uploaded(resumed, remote_hash="old-hash")
+            self.assertEqual(upgraded.list_jobs(summary=True)[0]["storage_mode"], "unlimited")
+            before = upgraded._db.execute("PRAGMA data_version").fetchone()[0]
+            with Queue(self.db, destination="/Archive", account_id="test-account") as reopened:
+                self.assertEqual(reopened._db.total_changes, 0)
+                self.assertEqual(reopened.stats()["uploaded"], 1)
+            self.assertEqual(upgraded._db.execute("PRAGMA data_version").fetchone()[0], before)
+
+    def test_claim_size_partitions_use_exact_binary_boundary(self):
+        for name, size in (("below.mp4", UNLIMITED_MAX_BYTES - 1),
+                           ("at.mp4", UNLIMITED_MAX_BYTES),
+                           ("above.mp4", UNLIMITED_MAX_BYTES + 1)):
+            self.sparse_media(name, size)
+        self.queue.scan()
+        regular = self.queue.claim(storage_mode="regular")
+        self.assertEqual(regular.relative_path, "above.mp4")
+        self.assertIsNone(self.queue.claim(storage_mode="regular"))
+        unlimited = [self.queue.claim(storage_mode="unlimited") for _ in range(2)]
+        self.assertEqual({job.size for job in unlimited}, {UNLIMITED_MAX_BYTES - 1, UNLIMITED_MAX_BYTES})
+        self.assertIsNone(self.queue.claim(storage_mode="unlimited"))
+        self.assertIsNone(self.queue.claim())
+
+    def test_partitioned_retry_claims_respect_due_time_and_attempt_limit(self):
+        self.photo("small.jpg")
+        self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.queue.scan()
+        small = self.queue.claim(storage_mode="unlimited")
+        large = self.queue.claim(storage_mode="regular")
+        self.queue.mark_failed(small, "later", now=100, retry_delay=20)
+        self.queue.mark_failed(large, "earlier", now=100, retry_delay=10)
+        self.assertIsNone(self.queue.claim(storage_mode="regular", now=109))
+        self.assertIsNone(self.queue.claim(storage_mode="unlimited", now=119))
+        retried = self.queue.claim(storage_mode="regular", now=110, max_attempts=2)
+        self.assertEqual((retried.id, retried.attempts), (large.id, 2))
+        self.queue.mark_failed(retried, "again", now=110, retry_delay=0)
+        self.assertIsNone(self.queue.claim(storage_mode="regular", now=120, max_attempts=2))
+        self.assertEqual(self.queue.claim(storage_mode="unlimited", now=120).id, small.id)
+
+    def test_partitioned_stats_include_all_statuses_and_retry_timing(self):
+        fixtures = [
+            ("small-pending.jpg", 10, "pending", 0),
+            ("small-later.jpg", 11, "failed", 200),
+            ("small-permanent.jpg", 12, "failed", None),
+            ("small-done.jpg", 13, "uploaded", None),
+            ("large-pending.mp4", UNLIMITED_MAX_BYTES + 1, "pending", 0),
+            ("large-due.mp4", UNLIMITED_MAX_BYTES + 2, "failed", 90),
+            ("large-later.mp4", UNLIMITED_MAX_BYTES + 3, "failed", 300),
+            ("large-permanent.mp4", UNLIMITED_MAX_BYTES + 4, "failed", None),
+            ("large-done.mp4", UNLIMITED_MAX_BYTES + 5, "uploaded", None),
+        ]
+        for name, size, _, _ in fixtures:
+            self.sparse_media(name, size)
+        self.queue.scan()
+        for name, _, status, next_attempt in fixtures:
+            self.queue._db.execute("UPDATE jobs SET status=?,next_attempt=? WHERE relative_path=?",
+                                   (status, next_attempt, name))
+        small = self.queue.stats(now=100, storage_mode="unlimited")
+        large = self.queue.stats(now=100, storage_mode="regular")
+        all_jobs = self.queue.stats(now=100)
+        self.assertEqual((small["total"], large["total"], all_jobs["total"]), (4, 5, 9))
+        self.assertEqual((small["ready"], large["ready"], all_jobs["ready"]), (1, 2, 3))
+        self.assertEqual((small["next_retry_at"], large["next_retry_at"]), (200, 300))
+        self.assertEqual((small["permanent_failures"], large["permanent_failures"]), (1, 1))
+        for key in ("uploaded", "total_bytes", "uploaded_bytes", "permanent_failures"):
+            self.assertEqual(all_jobs[key], small[key] + large[key])
+        for status in all_jobs["bytes_by_status"]:
+            self.assertEqual(all_jobs["bytes_by_status"][status],
+                             small["bytes_by_status"][status] + large["bytes_by_status"][status])
+
+    def test_source_change_moves_size_partition_and_clears_saved_mode_and_proof(self):
+        path = self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.queue.scan()
+        original = self.queue.claim(storage_mode="regular")
+        self.queue.save_commit_intent(original, "old-hash", storage_mode="regular")
+        self.queue.confirm_regular_commit(original, "old-hash")
+        self.queue.release(original)
+        path.write_bytes(b"now-small")
+        self.assertIsNone(self.queue.claim(storage_mode="regular"))
+        updated = self.queue.claim(storage_mode="unlimited")
+        self.assertEqual(updated.size, len(b"now-small"))
+        self.assertIsNone(updated.storage_mode)
+        self.assertIsNone(self.queue.get_commit_intent(updated))
+
+    def test_regular_confirmation_is_durable_separate_and_never_claims_unlimited(self):
+        self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.queue.scan()
+        first = self.queue.claim(storage_mode="regular")
+        with self.assertRaises(QueueError):
+            self.queue.confirm_regular_commit(first, "abc123")
+        self.queue.save_commit_intent(first, "abc123", storage_mode="regular")
+        with self.assertRaises(QueueError):
+            self.queue.confirm_unlimited_commit(first, "abc123")
+        with self.assertRaises(QueueError):
+            self.queue.confirm_regular_commit(first, "wrong-hash")
+        self.queue.confirm_regular_commit(first, "ABC123")
+        confirmed = self.queue.get_commit_intent(first)
+        self.assertEqual(confirmed["storage_mode"], "regular")
+        self.assertIs(confirmed["regular_confirmed"], True)
+        self.assertGreater(confirmed["regular_confirmed_at"], 0)
+        self.assertNotIn("unlimited_confirmed", confirmed)
+        self.queue.recover_running()
+        resumed = self.queue.claim(storage_mode="regular")
+        self.assertEqual(resumed.storage_mode, "regular")
+        self.assertEqual(self.queue.get_commit_intent(resumed), confirmed)
+        with self.assertRaises(StaleClaimError):
+            self.queue.confirm_regular_commit(first, "abc123")
+        self.queue.mark_uploaded(resumed, remote_hash="abc123", verified_metadata={
+            "storage_mode": "regular", "regular_evidence": "saved_commit_response",
+        })
+        self.assertEqual(self.queue.list_jobs(summary=True)[0]["storage_mode"], "regular")
+        result = self.queue.upload_history(first.id)[0]["verified_metadata"]
+        self.assertEqual(result["storage_mode"], "regular")
+        self.assertNotIn("is_unlim_upload", result)
+        self.assertNotIn("unlimited_evidence", result)
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM commit_intents").fetchone()[0], 0)
+
+    def test_regular_confirmation_rejects_changed_scope_and_cross_mode_proof(self):
+        self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.queue.scan()
+        job = self.queue.claim(storage_mode="regular")
+        self.queue.save_commit_intent(job, "same-hash", storage_mode="regular")
+        original = self.queue.get_commit_intent(job)
+        changes = {"account_id": "other-account", "destination": "/Other", "storage_mode": "unlimited",
+                   "remote_path": "/Other/file.mp4", "source_size": job.size + 1,
+                   "source_mtime_ns": job.mtime_ns + 1, "device": job.device + 1,
+                   "inode": job.inode + 1, "cloud_hash": "other-hash"}
+        for key, value in changes.items():
+            with self.subTest(field=key):
+                self.queue._db.execute("UPDATE commit_intents SET intent_json=? WHERE job_id=?",
+                                       (json.dumps({**original, key: value}), job.id))
+                with self.assertRaises(QueueError):
+                    self.queue.confirm_regular_commit(job, "same-hash")
+                saved = json.loads(self.queue._db.execute("SELECT intent_json FROM commit_intents").fetchone()[0])
+                self.assertNotIn("regular_confirmed", saved)
+        self.queue._db.execute("UPDATE commit_intents SET intent_json=?,source_size=? WHERE job_id=?",
+                               (json.dumps(original), job.size + 1, job.id))
+        with self.assertRaises(QueueError):
+            self.queue.confirm_regular_commit(job, "same-hash")
+
+    def test_new_intent_clears_confirmation_of_both_storage_modes(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        for previous_mode, new_mode in (("unlimited", "regular"), ("regular", "regular"), ("regular", "unlimited")):
+            with self.subTest(previous=previous_mode, new=new_mode):
+                self.queue.save_commit_intent(job, "same-hash", storage_mode=previous_mode)
+                getattr(self.queue, f"confirm_{previous_mode}_commit")(job, "same-hash")
+                self.queue.save_commit_intent(job, "same-hash", storage_mode=new_mode)
+                fresh = self.queue.get_commit_intent(job)
+                self.assertEqual(fresh["storage_mode"], new_mode)
+                self.assertEqual(self.queue.list_jobs()[0]["storage_mode"], new_mode)
+                for key in ("regular_confirmed", "regular_confirmed_at", "unlimited_confirmed", "unlimited_confirmed_at"):
+                    self.assertNotIn(key, fresh)
+
+    def test_regular_confirmation_source_change_and_rescan_clear_mode(self):
+        path = self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.queue.scan()
+        job = self.queue.claim(storage_mode="regular")
+        self.queue.save_commit_intent(job, "old-hash", storage_mode="regular")
+        path.write_bytes(b"different")
+        with self.assertRaises(FileChangedError):
+            self.queue.confirm_regular_commit(job, "old-hash")
+        self.assertIsNone(self.queue.list_jobs()[0]["storage_mode"])
+        retried = self.queue.claim()
+        self.queue.mark_uploaded(retried, verified_metadata={"storage_mode": "unlimited"})
+        path.write_bytes(b"changed again")
+        self.queue.scan()
+        self.assertIsNone(self.queue.list_jobs()[0]["storage_mode"])
+        self.assertEqual(self.queue.upload_history(job.id)[0]["verified_metadata"]["storage_mode"], "unlimited")
+
+    def test_regular_completion_rejects_conflicting_or_omitted_storage_mode(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "hash", storage_mode="regular")
+        for evidence in ({}, {"storage_mode": "unlimited"}, {"storage_mode": "regular", "is_unlim_upload": True}):
+            with self.subTest(evidence=evidence), self.assertRaises(QueueError):
+                self.queue.mark_uploaded(job, remote_hash="hash", verified_metadata=evidence)
+        self.assertEqual(self.queue.upload_history(job.id), [])
+        self.assertEqual(self.queue.stats()["running"], 1)
+        self.assertEqual(self.queue.get_commit_intent(job)["storage_mode"], "regular")
+
+    def test_unknown_storage_modes_are_rejected_without_changing_queue(self):
+        for mode in ("manual", "AUTO", "", False, [], {}):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    self.queue.claim(storage_mode=mode)
+                with self.assertRaises(ValueError):
+                    self.queue.stats(storage_mode=mode)
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        for mode in (None, "manual", "AUTO", [], {}):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.queue.save_commit_intent(job, "hash", storage_mode=mode)
+        with self.assertRaises(ValueError):
+            self.queue.mark_uploaded(job, verified_metadata={"storage_mode": "manual"})
+        self.assertIsNone(self.queue.get_commit_intent(job))
+        self.assertIsNone(self.queue.list_jobs()[0]["storage_mode"])
+
+    def test_disabling_large_files_parks_only_live_retryable_work_and_preserves_evidence(self):
+        names = ("pending.mp4", "retry.mp4", "permanent.mp4", "done.mp4", "active.mp4", "missing.mp4", "skip.mp4")
+        for name in names:
+            self.sparse_media(name, UNLIMITED_MAX_BYTES + 1)
+        self.photo("small.jpg")
+        self.queue.scan()
+        claims = [self.queue.claim() for _ in range(len(names) + 1)]
+        by_name = {job.relative_path: job for job in claims}
+        for job in claims:
+            if job.relative_path == "small.jpg":
+                self.queue.release(job)
+                continue
+            self.queue.save_commit_intent(job, "hash-" + job.relative_path, storage_mode="regular")
+            if job.relative_path in ("retry.mp4", "done.mp4"):
+                self.queue.confirm_regular_commit(job, "hash-" + job.relative_path)
+            if job.relative_path in ("pending.mp4", "missing.mp4"):
+                self.queue.release(job)
+            elif job.relative_path == "retry.mp4":
+                self.queue.mark_failed(job, "response interrupted", retry_delay=1000)
+            elif job.relative_path == "permanent.mp4":
+                self.queue.mark_failed(job, "permanent account limit", retry_delay=None)
+            elif job.relative_path == "done.mp4":
+                self.queue.mark_uploaded(job, verified_metadata={"storage_mode": "regular"})
+            elif job.relative_path == "skip.mp4":
+                self.queue.mark_skipped(job, "unsupported codec")
+        self.queue._db.execute("UPDATE jobs SET present=0 WHERE relative_path='missing.mp4'")
+        before = {row["id"]: row for row in self.queue.list_jobs()}
+        intents_before = list(self.queue._db.execute("SELECT job_id,intent_json FROM commit_intents ORDER BY job_id"))
+        history_before = self.queue.upload_history(by_name["done.mp4"].id)
+        self.assertEqual(self.queue.skip_large_disabled(), 2)
+        self.assertEqual(self.queue.skip_large_disabled(), 0)
+        parked_ids = {by_name["pending.mp4"].id, by_name["retry.mp4"].id}
+        for row in self.queue.list_jobs():
+            if row["id"] in parked_ids:
+                self.assertEqual((row["status"], row["skip_reason"]), ("skipped", "large_files_disabled"))
+                self.assertIsNone(row["next_attempt"])
+            else:
+                self.assertEqual(row, before[row["id"]])
+        self.assertEqual(list(self.queue._db.execute("SELECT job_id,intent_json FROM commit_intents ORDER BY job_id")),
+                         intents_before)
+        self.assertEqual(self.queue.retry_large_skipped(), 2)
+        self.assertEqual(self.queue.retry_large_skipped(), 0)
+        for row in self.queue.list_jobs():
+            if row["id"] in parked_ids:
+                self.assertEqual((row["status"], row["attempts"], row["next_attempt"]), ("pending", 0, 0))
+                self.assertIsNone(row["skip_reason"])
+                self.assertIsNone(row["last_error"])
+                self.assertEqual(row["storage_mode"], "regular")
+            else:
+                self.assertEqual(row, before[row["id"]])
+        self.assertEqual(list(self.queue._db.execute("SELECT job_id,intent_json FROM commit_intents ORDER BY job_id")),
+                         intents_before)
+        self.assertEqual(self.queue.upload_history(by_name["done.mp4"].id), history_before)
+
+    def test_large_file_skip_code_preserves_ambiguous_commit_through_restart(self):
+        self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.queue.scan()
+        job = self.queue.claim(storage_mode="regular")
+        self.queue.save_commit_intent(job, "regular-hash", storage_mode="regular")
+        self.queue.confirm_regular_commit(job, "regular-hash")
+        original = self.queue.get_commit_intent(job)
+        self.queue.mark_skipped(job, "regular uploads disabled", code="large_files_disabled")
+        with Queue(self.db, destination="/Archive") as restarted:
+            self.assertEqual(restarted.retry_large_skipped(), 1)
+            resumed = restarted.claim(storage_mode="regular")
+            self.assertEqual(restarted.get_commit_intent(resumed), original)
+            self.assertEqual(resumed.attempts, 1)
+            restarted.mark_skipped(resumed, "deliberate manual skip")
+            self.assertEqual(restarted.retry_large_skipped(), 0)
+            self.assertEqual(restarted._db.execute("SELECT COUNT(*) FROM commit_intents").fetchone()[0], 0)
+
+    def test_retry_large_skipped_recognizes_only_exact_legacy_limit_and_explicit_code(self):
+        legacy = "Файл больше 2 ГБ; он не отправлен обычной загрузкой."
+        fixtures = [
+            ("legacy.mp4", UNLIMITED_MAX_BYTES + 1, "skipped", "manual", legacy, 1),
+            ("flag.mp4", UNLIMITED_MAX_BYTES + 1, "skipped", "large_files_disabled", "disabled", 1),
+            ("other.mp4", UNLIMITED_MAX_BYTES + 1, "skipped", "manual", "Unsupported format", 1),
+            ("similar.mp4", UNLIMITED_MAX_BYTES + 1, "skipped", "manual", legacy + " User skipped it.", 1),
+            ("other-code.mp4", UNLIMITED_MAX_BYTES + 1, "skipped", "deliberate", legacy, 1),
+            ("missing.mp4", UNLIMITED_MAX_BYTES + 1, "skipped", "large_files_disabled", "disabled", 0),
+            ("done.mp4", UNLIMITED_MAX_BYTES + 1, "uploaded", "large_files_disabled", "disabled", 1),
+            ("small.mp4", UNLIMITED_MAX_BYTES, "skipped", "manual", legacy, 1),
+        ]
+        for name, size, *_ in fixtures:
+            self.sparse_media(name, size)
+        self.queue.scan()
+        for name, _, status, code, error, present in fixtures:
+            self.queue._db.execute(
+                "UPDATE jobs SET status=?,skip_reason=?,last_error=?,present=?,attempts=4 WHERE relative_path=?",
+                (status, code, error, present, name),
+            )
+        self.assertEqual(self.queue.retry_large_skipped(), 2)
+        self.assertEqual({row["relative_path"] for row in self.queue.list_jobs("pending")}, {"legacy.mp4", "flag.mp4"})
+        self.assertEqual(self.queue.retry_large_skipped(), 0)
+        for row in self.queue.list_jobs():
+            self.assertEqual(row["attempts"], 0 if row["status"] == "pending" else 4)
+
+    def test_partitioned_claim_cost_does_not_scan_an_unrelated_30000_job_prefix(self):
+        target = self.photo("target.mp4")
+        self.queue.scan()
+        target_id = 30001
+        self.queue._db.execute("UPDATE jobs SET id=?", (target_id,))
+        with self.queue._transaction():
+            self.queue._db.execute("""
+                WITH RECURSIVE prefix(n) AS (
+                    VALUES(1) UNION ALL SELECT n+1 FROM prefix WHERE n<30000
+                )
+                INSERT INTO jobs(id,root_id,relative_path,local_path,local_key,remote_path,remote_key,
+                                 size,mtime_ns,device,inode,status,next_attempt,created_at,updated_at)
+                SELECT n,1,'prefix-'||n||'.mp4','/fixture/prefix-'||n,'prefix-'||n,
+                       '/Archive/camera/prefix-'||n,'/archive/camera/prefix-'||n,
+                       0,0,0,'0','pending',0,0,0 FROM prefix
+            """)
+        for mode in ("unlimited", "regular"):
+            target_size = 32 if mode == "unlimited" else UNLIMITED_MAX_BYTES + 1
+            other_size = UNLIMITED_MAX_BYTES + 1 if mode == "unlimited" else 32
+            with target.open("r+b") as stream:
+                stream.truncate(target_size)
+            snapshot = target.stat()
+            for state in ("pending", "failed"):
+                with self.subTest(mode=mode, state=state):
+                    with self.queue._transaction():
+                        self.queue._db.execute(
+                            "UPDATE jobs SET size=?,status=?,claim_token=NULL,attempts=0,next_attempt=0 WHERE id<?",
+                            (other_size, state, target_id),
+                        )
+                        self.queue._db.execute(
+                            "UPDATE jobs SET size=?,mtime_ns=?,device=?,inode=?,status=?,claim_token=NULL,"
+                            "attempts=0,next_attempt=0 WHERE id=?",
+                            (snapshot.st_size, snapshot.st_mtime_ns, snapshot.st_dev, str(snapshot.st_ino), state, target_id),
+                        )
+                    steps = 0
+                    def count_steps():
+                        nonlocal steps
+                        steps += 1
+                        return 0
+                    self.queue._db.set_progress_handler(count_steps, 1000)
+                    try:
+                        claimed = self.queue.claim(storage_mode=mode, now=100)
+                    finally:
+                        self.queue._db.set_progress_handler(None, 0)
+                    self.assertEqual(claimed.id, target_id)
+                    self.assertLess(steps, 50, "Claim scanned jobs belonging to the other storage mode")
 
 
 if __name__ == "__main__":

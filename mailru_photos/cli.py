@@ -16,7 +16,7 @@ from pathlib import Path
 from . import __version__
 from .api import CloudAPI, ProtocolError
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
-from .queue import PHOTO_EXTENSIONS, Queue, QueueError
+from .queue import Queue, QueueError
 from .runner import ProbeRequired, probe, run
 from .transport import Cancelled, TransportError
 
@@ -31,6 +31,14 @@ def write_json(path: Path, value) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        if os.name != "nt":
+            # A durable rename matters for saved logout/pause intent as well
+            # as settings: a power loss must not restore an older intention.
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -75,7 +83,7 @@ class Reporter:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="python -m mailru_photos",
-        description="Экспериментальный Python-клиент безлимитной автозагрузки собственных фото в Облако Mail.",
+        description="Загрузчик фото и видео в Облако Mail с сохраняемой очередью.",
     )
     root.add_argument("--version", action="version", version=__version__)
     root.add_argument("--state", type=Path, default=Path("state"), help="локальная папка очереди и авторизации (по умолчанию ./state)")
@@ -85,14 +93,14 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--destination", required=True, help="новая папка назначения, например /PhotoArchivePC")
     login = commands.add_parser("login", help="вход через cloud-win с паролем внешнего приложения; пароль вводится скрыто")
     login.add_argument("--email", required=True)
-    commands.add_parser("doctor", help="проверить авторизацию, признак безлимита и квоту; фото не загружает")
+    commands.add_parser("doctor", help="проверить авторизацию, признак безлимита и квоту; файлы не загружает")
     folder = commands.add_parser("add-folder", help="добавить исходную папку рекурсивно")
     folder.add_argument("path", type=Path)
     folder.add_argument("--alias", required=True, help="уникальное имя источника в папке назначения")
     scan = commands.add_parser("scan", help="обойти все источники и обновить очередь")
-    scan.add_argument("--extensions", help="расширения через запятую, например jpg,jpeg,png,heic,heif,webp,dng")
+    scan.add_argument("--extensions", help="расширения через запятую; по умолчанию фото и видео, например jpg,png,heic,mp4,mov")
     commands.add_parser("status", help="показать состояние очереди без сети")
-    trial = commands.add_parser("probe", help="проверить несколько фото из очереди и измерить квоту")
+    trial = commands.add_parser("probe", help="проверить несколько фото или видео до 2 ГБ и измерить квоту")
     trial.add_argument("--count", type=int, default=3)
     trial.add_argument("--settle-seconds", type=float, default=60)
     upload = commands.add_parser("run", help="загрузить очередь после probe; повторный запуск продолжает работу")
@@ -192,14 +200,16 @@ def dispatch(args) -> int:
             with queue.exclusive_run():
                 queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started"})
                 if args.extensions is None:
-                    extensions = queue.get_metadata("extensions", sorted(PHOTO_EXTENSIONS))
+                    extensions = queue.discovery_extensions()
                 else:
                     extensions = [item.strip() for item in args.extensions.split(",") if item.strip()]
-                print("Обход исходных папок. Фотографии не декодируются и не копируются…", flush=True)
+                extensions = queue.set_discovery_extensions(
+                    extensions, custom=True if args.extensions is not None else None,
+                )
+                print("Обход исходных папок. Фото и видео не декодируются и не копируются…", flush=True)
                 result = queue.scan(extensions)
                 value = dataclasses.asdict(result)
                 queue.set_metadata("last_scan", value)
-                queue.set_metadata("extensions", sorted(extensions))
             pretty(value)
             pretty(queue.stats())
             return 0 if result.complete else 2

@@ -115,20 +115,43 @@ volumes:
 
 | Значение `image` | Как выбирать обновления |
 | --- | --- |
-| `ghcr.io/zhalenik/mail_cloud:stable` | Получать выпуски канала `stable`, когда владелец репозитория обновляет этот тег. |
-| `ghcr.io/zhalenik/mail_cloud:v0.4.2` | Использовать выбранный выпуск. Для следующей версии изменить тег в YAML. |
+| `ghcr.io/zhalenik/mail_cloud:stable` | Получать новые выпуски без изменения тега в YAML. |
+| `ghcr.io/zhalenik/mail_cloud:v0.4.3` | Использовать выбранный выпуск. Для следующей версии изменить тег в YAML. |
 | `ghcr.io/zhalenik/mail_cloud@sha256:…` | Закрепить конкретный digest опубликованного образа, если нужна точная фиксация содержимого. |
 
 Версионный тег удобен для выбора выпуска; технически владелец registry может перезаписать любой тег. Digest фиксирует конкретное содержимое; см. [Docker: получение образа по digest](https://docs.docker.com/reference/cli/docker/image/pull/#pull-an-image-by-digest-immutable-identifier). Наличие новой версии приложения в GitHub само по себе не меняет YAML с фиксированным тегом.
 
-TrueNAS отслеживает изменения upstream-образов и показывает доступное обновление. Выберите приложение в **Apps → Installed**, откройте меню **⋮ → Update** и подтвердите обновление. Это ручная установка; `restart: unless-stopped` отвечает только за перезапуск контейнера. Элементы интерфейса зависят от версии TrueNAS. [Официальный порядок обновления](https://apps.truenas.com/managing-apps/managing-installed-apps/#updating-apps).
+### Одна настройка для канала stable
 
-Перед обновлением:
+В существующем YAML у сервиса должны быть обе строки:
+
+```yaml
+services:
+  mailru-photos:
+    image: ghcr.io/zhalenik/mail_cloud:stable
+    pull_policy: always
+```
+
+Добавьте `pull_policy` через **Apps → mail-cloud → Edit**; остальные параметры вашего YAML сохраните. Новый шаблон уже содержит эту настройку. Обновление файла в GitHub или самого образа не меняет YAML ранее установленного приложения — один раз поправить его нужно на NAS.
+
+Без `pull_policy` Compose использует политику `missing`: существующий локальный образ с тегом `stable` можно получить снова даже после переустановки приложения. `always` заставляет Compose проверять образ в registry при развёртывании. Неизменившиеся слои повторно не скачиваются. [Описание Docker Compose](https://docs.docker.com/reference/compose-file/services/#pull_policy).
+
+### Как установить следующий выпуск
 
 1. Приостановите загрузку в панели и дождитесь её остановки.
 2. Остановите приложение в TrueNAS и сделайте ZFS snapshot dataset состояния.
-3. Сохраните тот же mount `/state`, пути источников внутри `/photos` и согласованный UID/GID.
-4. Обновите образ или тег и запустите приложение. Проверьте очередь, затем продолжите загрузку.
+3. Нажмите **Start**. С `stable` и `pull_policy: always` TrueNAS получит текущий образ и создаст контейнер с ним. Номер версии менять не требуется.
+4. Проверьте версию в панели, очередь и настройки, затем продолжите загрузку.
+
+Сохраняйте тот же mount `/state`, пути источников внутри `/photos` и согласованный UID/GID. Для запуска с `pull_policy: always` серверу нужен доступ к GHCR. Настройка `restart: unless-stopped` сама по себе образы не обновляет: перезапуск процесса Docker после сбоя или загрузки NAS отличается от **Start** приложения в TrueNAS.
+
+### Почему может не быть кнопки Update
+
+TrueNAS отдельно проверяет registry и показывает **⋮ → Update**, когда обнаружит новый образ. Эта проверка не обязана срабатывать сразу после публикации. На SCALE 24.10.2.3 у остановленного custom app обновления образов не показываются, а операция Update требует запущенного приложения. Если выбираете этот способ, приостановите загрузку внутри клиента; после снимка dataset снова запустите приложение, затем используйте **Update**, если оно доступно. [Официальный порядок обновления](https://apps.truenas.com/managing-apps/managing-installed-apps/#updating-apps).
+
+Наличие кнопки не нужно для способа **Stop → Start** с `pull_policy: always`. Для отдельного получения образа есть также **Apps → Configuration → Manage Container Images → Pull Image**: укажите `ghcr.io/zhalenik/mail_cloud:stable`, дождитесь скачивания и выполните **Stop → Start** приложения. [Экран управления образами TrueNAS 24.10](https://www.truenas.com/docs/scale/24.10/scaleuireference/apps/#manage-container-images).
+
+Поведение **Start**, применения YAML и проверки обновлений сверено с исходниками [TrueNAS 24.10.2.3: запуск](https://github.com/truenas/middleware/blob/TS-24.10.2.3/src/middlewared/middlewared/plugins/apps/app_scale.py), [вызов Compose](https://github.com/truenas/middleware/blob/TS-24.10.2.3/src/middlewared/middlewared/plugins/apps/compose_utils.py) и [обновление приложения](https://github.com/truenas/middleware/blob/TS-24.10.2.3/src/middlewared/middlewared/plugins/apps/upgrade.py).
 
 Приложению отведено `120s` на остановку. Не сокращайте это время для очереди с активными сетевыми запросами.
 

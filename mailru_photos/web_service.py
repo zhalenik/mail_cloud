@@ -21,7 +21,7 @@ from . import __version__
 from .api import CloudAPI, PROTOCOL_VERSION, ProtocolError
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .cli import write_json
-from .queue import PHOTO_EXTENSIONS, FileChangedError, Queue, QueueBusyError, QueueError, STATES, _file_lock
+from .queue import FileChangedError, Queue, QueueBusyError, QueueError, STATES, _file_lock
 from .runner import ProbeRequired, probe, process_job, run
 from .transport import Cancelled, TransportError
 
@@ -39,7 +39,7 @@ class WebService:
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.allowed_roots = tuple(dict.fromkeys(Path(p).expanduser().resolve() for p in allowed_roots))
         if not self.allowed_roots:
-            raise ValueError("Укажите хотя бы одну доступную папку с фотографиями.")
+            raise ValueError("Укажите хотя бы одну доступную папку с фото и видео.")
         self._api_factory = api_factory
         self._auth_client_factory = auth_client_factory
         self._event_factory = event_factory
@@ -55,7 +55,7 @@ class WebService:
         self._closed = False
         self._files: dict[int, dict] = {}
         self._uploaded_in_run = 0
-        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True}
+        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True, "upload_large_files": False}
         stored = self._read_json("web_settings.json", {})
         if isinstance(stored, dict):
             if type(stored.get("workers")) is int and 1 <= stored["workers"] <= 16:
@@ -64,8 +64,12 @@ class WebService:
                 self._settings["auto_resume"] = stored["auto_resume"]
             if type(stored.get("preflight_check")) is bool:
                 self._settings["preflight_check"] = stored["preflight_check"]
+            if type(stored.get("upload_large_files")) is bool:
+                self._settings["upload_large_files"] = stored["upload_large_files"]
         previous = self._read_json("web_activity.json", {})
-        self._resume_upload = isinstance(previous, dict) and previous.get("resume_upload") is True
+        self._logout_requested = isinstance(previous, dict) and previous.get("logout_requested") is True
+        self._resume_upload = (isinstance(previous, dict) and previous.get("resume_upload") is True
+                               and not self._logout_requested)
         self._auto_pending = self._resume_upload and self._settings["auto_resume"]
         self._activity = {"phase": "paused" if self._resume_upload else "idle",
                           "message": "Очередь восстановлена после остановки." if self._resume_upload else "Готово к работе.",
@@ -83,9 +87,16 @@ class WebService:
             if self._configuration is not None:
                 with self._queue() as queue, queue.exclusive_run():
                     recovered = queue.recover_running()
+                    queue.upgrade_media_discovery()
+                    if self._settings["upload_large_files"]:
+                        queue.retry_large_skipped()
                     if recovered:
                         self._activity["message"] = f"Восстановлено незавершённых заданий: {recovered}."
-            self._authenticated = self._has_auth()
+            self._authenticated = False
+            if self._logout_requested:
+                self._complete_logout()
+            else:
+                self._authenticated = self._has_auth()
         except BaseException:
             self._server_lock.__exit__(None, None, None)
             raise
@@ -140,6 +151,7 @@ class WebService:
     def _persist_activity(self) -> None:
         write_json(self.state_dir / "web_activity.json", {
             "version": 1, "resume_upload": self._resume_upload,
+            "logout_requested": self._logout_requested,
             "phase": self._activity["phase"], "updated_at": time.time(),
         })
 
@@ -153,6 +165,8 @@ class WebService:
     def _phase(self, phase: str, message: str, *, error: str | None = None) -> None:
         self._invalidate_stats()
         with self._lock:
+            if self._logout_requested and phase != "logout":
+                return
             # A worker must not overwrite a visible pause request while it drains.
             if self._pause_requested and phase in {"checking", "probing", "uploading", "scanning"}:
                 return
@@ -169,15 +183,15 @@ class WebService:
     def _ensure_idle(self) -> None:
         if self._closed:
             raise QueueError("Приложение останавливается.")
-        if self._operation is not None:
+        if self._operation is not None or self._logout_requested:
             raise QueueBusyError("Дождитесь текущей операции или нажмите «Пауза».")
 
     def _allowed_path(self, value: str | Path, *, exists: bool = True) -> Path:
         if not isinstance(value, (str, Path)) or not str(value) or "\x00" in str(value):
-            raise ValueError("Укажите папку с фотографиями.")
+            raise ValueError("Укажите папку с фото и видео.")
         path = Path(value).expanduser().resolve()
         if not any(path == root or path.is_relative_to(root) for root in self.allowed_roots):
-            raise ValueError("Эта папка находится за пределами подключённых каталогов с фотографиями.")
+            raise ValueError("Эта папка находится за пределами подключённых каталогов с фото и видео.")
         if exists and not path.is_dir():
             raise ValueError("Папка недоступна. Проверьте подключение диска и путь на сервере.")
         return path
@@ -210,7 +224,7 @@ class WebService:
         return {"ok": True, "source": dataclasses.asdict(root)}
 
     def settings(self, workers: int | None = None, auto_resume: bool | None = None,
-                 preflight_check: bool | None = None) -> dict:
+                 preflight_check: bool | None = None, upload_large_files: bool | None = None) -> dict:
         with self._lock:
             self._ensure_idle()
             updated = dict(self._settings)
@@ -226,8 +240,21 @@ class WebService:
                 if type(preflight_check) is not bool:
                     raise ValueError("Предварительная проверка должна быть включена или выключена.")
                 updated["preflight_check"] = preflight_check
-            write_json(self.state_dir / "web_settings.json", updated)
+            if upload_large_files is not None:
+                if type(upload_large_files) is not bool:
+                    raise ValueError("Загрузка больших файлов должна быть включена или выключена.")
+                updated["upload_large_files"] = upload_large_files
+            restored = 0
+            if upload_large_files is True and self._configuration is not None:
+                with self._queue() as queue, queue.exclusive_run():
+                    restored = queue.retry_large_skipped()
+                    write_json(self.state_dir / "web_settings.json", updated)
+            else:
+                write_json(self.state_dir / "web_settings.json", updated)
             self._settings = updated
+            if restored:
+                self._invalidate_stats()
+                self._event(f"Большие файлы возвращены в очередь для обычного хранения: {restored:,}.")
             return {"ok": True, "settings": dict(self._settings)}
 
     def folders(self, path: str | None = None) -> dict:
@@ -263,7 +290,7 @@ class WebService:
         if self._configuration is None:
             return {"jobs": [], "total": 0, "offset": offset, "limit": limit}
         fields = {"id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
-                  "last_error", "skip_reason", "next_attempt", "uploaded_at"}
+                  "last_error", "skip_reason", "next_attempt", "uploaded_at", "storage_mode"}
         with self._queue() as queue:
             rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True)
             stats = self._display_stats(queue)
@@ -353,6 +380,14 @@ class WebService:
                 self._invalidate_stats()
                 self._files.clear()
                 self._activity["probe_wait_until"] = None
+                if self._logout_requested:
+                    try:
+                        self._complete_logout()
+                    except Exception:
+                        safe = "Не удалось завершить выход из Mail.ru. Проверьте доступ к папке состояния и повторите выход."
+                        self._activity.update(phase="error", message=safe, last_error=safe)
+                        self._event(safe, "error")
+                        LOGGER.error("phase=logout error=True")
                 self._operation = None
                 self._persist_activity()
                 if self._closed:
@@ -364,6 +399,49 @@ class WebService:
 
     def _new_api(self):
         return self._api_factory(TokenManager(TokenStore(self.state_dir / "auth.dat")), stop=self._stop)
+
+    def _complete_logout(self) -> None:
+        """Run only after the active task and its workers have drained.
+
+        The durable request survives a crash. The queue's run lock prevents a
+        separate CLI process from refreshing credentials while they are removed.
+        Queue/account binding and completed jobs deliberately survive logout.
+        """
+        if self._configuration is not None:
+            with self._queue() as queue, queue.exclusive_run():
+                report = queue.get_metadata("probe")
+                if isinstance(report, dict) and report:
+                    queue.set_metadata("probe", {**report, "result": "invalidated", "reason": "logout"})
+                queue.set_metadata("last_auth", {"result": "logged_out", "at": time.time()})
+                TokenStore(self.state_dir / "auth.dat").clear()
+        else:
+            TokenStore(self.state_dir / "auth.dat").clear()
+        self._authenticated = False
+        self._logout_requested = False
+        self._resume_upload = False
+        self._auto_pending = False
+        self._phase("paused", "Вы вышли из Mail.ru. Очередь сохранена; для продолжения войдите в тот же аккаунт.")
+
+    def logout(self) -> dict:
+        with self._lock:
+            if self._closed:
+                raise QueueError("Приложение останавливается.")
+            self._logout_requested = True
+            self._resume_upload = False
+            self._auto_pending = False
+            self._pause_requested = True
+            self._stop.set()
+            self._activity.update(phase="logout", message="Завершаем текущую операцию и выходим из Mail.ru…",
+                                  last_error=None, probe_wait_until=None)
+            # Persist before signalling completion, including when a login or
+            # token refresh is currently in flight and may still save tokens.
+            self._persist_activity()
+            if self._operation is None:
+                self._operation = "logout"
+                self._thread = threading.Thread(target=self._execute,
+                    args=(lambda: ("paused", "Выход из Mail.ru."),), name="mailru-web-logout", daemon=True)
+                self._thread.start()
+        return {"ok": True, "started": "logout"}
 
     def login(self, email: str, password: str) -> dict:
         if not isinstance(email, str) or not email.strip() or len(email) > 320:
@@ -410,16 +488,16 @@ class WebService:
         return self._launch("login", perform)
 
     def _scan_queue(self, queue: Queue) -> None:
-        self._phase("scanning", "Сканируем папки с фотографиями…")
+        self._phase("scanning", "Сканируем папки с фото и видео…")
         def on_progress(result):
             with self._lock:
                 self._activity["scan"] = dataclasses.asdict(result)
-                self._activity["message"] = f"Найдено фотографий: {result.seen:,}."
+                self._activity["message"] = f"Найдено файлов: {result.seen:,}."
         with queue.exclusive_run():
             queue.recover_running()
             for source in queue.roots():
                 self._allowed_path(source.path)
-            extensions = queue.get_metadata("extensions", sorted(PHOTO_EXTENSIONS))
+            extensions = queue.discovery_extensions()
             queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started"})
             result = queue.scan(extensions, stop=self._stop, progress=on_progress)
             queue.set_metadata("last_scan", dataclasses.asdict(result))
@@ -447,7 +525,12 @@ class WebService:
                 with self._stats_lock:
                     self._stats_cache = (time.monotonic(), copy.deepcopy(data))
             elif event == "file_started":
-                self._files[data["job_id"]] = {"id": data["job_id"], "path": data["path"], "size": data["size"], "sent": 0, "stage": "preparing"}
+                self._files[data["job_id"]] = {"id": data["job_id"], "path": data["path"], "size": data["size"],
+                                               "sent": 0, "stage": "preparing", "storage_mode": data.get("storage_mode")}
+            elif event == "regular_uploads":
+                self._phase("uploading", "Загружаем файлы больше 2 ГБ в обычное Облако. Они занимают место по тарифу.")
+            elif event == "large_files_skipped":
+                self._event(f"Пропущено файлов больше 2 ГБ: {data['count']:,}. Обычное хранение выключено.")
             elif event == "upload_progress":
                 item = self._files.get(data["job_id"])
                 if item:
@@ -457,7 +540,7 @@ class WebService:
                 self._files.pop(data["job_id"], None)
             elif event == "probe_wait":
                 self._activity["probe_wait_until"] = time.time() + data["seconds"]
-                self._activity["message"] = "Проверяем, что фотографии не расходуют квоту…"
+                self._activity["message"] = "Проверяем, что фото и видео не расходуют квоту…"
             elif event == "uploaded":
                 self._uploaded_in_run += 1
                 if self._uploaded_in_run % 100 == 0:
@@ -534,7 +617,7 @@ class WebService:
                     if history:
                         result = {"job_id": active_id, **history[-1]["verified_metadata"]}
                     else:
-                        job = queue.claim(max_attempts=5)
+                        job = queue.claim(max_attempts=5, storage_mode="unlimited")
                         if job is None or job.id != active_id:
                             if job is not None:
                                 queue.release(job, "Waiting for the original interrupted probe job")
@@ -608,22 +691,30 @@ class WebService:
             with queue.exclusive_run():
                 queue.recover_running()
                 if not queue.roots():
-                    raise ValueError("Добавьте хотя бы одну папку с фотографиями.")
+                    raise ValueError("Добавьте хотя бы одну папку с фото и видео.")
                 for source in queue.roots():
                     self._allowed_path(source.path)
             last_scan = queue.get_metadata("last_scan", {})
             if not isinstance(last_scan, dict) or last_scan.get("complete") is not True:
                 self._scan_queue(queue)
             self._check_stop()
+            if not self._settings["upload_large_files"]:
+                skipped = queue.skip_large_disabled()
+                if skipped:
+                    self._emit("large_files_skipped", {"count": skipped})
+                    self._invalidate_stats()
             stats = queue.stats()
             remaining = stats["pending"] + stats["running"] + stats["failed"] - stats["permanent_failures"]
             old_probe = queue.get_metadata("probe", {})
             preflight_check = self._settings["preflight_check"]
             resume_control = preflight_check and self._can_resume_probe(old_probe, queue.account_id, queue.destination)
+            small = queue.stats(storage_mode="unlimited")
+            remaining_small = small["pending"] + small["running"] + small["failed"] - small["permanent_failures"]
+            preflight_check = preflight_check and (remaining_small > 0 or resume_control)
             if not remaining and not resume_control:
                 if stats["failed"]:
                     return "error", "Есть файлы с ошибками. Исправьте причину и нажмите «Повторить ошибки»."
-                return "completed", "Все найденные файлы обработаны." if stats["skipped"] else "Все найденные фотографии загружены."
+                return "completed", "Все найденные файлы обработаны." if stats["skipped"] else "Все найденные фото и видео загружены."
             api = self._new_api()
             try:
                 self._phase("checking", "Проверяем аккаунт и доступность безлимита…")
@@ -639,7 +730,7 @@ class WebService:
                     if self._can_resume_probe(report, account.email, queue.destination):
                         report = self._resume_probe(queue, api, report)
                     else:
-                        stats = queue.stats()
+                        stats = queue.stats(storage_mode="unlimited")
                         retry_at = stats.get("next_retry_at")
                         if stats["ready"] == 0 and retry_at is not None:
                             self._phase("probing", "Ожидаем повторной попытки после временного сбоя…")
@@ -650,9 +741,10 @@ class WebService:
                     if report.get("result") != "provisional_pass":
                         raise ProbeRequired("Квота изменилась во время проверки. Загрузка приостановлена; повторите запуск при стабильной квоте.")
                 self._check_stop()
-                self._phase("uploading", "Загружаем фотографии в безлимит…")
+                self._phase("uploading", "Загружаем фото и видео в безлимит…")
                 result = run(queue, api, workers=self._settings["workers"], emit=self._emit,
-                             file_progress=True, require_probe=preflight_check)
+                             file_progress=True, require_probe=preflight_check,
+                             upload_large_files=self._settings["upload_large_files"])
                 if self._pause_requested or self._shutting_down:
                     raise Cancelled("Приостановлено.")
                 if result.get("stopped"):
@@ -661,7 +753,7 @@ class WebService:
                     return "error", "Загрузка завершилась с ошибками; подробности в списке заданий."
                 if result.get("outcome") == "finished_with_skips":
                     return "completed", "Загрузка завершена; есть пропущенные файлы."
-                return "completed", "Все фотографии загружены и проверены."
+                return "completed", "Все фото и видео загружены и проверены."
             finally:
                 api.close_thread()
 
@@ -674,6 +766,8 @@ class WebService:
 
     def pause(self) -> dict:
         with self._lock:
+            if self._logout_requested:
+                return {"ok": True}
             self._resume_upload = False
             self._auto_pending = False
             self._pause_requested = True

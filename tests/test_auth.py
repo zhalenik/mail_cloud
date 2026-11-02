@@ -30,6 +30,18 @@ class Opener:
 
 
 class AuthenticationTests(unittest.TestCase):
+    def test_logout_removes_saved_tokens_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'auth.dat'
+            store = TokenStore(path)
+            store.save(Tokens('offline-access', 'offline-refresh', 'owner@example.test'))
+            store.clear()
+            self.assertFalse(path.exists())
+            store.clear()
+            with self.assertRaises(AuthError) as caught:
+                store.load()
+            self.assertEqual(caught.exception.code, 'not_logged_in')
+
     def test_login_urlencoding_and_no_password_persistence(self):
         opener = Opener([{"access_token": "ACCESS", "refresh_token": "REFRESH", "expires_in": 3600}])
         tokens = AuthClient(opener=opener, clock=lambda: 1000).login("owner@example.ru", "p&= +%😀")

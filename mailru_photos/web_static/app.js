@@ -4,14 +4,15 @@
   const $ = (id) => document.getElementById(id);
   const numberFormat = new Intl.NumberFormat("ru-RU");
   const pageNames = { overview: "Обзор", queue: "Очередь файлов", sources: "Исходные папки", settings: "Настройки" };
-  const busyPhases = new Set(["login", "scanning", "checking", "probing", "uploading", "pausing"]);
+  const busyPhases = new Set(["login", "logout", "scanning", "checking", "probing", "uploading", "pausing"]);
   const phaseInfo = {
     idle: ["Готов к работе", "Ожидание", "neutral", "cloud"],
     login: ["Подключаем аккаунт", "Подключение", "blue", "lock"],
-    scanning: ["Ищем фотографии", "Сканирование", "blue", "scan"],
+    logout: ["Выходим из Mail.ru", "Выход", "orange", "logout"],
+    scanning: ["Ищем фото и видео", "Сканирование", "blue", "scan"],
     checking: ["Проверяем доступ к Облаку", "Проверка", "blue", "lock"],
     probing: ["Проверяем безлимит", "Проверка", "blue", "lock"],
-    uploading: ["Загружаем фотографии", "Загрузка", "blue", "cloud"],
+    uploading: ["Загружаем файлы", "Загрузка", "blue", "cloud"],
     pausing: ["Сохраняем прогресс", "Останавливаем", "orange", "pause"],
     paused: ["Загрузка приостановлена", "На паузе", "orange", "pause"],
     completed: ["Обработка завершена", "Завершено", "green", "check"],
@@ -37,6 +38,7 @@
   let settingsDirty = false;
   let connected = true;
   let accessBusy = false;
+  let mailLogoutRequested = false;
   const pendingActions = new Set();
   const jobsLimit = 50;
 
@@ -57,6 +59,7 @@
     return new Date(value * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
   }
   function plain(value, fallback = "") { return typeof value === "string" ? value : fallback; }
+  function mediaIcon(path) { return /\.(mp4|3gp|3g2|3gpp|3gpp2|avi|vob|mov|mkv|m2t|m2ts|ts|mts|f4v|flv|wmv|m4v|mpg|ogv|webm|hevc)$/i.test(path) ? "video" : "image"; }
   function setText(id, value) { $(id).textContent = String(value); }
   function setHidden(id, hidden) { $(id).hidden = Boolean(hidden); }
   function icon(name, extraClass = "") {
@@ -73,6 +76,12 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = String(text);
     return node;
+  }
+  function appendStorageMode(container, mode) {
+    if (mode !== "regular") return;
+    const label = element("span", "storage-mode", "Обычное хранение");
+    label.title = "Режим загрузки с расходованием места по тарифу";
+    container.appendChild(label);
   }
   function setError(id, message = "") {
     setText(id, message);
@@ -134,6 +143,8 @@
   function showAccess(setup) {
     clearTimeout(pollTimer);
     closeDialogs();
+    closeAccountMenu();
+    mailLogoutRequested = false;
     setHidden("loading-screen", true);
     setHidden("app", true);
     setHidden("access-screen", false);
@@ -174,6 +185,8 @@
       label = "Войдите в панель";
     } else if (snapshot && snapshot.activity && snapshot.activity.phase === "login") {
       label = "Вход в Mail.ru…"; status = "checking";
+    } else if (snapshot && snapshot.activity && snapshot.activity.phase === "logout") {
+      label = "Выход из Mail.ru…"; status = "checking";
     } else if (snapshot && snapshot.authenticated === true) {
       label = "Mail.ru подключён"; status = "";
       hint = "Сессия Mail.ru сохранена. Доступ к Облаку проверяется при загрузке.";
@@ -202,6 +215,10 @@
     setConnectivity(true);
     renderState();
     if (previouslyAuthenticated === false && value.authenticated === true) toast("Вход в Mail.ru сохранён.");
+    if (mailLogoutRequested && value.authenticated === false && phase() !== "logout") {
+      mailLogoutRequested = false;
+      toast("Вы вышли из Mail.ru. Очередь сохранена.");
+    } else if (phase() === "error") mailLogoutRequested = false;
   }
 
   async function poll() {
@@ -241,7 +258,10 @@
     const resumed = ["paused", "error"].includes(current) || finite(snapshot.stats && snapshot.stats.uploaded) > 0;
     $("start-upload").querySelector("span").textContent = resumed ? "Продолжить загрузку" : "Начать загрузку";
     ["add-source", "empty-add-source", "onboarding-source"].forEach((id) => { $(id).disabled = busy || transient || !configured || !connected; });
-    ["onboarding-login", "settings-login", "account-button"].forEach((id) => { $(id).disabled = busy || transient || !configured || !connected; });
+    ["onboarding-login", "settings-login", "account-menu-login"].forEach((id) => { $(id).disabled = busy || transient || !configured || !connected; });
+    $("account-button").disabled = ["login", "logout"].includes(current) || transient || !configured || !connected;
+    $("account-menu-logout").disabled = !snapshot.authenticated || current === "logout" || transient || !connected;
+    setText("account-menu-note", busy ? "Выход остановит текущую работу и сохранит очередь." : "Очередь и завершённые задания сохранятся. Для продолжения войдите в этот же аккаунт.");
     $("open-setup").disabled = configured || busy || transient || !connected;
     $("settings-setup").disabled = configured || busy || transient || !connected;
     setHidden("settings-setup", configured);
@@ -250,6 +270,7 @@
     $("workers").disabled = busy || transient;
     $("auto-resume").disabled = busy || transient;
     $("preflight-check").disabled = busy || transient;
+    $("upload-large-files").disabled = busy || transient;
   }
 
   function renderState() {
@@ -266,12 +287,15 @@
     setText("version-label", "Версия " + plain(state.version, "0.4"));
     setText("account-label", state.authenticated ? plain(state.account, "Вход сохранён") : "Подключить Mail.ru");
     $("account-button").title = state.authenticated ? "Вход в Mail.ru сохранён: " + plain(state.account) : "Подключить аккаунт Mail.ru";
+    $("account-button").setAttribute("aria-haspopup", state.authenticated ? "menu" : "dialog");
+    setText("account-menu-email", plain(state.account, "Аккаунт Mail.ru"));
+    if (!state.authenticated) closeAccountMenu();
     setText("nav-queue-count", count(finite(stats.pending) + finite(stats.running)));
     setText("transfer-title", info[0]);
     setText("phase-badge", info[1]);
     $("phase-badge").className = "badge " + info[2];
     $("phase-icon").replaceChildren(icon(info[3]));
-    let fallbackMessage = !state.configured ? "Выберите папку назначения в Облаке." : !state.authenticated ? "Подключите аккаунт Mail.ru." : sources.length === 0 ? "Добавьте исходную папку с фотографиями." : total === 0 ? "Нажмите «Начать загрузку»: клиент сам найдёт фотографии." : "История сохранена. Можно продолжить работу.";
+    let fallbackMessage = !state.configured ? "Выберите папку назначения в Облаке." : !state.authenticated ? "Подключите аккаунт Mail.ru." : sources.length === 0 ? "Добавьте исходную папку с фото и видео." : total === 0 ? "Нажмите «Начать загрузку»: клиент сам найдёт фото и видео." : "История сохранена. Можно продолжить работу.";
     setText("activity-message", plain(activity.message, fallbackMessage) || fallbackMessage);
     setText("uploaded-count", count(uploaded));
     setText("total-count", count(total));
@@ -348,8 +372,8 @@
     if (!files.length) {
       let title = "Активных загрузок пока нет", message = "Здесь появятся файлы, которые обрабатываются прямо сейчас.";
       if (phase() === "paused") { title = "Очередь на паузе"; message = "Нажмите «Продолжить загрузку», когда будете готовы."; }
-      if (phase() === "completed") { title = "Все текущие задания обработаны"; message = "Добавьте новые фотографии и нажмите «Найти новые файлы»."; }
-      if (phase() === "scanning") { title = "Собираем список фотографий"; message = "Сканирование не копирует файлы и не создаёт миниатюры."; }
+      if (phase() === "completed") { title = "Все текущие задания обработаны"; message = "Добавьте новые фото или видео и нажмите «Найти новые файлы»."; }
+      if (phase() === "scanning") { title = "Собираем список файлов"; message = "Сканирование не копирует файлы и не создаёт миниатюры."; }
       list.appendChild(emptyBlock("image", title, message, true));
       return;
     }
@@ -362,11 +386,12 @@
       const stageNames = { hash: "Проверка файла", hashing: "Проверка файла", upload: "Передача", uploading: "Передача", blob_upload: "Передача", stat: "Проверка", verify: "Проверка", verifying: "Проверка", commit: "Подтверждение", add: "Подтверждение", unlimited_add: "Подтверждение", preparing: "Подготовка" };
       const item = element("div", "active-file");
       const heading = element("div", "active-file-heading");
-      const fileIcon = element("span", "file-icon"); fileIcon.appendChild(icon("image"));
+      const fileIcon = element("span", "file-icon"); fileIcon.appendChild(icon(mediaIcon(name)));
       const label = element("div");
       const title = element("div", "active-file-name", name); title.title = fullPath;
       const path = element("div", "active-file-path", fullPath); path.title = fullPath;
       label.append(title, path);
+      appendStorageMode(label, file.storage_mode);
       heading.append(fileIcon, label, element("span", "badge blue", stageNames[stage] || "Обработка"));
       const progress = element("div", "active-file-progress");
       const track = element("div", "progress-track"); track.setAttribute("role", "progressbar"); track.setAttribute("aria-label", name); track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100"); track.setAttribute("aria-valuenow", percent.toFixed(1));
@@ -416,6 +441,7 @@
       $("workers").value = String(finite(state.settings && state.settings.workers, 2));
       $("auto-resume").checked = !state.settings || state.settings.auto_resume !== false;
       $("preflight-check").checked = !state.settings || state.settings.preflight_check !== false;
+      $("upload-large-files").checked = Boolean(state.settings && state.settings.upload_large_files === true);
     }
   }
 
@@ -463,10 +489,11 @@
       const nameCell = document.createElement("td");
       const name = element("div", "job-name");
       const fullName = plain(job.relative_path, plain(job.local_path, "Файл"));
-      name.append(icon("image"), element("span", "", fullName));
+      name.append(icon(mediaIcon(fullName)), element("span", "", fullName));
       name.title = plain(job.local_path, fullName);
       const remote = element("div", "job-path", plain(job.remote_path)); remote.title = plain(job.remote_path);
       nameCell.append(name, remote);
+      appendStorageMode(nameCell, job.storage_mode);
       const statusCell = document.createElement("td");
       const state = jobStates[job.status] || ["Неизвестно", "neutral"];
       statusCell.appendChild(element("span", "badge " + state[1], state[0]));
@@ -507,6 +534,7 @@
     setError("setup-error"); showDialog("setup-dialog");
   }
   function openMail() {
+    closeAccountMenu();
     if (!snapshot || !snapshot.configured) { openSetup(); return; }
     $("mail-email").value = plain(snapshot.account);
     $("mail-password").value = "";
@@ -549,8 +577,8 @@
         row.addEventListener("click", () => browseFolder(entry.path));
         container.appendChild(row);
       });
-      if (!container.childElementCount) container.appendChild(element("div", "folder-empty", folderState.path ? "Вложенных папок нет. Можно выбрать текущую папку — фотографии будут найдены при сканировании." : "Нет доступных папок. Подключите каталог с фотографиями к серверу и разрешите к нему доступ в настройках запуска."));
-      setText("folder-note", result.truncated ? "Показана часть каталогов. Нужный полный путь также можно ввести в поле источника." : "Показаны только папки. Сами фотографии здесь не перечисляются.");
+      if (!container.childElementCount) container.appendChild(element("div", "folder-empty", folderState.path ? "Вложенных папок нет. Можно выбрать текущую папку — файлы будут найдены при сканировании." : "Нет доступных папок. Подключите каталог с фото и видео к серверу и разрешите к нему доступ в настройках запуска."));
+      setText("folder-note", result.truncated ? "Показана часть каталогов. Нужный полный путь также можно ввести в поле источника." : "Показаны только папки. Сами фото и видео здесь не перечисляются.");
     } catch (error) {
       if (request !== folderRequest) return;
       folderState = { path: null, parent: null };
@@ -588,6 +616,57 @@
       await refreshSession(); setError("access-error");
     } catch (error) { toast(error.message, true); }
   }
+  function accountMenuItems() { return [...$("account-menu").querySelectorAll('[role="menuitem"]')].filter((item) => !item.disabled); }
+  function closeAccountMenu(restoreFocus = false) {
+    const wasOpen = !$("account-menu").hidden;
+    setHidden("account-menu", true);
+    $("account-button").setAttribute("aria-expanded", "false");
+    if (wasOpen && restoreFocus) $("account-button").focus();
+  }
+  function openAccountMenu(last = false) {
+    if (!snapshot || !snapshot.authenticated) { openMail(); return; }
+    updateControls();
+    if ($("account-button").disabled) return;
+    setHidden("account-menu", false);
+    $("account-button").setAttribute("aria-expanded", "true");
+    const items = accountMenuItems();
+    if (items.length) items[last ? items.length - 1 : 0].focus();
+  }
+  async function logoutMail() {
+    closeAccountMenu(true);
+    mailLogoutRequested = true;
+    if (!await perform("logout", "/api/logout")) mailLogoutRequested = false;
+  }
+  $("account-button").addEventListener("click", () => {
+    if (!$("account-menu").hidden) closeAccountMenu(true);
+    else openAccountMenu();
+  });
+  $("account-button").addEventListener("keydown", (event) => {
+    if (["ArrowDown", "ArrowUp"].includes(event.key) && snapshot && snapshot.authenticated) {
+      event.preventDefault(); openAccountMenu(event.key === "ArrowUp");
+    }
+  });
+  $("account-menu").addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.preventDefault(); closeAccountMenu(true); }
+    else if (event.key === "Tab") closeAccountMenu(true);
+    else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const items = accountMenuItems();
+      if (!items.length) return;
+      const current = items.indexOf(document.activeElement);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 :
+        (current + (event.key === "ArrowUp" ? -1 : 1) + items.length) % items.length;
+      items[next].focus();
+    }
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!$("account-menu-wrap").contains(event.target)) closeAccountMenu();
+  });
+  $("account-menu-wrap").addEventListener("focusout", (event) => {
+    if (!$("account-menu-wrap").contains(event.relatedTarget)) closeAccountMenu();
+  });
+  $("account-menu-login").addEventListener("click", openMail);
+  $("account-menu-logout").addEventListener("click", logoutMail);
   ["logout-panel", "logout-panel-settings"].forEach((id) => $(id).addEventListener("click", logoutPanel));
   $("refresh-connection").addEventListener("click", () => { clearTimeout(pollTimer); poll(); });
   $("start-upload").addEventListener("click", () => perform("start", "/api/start"));
@@ -595,7 +674,7 @@
   $("scan-folders").addEventListener("click", () => perform("scan", "/api/scan"));
   $("view-errors").addEventListener("click", () => { setFilter("failed"); location.hash = "queue"; if (activePage === "queue") loadJobs(); });
   ["open-setup", "settings-setup"].forEach((id) => $(id).addEventListener("click", openSetup));
-  ["account-button", "settings-login", "onboarding-login"].forEach((id) => $(id).addEventListener("click", openMail));
+  ["settings-login", "onboarding-login"].forEach((id) => $(id).addEventListener("click", openMail));
   ["add-source", "empty-add-source", "onboarding-source"].forEach((id) => $(id).addEventListener("click", openSource));
 
   $("setup-form").addEventListener("submit", async (event) => {
@@ -642,12 +721,12 @@
     try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задания возвращены в очередь." }); }
     finally { $("retry-submit").disabled = false; }
   });
-  ["workers", "auto-resume", "preflight-check"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
+  ["workers", "auto-resume", "preflight-check", "upload-large-files"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
   $("settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const workers = Number($("workers").value);
     if (!Number.isInteger(workers) || workers < 1 || workers > 16) { setError("settings-error", "Укажите целое число потоков от 1 до 16."); return; }
-    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
+    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked, upload_large_files: $("upload-large-files").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
     if (success) { settingsDirty = false; if (snapshot) renderSettings(snapshot); }
   });
 

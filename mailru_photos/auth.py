@@ -179,6 +179,24 @@ class TokenStore:
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
 
+    def clear(self) -> None:
+        """Forget this client's saved session after all token users have stopped."""
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise AuthError("Не удалось удалить сохранённый вход в Mail.ru.", code="token_storage_error") from None
+        if os.name != "nt":
+            try:
+                fd = os.open(self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                raise AuthError("Не удалось сохранить выход из Mail.ru на диске.", code="token_storage_error") from None
+
     def save(self, tokens: Tokens) -> None:
         # Re-validate before writing so an invalid server response cannot be saved.
         tokens = Tokens.from_dict(tokens.to_dict())

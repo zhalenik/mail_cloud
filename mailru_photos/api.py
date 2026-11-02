@@ -1,4 +1,4 @@
-"""Experimental mobile upload protocol, without an ordinary-quota fallback.
+"""Mobile media uploads and a separate, explicit ordinary upload operation.
 
 See docs/PROTOCOL_RU.md for APK evidence and limits of offline verification.
 """
@@ -21,7 +21,11 @@ from typing import Any, Callable
 from urllib.parse import quote, urlencode, urlsplit
 
 from .auth import AuthError, TokenManager
-from .metadata import encode_mkdir, encode_quota, parse_mkdir_response, parse_quota_response
+from .media import UNLIMITED_MAX_BYTES
+from .metadata import (
+    MetadataProtocolError, encode_add_file, encode_mkdir, encode_quota,
+    parse_add_file_response, parse_mkdir_response, parse_quota_response,
+)
 from .transport import Cancelled, HTTP, Response, TransportError, validate_url
 
 
@@ -29,7 +33,10 @@ API_BASE = "https://android-api.cloud.mail.ru"
 QUOTA_BASE = "https://cloud.mail.ru"
 UPLOAD_BASE = "https://uploader.cloud.mail.ru"
 DISPATCHER = "https://dispatcher.cloud.mail.ru/m"
-MAX_PHOTO_BYTES = 2_000_000_000  # Conservative interpretation of the documented 2 GB limit.
+# Exact APK RemoteParams unlimited_upload_max_file_size default. An ordinary
+# account upload limit can be higher and is checked separately for that mode.
+MAX_MEDIA_BYTES = UNLIMITED_MAX_BYTES
+MAX_PHOTO_BYTES = MAX_MEDIA_BYTES  # Compatibility for existing Python callers.
 PROTOCOL_VERSION = "cloud-mail-5.117.0.10079902-unlimited-v2-confirmed"
 
 
@@ -61,7 +68,7 @@ class SourceChanged(ProtocolError):
 
 
 class UnsupportedPhoto(ProtocolError):
-    pass
+    """Unsupported media; the original exception name remains compatible."""
 
 
 @dataclass(frozen=True)
@@ -267,8 +274,11 @@ class CloudAPI:
         flag = data.get("unlimited_upload_enabled")
         if not isinstance(email, str) or not email or not isinstance(flag, bool):
             raise ProtocolError("В user/info отсутствуют email или unlimited_upload_enabled; массовая загрузка остановлена.")
-        limit = data.get("upload_limit")
-        return AccountInfo(email.strip().lower(), flag, _integer(limit, "upload_limit") if limit is not None else None)
+        # The Android DTO names this upload_limit. Also honor max_file_size
+        # if a server version supplies it; use the smaller reported value.
+        limits = [_integer(data[name], name) for name in ("upload_limit", "max_file_size")
+                  if data.get(name) is not None]
+        return AccountInfo(email.strip().lower(), flag, min(limits) if limits else None)
 
     def require_account(self, expected_email: str | None = None) -> AccountInfo:
         account = self.account_info()
@@ -346,26 +356,54 @@ class CloudAPI:
             raise ProtocolError("Сервер не вернул ожидаемый хеш файла.")
         return {"size": size, "hash": digest.upper()}
 
-    def _upload_url(self, url: str, *, is_retried: bool = False) -> str:
+    def _upload_url(self, url: str, *, is_retried: bool = False, upload_type: str = "AUTO") -> str:
         """Append the APK's upload query fields, preserving a shard's own query."""
         validate_url(url)
         if not isinstance(is_retried, bool):
             raise ValueError("is_retried must be a boolean")
+        if upload_type not in ("AUTO", "MANUAL"):
+            raise ValueError("upload_type must be AUTO or MANUAL")
         query = urlencode({
             "platform": "cloud-android", "gaid": "", "is_background": "true",
-            "upload_type": "AUTO", "session_id": self._session_id,
+            "upload_type": upload_type, "session_id": self._session_id,
             "is_retried": "true" if is_retried else "false", "network": "wi-fi",
         })
         return url + ("&" if "?" in url else "?") + query
 
+    @staticmethod
+    def _check_blob_limits(response: Response, size: int) -> None:
+        """Apply APK upload limits before sending a new or resumed body.
+
+        X-Max-Upload-Limit is a file-size cap. X-Upload-Limit can instead be
+        the remaining space; the APK distinguishes that from an oversized
+        file when the two limits differ. A 404 must supply X-Upload-Limit;
+        partially available blobs may omit it.
+        """
+        maximum = response.headers.get("x-max-upload-limit")
+        maximum = _integer(maximum, "X-Max-Upload-Limit") if maximum is not None else None
+        if maximum is not None and size > maximum:
+            raise UnsupportedPhoto("Файл превышает максимальный размер загрузки, возвращённый сервером.")
+        limit = response.headers.get("x-upload-limit")
+        if limit is None and response.status != 404:
+            return
+        if limit == "-1":
+            return  # APK LimitChecker treats this specific value as unknown.
+        limit = _integer(limit, "X-Upload-Limit")
+        if size > limit:
+            if maximum is not None and limit == maximum:
+                raise UnsupportedPhoto("Файл превышает максимальный размер загрузки, возвращённый сервером.")
+            raise RemoteError(400, "CONDITION/OVERQUOTA")
+
     def _upload_blob(self, path: str, digest: str, identity: FileIdentity, *, progress=None,
-                     is_retried: bool = False) -> None:
+                     is_retried: bool = False, upload_type: str = "AUTO") -> None:
         url = UPLOAD_BASE + "/resumable/" + digest
         deadline = time.monotonic() + 600
         while True:
-            status = self._request("PUT", self._upload_url(url, is_retried=is_retried), headers={"Content-Range": f"bytes */{identity.size}",
+            status = self._request("PUT", self._upload_url(url, is_retried=is_retried, upload_type=upload_type), headers={"Content-Range": f"bytes */{identity.size}",
                                                         "Content-Type": "application/json"})
             if status.status == 201:
+                if upload_type == "MANUAL":
+                    self._check_blob_limits(status, identity.size)
                 # The APK requires a parseable Long, not a positive lifetime.
                 # In particular, a confirmed blob may return X-Valid-for: 0.
                 _integer(status.headers.get("x-valid-for"), "X-Valid-for")
@@ -377,11 +415,10 @@ class CloudAPI:
                 self._wait(max(1, delay))
                 continue
             if status.status == 404:
-                limit = _integer(status.headers.get("x-upload-limit"), "X-Upload-Limit")
-                if identity.size > limit:
-                    raise UnsupportedPhoto("Файл превышает лимит загрузки, возвращённый сервером.")
+                self._check_blob_limits(status, identity.size)
                 offset, target = 0, url
             elif status.status == 200:
+                self._check_blob_limits(status, identity.size)
                 _integer(status.headers.get("x-valid-for"), "X-Valid-for")
                 offset = _integer(status.headers.get("x-received"), "X-Received")
                 target = status.headers.get("x-location")
@@ -403,12 +440,14 @@ class CloudAPI:
                 if FileIdentity.from_stat(os.fstat(stream.fileno())) != identity:
                     raise SourceChanged("Файл изменился перед передачей.")
                 stream.seek(offset)
-                uploaded = self._request("PUT", self._upload_url(target, is_retried=is_retried), headers=headers, stream=stream,
+                uploaded = self._request("PUT", self._upload_url(target, is_retried=is_retried, upload_type=upload_type), headers=headers, stream=stream,
                                          length=identity.size - offset, progress=progress)
                 if FileIdentity.from_stat(os.fstat(stream.fileno())) != identity:
                     raise SourceChanged("Файл изменился во время передачи.")
             self._require(uploaded, 201, 202)
             if uploaded.status == 201:
+                if upload_type == "MANUAL":
+                    self._check_blob_limits(uploaded, identity.size)
                 _integer(uploaded.headers.get("x-valid-for"), "X-Valid-for")
                 return
             self._wait(max(1, _integer(uploaded.headers.get("x-wait-for"), "X-Wait-for")))
@@ -417,21 +456,28 @@ class CloudAPI:
                      prior_intent: dict[str, Any] | None = None, save_intent: Callable[[str], None],
                      save_confirmation: Callable[[str], None] | None = None,
                      progress=None, is_retried: bool = False) -> dict[str, Any]:
+        """Upload original photo or video bytes through the same mobile flow.
+
+        The legacy method name is retained for runner and Python compatibility.
+        The server, rather than a file extension, confirms media eligibility.
+        """
         if expected.size <= 20:
-            raise UnsupportedPhoto("Файл слишком мал для поддерживаемого формата фотографии.")
-        if expected.size > MAX_PHOTO_BYTES:
-            raise UnsupportedPhoto("Файл больше 2 ГБ; он не отправлен обычной загрузкой.")
+            raise UnsupportedPhoto("Файл слишком мал для поддерживаемого формата фото или видео.")
+        if expected.size > MAX_MEDIA_BYTES:
+            raise UnsupportedPhoto("Файл больше 2 ГБ (2 147 483 648 байт) — лимита автозагрузки фото и видео.")
         digest, identity = cloud_hash(path, expected=expected, stop=self.stop)
         existing = self.stat(remote_path)
         if existing is not None:
             if (existing["hash"] == digest and existing["size"] == identity.size and prior_intent
-                    and prior_intent.get("cloud_hash") == digest and prior_intent.get("remote_path") == remote_path):
+                    and prior_intent.get("cloud_hash") == digest and prior_intent.get("remote_path") == remote_path
+                    and prior_intent.get("storage_mode", "unlimited") == "unlimited"):
                 if prior_intent.get("unlimited_confirmed") is not True:
                     raise UnlimitedNotConfirmed("Файл уже есть в Облаке и совпадает по хешу, но подтверждение "
                                                 "is_unlim_upload=true для него не сохранено. Автоматическое "
                                                 "признание загрузки безлимитной остановлено; проверьте отчёт.")
                 return {"hash": digest, "size": identity.size, "path": remote_path,
                         "commit_accepted": False, "recovered_commit": True, "stat_matched": True,
+                        "storage_mode": "unlimited",
                         "is_unlim_upload": True, "unlimited_evidence": "saved_commit_response",
                         "quota_status": "server_confirmed_unlimited"}
             raise RemoteConflict("Файл с этим путём уже есть в Облаке. Перезапись отключена.")
@@ -476,5 +522,86 @@ class CloudAPI:
         return {"hash": digest, "size": identity.size, "path": remote_path,
                 "nodeid": str(added.get("nodeid", "")), "commit_accepted": True,
                 "recovered_commit": False, "stat_matched": True,
+                "storage_mode": "unlimited",
                 "is_unlim_upload": True, "unlimited_evidence": "commit_response",
                 "quota_status": "server_confirmed_unlimited"}
+
+    def upload_regular(self, path: str, remote_path: str, *, expected: FileIdentity,
+                       prior_intent: dict[str, Any] | None = None, save_intent: Callable[[str], None],
+                       save_confirmation: Callable[[str], None] | None = None,
+                       progress=None, is_retried: bool = False,
+                       account: AccountInfo | None = None) -> dict[str, Any]:
+        """Explicit ordinary upload for media above the autoupload size limit.
+
+        Callers must obtain the user's opt-in before choosing this operation.
+        It is never called as a fallback from upload_photo. The native APK's
+        create-only metadata operation is used, with no overwrite/rename.
+        A complete success response is saved before checking the remote file;
+        hash equality alone cannot recover an ambiguous earlier commit.
+        """
+        if expected.size <= MAX_MEDIA_BYTES:
+            raise UnsupportedPhoto("Обычная загрузка разрешена только для файлов больше 2 ГБ (2 147 483 648 байт).")
+        existing = self.stat(remote_path)
+        if existing is None:
+            # Check caps before hashing a multi-gigabyte source or sending its
+            # body. A saved, already-committed file needs no free space again.
+            info = account if account is not None else self.require_account()
+            if info.upload_limit is None:
+                raise ProtocolError("Сервер не сообщил максимальный размер обычной загрузки для аккаунта.")
+            limit = _positive_integer(info.upload_limit, "upload_limit")
+            if expected.size > limit:
+                raise UnsupportedPhoto("Файл превышает максимальный размер обычной загрузки для этого аккаунта.")
+            quota = self.quota()
+            available = max(0, quota["total_bytes"] - quota["combined_used_bytes"])
+            if expected.size > available:
+                raise RemoteError(400, "CONDITION/OVERQUOTA")
+        digest, identity = cloud_hash(path, expected=expected, stop=self.stop)
+        if existing is not None:
+            if (existing["hash"] == digest and existing["size"] == identity.size and prior_intent
+                    and prior_intent.get("cloud_hash") == digest and prior_intent.get("remote_path") == remote_path
+                    and prior_intent.get("storage_mode") == "regular"):
+                if prior_intent.get("regular_confirmed") is not True:
+                    raise RemoteConflict("Файл уже есть в Облаке и совпадает по хешу, но подтверждение обычной "
+                                         "загрузки для него не сохранено. Перезапись и автоматическое признание "
+                                         "неподтверждённой загрузки завершённой отключены.")
+                return {"hash": digest, "size": identity.size, "path": remote_path,
+                        "commit_accepted": False, "recovered_commit": True, "stat_matched": True,
+                        "storage_mode": "regular", "regular_evidence": "saved_commit_response",
+                        "quota_status": "uses_cloud_quota"}
+            raise RemoteConflict("Файл с этим путём уже есть в Облаке. Перезапись отключена.")
+        body = encode_add_file(remote_path, identity.size, max(0, identity.mtime_ns // 1_000_000_000), digest)
+        self.ensure_parent(remote_path)
+        self._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried, upload_type="MANUAL")
+        if identity != FileIdentity.from_stat(os.stat(path, follow_symlinks=False)):
+            raise SourceChanged("Файл изменился до подтверждения загрузки.")
+        save_intent(digest)
+        response = self._require(self._request("POST", self._metadata_endpoint(),
+                                               headers={"Content-Type": "application/octet-stream"},
+                                               body=body, token_query=True), 200)
+        try:
+            status = parse_add_file_response(response.body)
+        except MetadataProtocolError:
+            raise ProtocolError("Сервер не вернул полное подтверждение обычной загрузки в ответе метаданных.") from None
+        if status in (4, 9, 12):
+            raise RemoteConflict("Облако не подтвердило создание нового файла: путь уже существует или конфликтует. "
+                                 "Перезапись и автоматическое переименование отключены.")
+        if status == 7:
+            raise RemoteError(400, "CONDITION/OVERQUOTA")
+        if status == 253:
+            raise RemoteError(400, "CONDITION/BADBLOB")
+        if status != 0:
+            raise ProtocolError(f"Облако не подтвердило обычную загрузку: код метаданных {status}.")
+        if save_confirmation is not None:
+            save_confirmation(digest)
+        result = None
+        for retry in range(4):
+            result = self.stat(remote_path)
+            if result is not None:
+                break
+            self._wait(1 + retry)
+        if result is None or result["hash"] != digest or result["size"] != identity.size:
+            raise ProtocolError("После добавления не подтверждены хеш и размер файла в Облаке.")
+        return {"hash": digest, "size": identity.size, "path": remote_path,
+                "commit_accepted": True, "recovered_commit": False, "stat_matched": True,
+                "storage_mode": "regular", "regular_evidence": "commit_response",
+                "quota_status": "uses_cloud_quota"}
