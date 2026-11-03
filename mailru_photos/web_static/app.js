@@ -4,7 +4,7 @@
   const $ = (id) => document.getElementById(id);
   const numberFormat = new Intl.NumberFormat("ru-RU");
   const pageNames = { overview: "Обзор", queue: "Очередь задач", sources: "Исходные папки", settings: "Настройки" };
-  const busyPhases = new Set(["login", "logout", "scanning", "checking", "probing", "uploading", "pausing", "reconciling"]);
+  const busyPhases = new Set(["login", "logout", "scanning", "checking", "probing", "uploading", "pausing", "reconciling", "quota"]);
   const phaseInfo = {
     idle: ["Готов к работе", "Ожидание", "neutral", "cloud"],
     login: ["Подключаем аккаунт", "Подключение", "blue", "lock"],
@@ -13,6 +13,7 @@
     checking: ["Проверяем доступ к Облаку", "Проверка", "blue", "lock"],
     probing: ["Проверяем безлимит", "Проверка", "blue", "lock"],
     reconciling: ["Проверяем файлы в Облаке", "Проверка", "blue", "scan"],
+    quota: ["Обновляем данные о месте", "Обновление", "blue", "cloud"],
     uploading: ["Загружаем файлы", "Загрузка", "blue", "cloud"],
     pausing: ["Сохраняем прогресс", "Останавливаем", "orange", "pause"],
     paused: ["Загрузка приостановлена", "На паузе", "orange", "pause"],
@@ -25,6 +26,9 @@
   };
   const transferStages = { hash: "Проверка файла", hashing: "Проверка файла", upload: "Передача", uploading: "Передача", blob_upload: "Передача", stat: "Проверка результата", verify: "Проверка результата", verifying: "Проверка результата", commit: "Подтверждение", add: "Подтверждение", unlimited_add: "Подтверждение", preparing: "Подготовка" };
   let session = { authenticated: false, setup_required: false, csrf: "" };
+  let sessionGeneration = 0;
+  let quotaAutoRequested = false;
+  let quotaAutoAccount = null;
   let snapshot = null;
   let activePage = "overview";
   let pollTimer = null;
@@ -113,9 +117,11 @@
   function closeDialogs() {
     document.querySelectorAll("dialog[open]").forEach((dialog) => dialog.close());
     $("mail-password").value = "";
+    clearPanelPasswords();
   }
 
   async function api(path, options = {}) {
+    const generation = sessionGeneration, passwordTransition = pendingActions.has("password");
     const method = options.method || "GET";
     const headers = { Accept: "application/json" };
     const controller = new AbortController();
@@ -133,7 +139,8 @@
       try { value = await response.json(); }
       catch { throw new Error("Сервер вернул неожиданный ответ. Повторите запрос."); }
       if (!response.ok) {
-        if (response.status === 401 && !path.startsWith("/api/session")) {
+        const staleSession = generation !== sessionGeneration || passwordTransition || pendingActions.has("password");
+        if (response.status === 401 && !path.startsWith("/api/session") && !staleSession) {
           session.authenticated = false;
           showAccess(false);
           setError("access-error", "Сессия панели завершилась. Войдите снова.");
@@ -142,6 +149,7 @@
         const error = new Error(message || "Не удалось выполнить действие. Код ответа: " + response.status + ".");
         error.status = response.status;
         error.code = value.error && value.error.code;
+        error.staleSession = staleSession;
         throw error;
       }
       return value;
@@ -221,7 +229,9 @@
 
   async function refreshState() {
     if (!session.authenticated) return;
+    const generation = sessionGeneration;
     const value = await api("/api/state");
+    if (generation !== sessionGeneration) return;
     const previouslyAuthenticated = snapshot && snapshot.authenticated;
     snapshot = value;
     setConnectivity(true);
@@ -234,17 +244,18 @@
   }
 
   async function poll() {
-    if (pollInFlight || !session.authenticated) return;
+    if (pollInFlight || !session.authenticated || pendingActions.has("password")) return;
     pollInFlight = true;
     try {
       await refreshState();
+      if (pendingActions.has("password")) return;
       if (activePage === "queue") await loadJobs(false);
     } catch (error) {
-      if (session.authenticated) setConnectivity(false, error.message + " Данные на экране могут быть устаревшими.");
+      if (session.authenticated && !error.staleSession) setConnectivity(false, error.message + " Данные на экране могут быть устаревшими.");
     } finally {
       pollInFlight = false;
       clearTimeout(pollTimer);
-      if (session.authenticated) pollTimer = setTimeout(poll, document.hidden ? 5000 : 2000);
+      if (session.authenticated && !pendingActions.has("password")) pollTimer = setTimeout(poll, document.hidden ? 5000 : 2000);
     }
   }
 
@@ -265,7 +276,7 @@
     const pausable = ["scanning", "checking", "probing", "uploading", "pausing", "reconciling"].includes(current);
     setHidden("pause-upload", !pausable);
     setHidden("start-upload", pausable);
-    $("pause-upload").disabled = current === "pausing" || pendingActions.has("pause") || !connected;
+    $("pause-upload").disabled = current === "pausing" || pendingActions.has("pause") || pendingActions.has("password") || !connected;
     $("pause-upload").querySelector("span").textContent = current === "scanning" ? "Остановить сканирование" : current === "pausing" ? "Сохраняем прогресс…" : "Приостановить";
     const resumed = ["paused", "error"].includes(current) || finite(snapshot.stats && snapshot.stats.uploaded) > 0;
     $("start-upload").querySelector("span").textContent = resumed ? "Продолжить загрузку" : "Начать загрузку";
@@ -284,6 +295,15 @@
     $("workers").disabled = busy || transient;
     $("auto-resume").disabled = busy || transient;
     $("preflight-check").disabled = busy || transient;
+    $("remote-reconcile").disabled = busy || transient;
+    $("change-panel-password").disabled = transient || !connected || !session.authenticated;
+    const changingPassword = pendingActions.has("password");
+    ["panel-password-current", "panel-password-new", "panel-password-confirm", "panel-password-submit"].forEach((id) => { $(id).disabled = changingPassword || !connected; });
+    setText("panel-password-submit", changingPassword ? "Сохраняем…" : "Сменить пароль");
+    ["logout-panel", "logout-panel-settings"].forEach((id) => { $(id).disabled = changingPassword; });
+    const quotaRefreshing = snapshot.quota_refreshing === true || Boolean(snapshot.quota && snapshot.quota.refreshing) || pendingActions.has("quota");
+    $("quota-refresh").disabled = snapshot.quota_refresh_available !== true || quotaRefreshing || transient || !connected;
+    $("quota-refresh").querySelector("span").textContent = quotaRefreshing ? "Обновляем…" : "Обновить";
     const canClear = canClearQueue();
     $("clear-queue").disabled = !canClear;
     $("queue-clear-submit").disabled = !canClear;
@@ -305,6 +325,7 @@
     const total = Math.max(0, finite(stats.total));
     const uploaded = Math.max(0, finite(stats.uploaded));
     const failed = Math.max(0, finite(stats.failed)), skipped = Math.max(0, finite(stats.skipped));
+    const existing = Math.min(skipped, Math.max(0, finite(stats.existing)));
     const finishedErrors = Math.max(0, finite(stats.permanent_failures ?? failed));
     const processed = Math.min(total, uploaded + finishedErrors + skipped);
     const percentage = total > 0 ? processed / total * 100 : 0;
@@ -328,7 +349,7 @@
     $("overall-progress").setAttribute("aria-valuenow", percentage.toFixed(1));
     $("overall-progress").setAttribute("aria-valuetext", "Обработано задач: " + count(processed) + " из " + count(total));
     setText("transfer-bytes", "Загружено: " + bytes(stats.uploaded_bytes) + " · Объём задач: " + bytes(stats.total_bytes));
-    setText("transfer-outcomes", "Успешно: " + count(uploaded) + " · Ошибок: " + count(failed) + " · Пропущено: " + count(skipped));
+    setText("transfer-outcomes", "Успешно: " + count(uploaded) + (existing ? " · Уже в Облаке: " + count(existing) : "") + " · Ошибок: " + count(failed) + " · Пропущено: " + count(skipped - existing));
     setText("stat-pending", count(finite(stats.pending) + finite(stats.running)));
     const byStatus = stats.bytes_by_status || {};
     setText("stat-pending-bytes", bytes(finite(byStatus.pending) + finite(byStatus.running)));
@@ -336,12 +357,18 @@
     setText("stat-uploaded-bytes", bytes(stats.uploaded_bytes));
     setText("stat-failed", count(failed));
     setText("stat-sources", count(sources.length));
-    setText("stat-skipped", "Пропущено: " + count(skipped));
+    setText("stat-skipped", "Пропущено: " + count(skipped - existing) + (existing ? " · Уже есть: " + count(existing) : ""));
     const scan = activity.scan || {};
     setHidden("scan-live", current !== "scanning");
     setText("scan-seen", count(scan.seen));
     setText("scan-added", count(scan.added));
     setText("scan-changed", count(scan.changed));
+    const reconcile = activity.reconcile || {};
+    setHidden("reconcile-live", current !== "reconciling" || !(state.settings && state.settings.remote_reconcile === true));
+    setText("reconcile-checked", count(reconcile.checked));
+    setText("reconcile-matched", count(reconcile.matched));
+    setText("reconcile-errors", count(reconcile.errors));
+    setText("reconcile-total", typeof reconcile.total === "number" && Number.isFinite(reconcile.total) && reconcile.total >= 0 ? " из " + count(reconcile.total) : "");
     setHidden("probe-live", current !== "probing" && current !== "checking");
     setText("probe-message", current === "checking" ? "Проверяем аккаунт и доступность безлимита…" : "Контрольная проверка безлимита выполняется автоматически.");
     renderProbeCountdown();
@@ -355,7 +382,44 @@
     renderEvents(Array.isArray(state.events) ? state.events : []);
     renderSources(sources);
     renderSettings(state);
+    renderQuota(state);
     updateControls();
+    maybeRefreshQuota();
+  }
+
+  function renderQuota(state) {
+    const quota = state.quota && typeof state.quota === "object" ? state.quota : null;
+    const refreshing = state.quota_refreshing === true || Boolean(quota && quota.refreshing);
+    const valid = Boolean(state.authenticated && quota && typeof quota.used_bytes === "number" && Number.isFinite(quota.used_bytes) && quota.used_bytes >= 0 && typeof quota.total_bytes === "number" && Number.isFinite(quota.total_bytes) && quota.total_bytes >= 0);
+    setHidden("quota-content", !valid); setHidden("quota-empty", valid);
+    setText("quota-empty", !state.authenticated ? "Подключите Mail.ru, чтобы получить данные о свободном месте." : refreshing ? "Получаем данные о месте в аккаунте…" : "Данные о квоте ещё не получены. Нажмите «Обновить», когда кнопка станет доступна.");
+    if (valid) {
+      const used = quota.used_bytes, total = quota.total_bytes;
+      const percent = total > 0 ? Math.max(0, Math.min(100, used / total * 100)) : used > 0 ? 100 : 0;
+      setText("quota-used", bytes(used) + " занято из " + bytes(total));
+      setText("quota-free", typeof quota.free_bytes === "number" && Number.isFinite(quota.free_bytes) ? "Свободно: " + bytes(quota.free_bytes) : "");
+      $("quota-progress-fill").style.width = percent + "%";
+      $("quota-progress").setAttribute("aria-valuenow", percent.toFixed(1));
+      $("quota-progress").setAttribute("aria-valuetext", bytes(used) + " занято из " + bytes(total));
+      const breakdown = [];
+      if (typeof quota.cloud_bytes === "number" && Number.isFinite(quota.cloud_bytes)) breakdown.push("Облако: " + bytes(quota.cloud_bytes));
+      if (typeof quota.mail_bytes === "number" && Number.isFinite(quota.mail_bytes)) breakdown.push("Почта: " + bytes(quota.mail_bytes));
+      setText("quota-breakdown", breakdown.join(" · "));
+      setText("quota-updated", quota.updated_at ? "Обновлено: " + dateTime(quota.updated_at) : "");
+    }
+    const error = state.authenticated ? plain(quota && quota.error, plain(state.quota_error)) : "";
+    const note = error ? "Не удалось обновить данные: " + error : refreshing && valid ? "Обновляем данные…" : quota && quota.stale && valid ? "Показаны последние сохранённые данные. Их можно обновить кнопкой выше." : "";
+    setText("quota-note", note); setHidden("quota-note", !note);
+    $("quota-note").className = "quota-note" + (error ? " error" : "");
+  }
+
+  function maybeRefreshQuota() {
+    if (!snapshot || !snapshot.authenticated) { quotaAutoRequested = false; quotaAutoAccount = null; return; }
+    const account = plain(snapshot.account);
+    if (account !== quotaAutoAccount) { quotaAutoAccount = account; quotaAutoRequested = false; }
+    if (quotaAutoRequested || snapshot.quota !== null || snapshot.quota_refresh_available !== true || snapshot.quota_refreshing === true || isBusy() || anyAction() || !connected) return;
+    quotaAutoRequested = true;
+    perform("quota", "/api/quota/refresh");
   }
 
   function renderOnboarding(state, sources) {
@@ -478,6 +542,7 @@
       $("workers").value = String(finite(state.settings && state.settings.workers, 2));
       $("auto-resume").checked = !state.settings || state.settings.auto_resume !== false;
       $("preflight-check").checked = !state.settings || state.settings.preflight_check !== false;
+      $("remote-reconcile").checked = Boolean(state.settings && state.settings.remote_reconcile === true);
     }
   }
 
@@ -495,14 +560,14 @@
   }
 
   async function loadJobs(showLoading = true) {
-    if (!session.authenticated) return;
-    const request = ++jobsRequest;
+    if (!session.authenticated || pendingActions.has("password")) return;
+    const request = ++jobsRequest, generation = sessionGeneration;
     const offset = jobsOffset, filter = jobsFilter;
     if (showLoading) setText("jobs-loading", "Обновляем…");
     try {
       const query = new URLSearchParams({ status: filter, offset: String(offset), limit: String(jobsLimit) });
       const result = await api("/api/jobs?" + query.toString());
-      if (request !== jobsRequest || offset !== jobsOffset || filter !== jobsFilter) return;
+      if (request !== jobsRequest || generation !== sessionGeneration || offset !== jobsOffset || filter !== jobsFilter) return;
       jobsTotal = Math.max(0, finite(result.total));
       if (jobsOffset >= jobsTotal && jobsOffset > 0) {
         jobsOffset = Math.max(0, Math.floor(Math.max(0, jobsTotal - 1) / jobsLimit) * jobsLimit);
@@ -511,7 +576,7 @@
       renderJobs(Array.isArray(result.jobs) ? result.jobs : []);
       setText("jobs-loading", "");
     } catch (error) {
-      if (request === jobsRequest) setText("jobs-loading", error.message);
+      if (request === jobsRequest && !error.staleSession) setText("jobs-loading", error.message);
     }
   }
 
@@ -526,8 +591,37 @@
     if (job.remove_requested === true) return ["Убирается…", "neutral"];
     if (job.paused === true && job.status === "running") return ["Останавливается…", "orange"];
     if (job.paused === true && !["uploaded", "skipped"].includes(job.status)) return jobStates.paused;
+    if (job.status === "skipped" && job.skip_reason === "remote_exists") return ["Уже в Облаке", "green"];
     if (job.status === "failed" && job.next_attempt != null) return ["Повтор позже", "orange"];
     return jobStates[job.status] || ["Неизвестно", "neutral"];
+  }
+
+  function taskLinkURL(value, cloud = false) {
+    if (typeof value !== "string" || !value) return "";
+    try {
+      if (cloud) {
+        const url = new URL(value);
+        return url.protocol === "https:" && url.hostname === "cloud.mail.ru" && !url.username && !url.password && (!url.port || url.port === "443") ? value : "";
+      }
+      if (!value.startsWith("/") || value.startsWith("//")) return "";
+      const url = new URL(value, location.origin);
+      return url.origin === location.origin && !url.username && !url.password ? value : "";
+    } catch { return ""; }
+  }
+
+  function createTaskLink(symbol, text, kind) {
+    const link = element("a", "task-link");
+    link.target = "_blank"; link.rel = "noopener noreferrer"; link.dataset.taskLink = kind;
+    link.append(icon(symbol, "small"), document.createTextNode(text));
+    if (kind === "download") link.setAttribute("download", "");
+    return link;
+  }
+
+  function updateTaskLink(link, value, description, cloud = false) {
+    const url = taskLinkURL(value, cloud);
+    link.hidden = !url;
+    if (url) link.setAttribute("href", url); else link.removeAttribute("href");
+    link.setAttribute("aria-label", description);
   }
 
   function createJobView(job) {
@@ -536,11 +630,14 @@
     const name = element("div", "job-name"), fileIcon = icon("image"), label = element("span");
     name.append(fileIcon, label);
     const remote = element("div", "job-path");
+    const links = element("div", "task-links");
+    const previewLink = createTaskLink("image", "Открыть фото", "preview"), downloadLink = createTaskLink("download", "Скачать", "download"), cloudLink = createTaskLink("external", "В Облаке", "cloud");
+    links.append(previewLink, downloadLink, cloudLink);
     const storage = element("span", "storage-mode", "Обычное хранение");
     storage.title = "Режим загрузки с расходованием места по тарифу";
     const detail = element("div", "job-detail"), actionError = element("div", "task-action-error");
     actionError.setAttribute("role", "status"); actionError.hidden = true;
-    nameCell.append(name, remote, storage, detail, actionError);
+    nameCell.append(name, remote, links, storage, detail, actionError);
     const statusCell = element("td", "task-status-cell"), badge = element("span", "badge neutral");
     const progress = element("div", "task-progress"), progressHeading = element("div", "task-progress-heading");
     const stage = element("span"), percentage = element("span", "task-percent");
@@ -553,7 +650,7 @@
     primary.type = "button"; primary.dataset.taskControl = "primary"; primary.append(primaryIcon, primaryLabel);
     const remove = element("button", "button compact danger subtle task-remove"); remove.type = "button"; remove.dataset.taskControl = "remove"; remove.appendChild(icon("remove", "small"));
     actions.append(primary, remove); actionsCell.appendChild(actions); row.append(nameCell, statusCell, size, attempts, actionsCell);
-    const view = { row, name, fileIcon, label, remote, storage, detail, actionError, badge, progress, stage, percentage, track, fill, transferred, size, attempts, actions, primary, primaryIcon, primaryLabel, remove, job, error: "" };
+    const view = { row, name, fileIcon, label, remote, links, previewLink, downloadLink, cloudLink, storage, detail, actionError, badge, progress, stage, percentage, track, fill, transferred, size, attempts, actions, primary, primaryIcon, primaryLabel, remove, job, error: "" };
     primary.addEventListener("click", () => {
       const action = taskPrimaryAction(view.job);
       if (action && primary.getAttribute("aria-disabled") !== "true") performTask(view, action[0]);
@@ -590,13 +687,17 @@
     view.fileIcon.firstElementChild.setAttribute("href", "#i-" + mediaIcon(fullName));
     view.name.title = plain(job.local_path, fullName);
     view.remote.textContent = plain(job.remote_path); view.remote.title = plain(job.remote_path);
+    updateTaskLink(view.previewLink, job.preview_url, "Открыть фото в новой вкладке: " + fullName);
+    updateTaskLink(view.downloadLink, job.download_url, "Скачать файл с сервера: " + fullName);
+    updateTaskLink(view.cloudLink, job.cloud_url, "Открыть в Облаке: " + fullName, true);
+    view.links.hidden = view.previewLink.hidden && view.downloadLink.hidden && view.cloudLink.hidden;
     view.storage.hidden = job.storage_mode !== "regular";
     const state = taskState(job);
     view.badge.textContent = state[0]; view.badge.className = "badge " + state[1];
     let detail = plain(job.last_error);
     if (job.next_attempt != null && job.status === "failed") detail += (detail ? " · " : "") + "Автоматический повтор: " + dateTime(job.next_attempt);
     if (!detail && job.status === "uploaded") detail = job.uploaded_at ? "Загружено: " + dateTime(job.uploaded_at) : "Файл сохранён в Облаке";
-    if (!detail && job.status === "skipped") detail = "Задача пропущена. Подробности — в журнале работы.";
+    if (!detail && job.status === "skipped") detail = job.skip_reason === "remote_exists" ? "Файл уже есть в указанной папке Облака. Повторная передача пропущена." : "Задача пропущена. Подробности — в журнале работы.";
     view.detail.textContent = detail; view.detail.hidden = !detail;
     view.detail.className = "job-detail" + (job.status === "failed" ? " failed" : "");
     view.size.textContent = bytes(job.size); view.attempts.textContent = count(job.attempts);
@@ -788,6 +889,7 @@
 
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
   $("mail-dialog").addEventListener("close", () => { $("mail-password").value = ""; });
+  $("panel-password-dialog").addEventListener("close", clearPanelPasswords);
   window.addEventListener("hashchange", () => navigate(location.hash.slice(1)));
   document.addEventListener("visibilitychange", () => { if (!document.hidden && session.authenticated) { clearTimeout(pollTimer); poll(); } });
 
@@ -808,6 +910,7 @@
   });
 
   async function logoutPanel() {
+    if (pendingActions.has("password")) return;
     try {
       await api("/api/session/logout", { method: "POST" });
       session.authenticated = false; snapshot = null;
@@ -942,12 +1045,53 @@
       $("queue-title").focus({ preventScroll: true });
     }
   });
-  ["workers", "auto-resume", "preflight-check"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
+  $("quota-refresh").addEventListener("click", () => {
+    if (!snapshot || snapshot.quota_refresh_available !== true || anyAction() || !connected) return;
+    quotaAutoRequested = true;
+    perform("quota", "/api/quota/refresh", {}, { message: "Обновление данных о месте запрошено." });
+  });
+
+  function clearPanelPasswords() {
+    ["panel-password-current", "panel-password-new", "panel-password-confirm"].forEach((id) => { $(id).value = ""; });
+  }
+
+  $("change-panel-password").addEventListener("click", () => {
+    if (anyAction() || !connected || !session.authenticated) return;
+    clearPanelPasswords(); setError("panel-password-error"); showDialog("panel-password-dialog");
+  });
+  $("panel-password-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (anyAction() || !connected || !session.authenticated) return;
+    setError("panel-password-error");
+    const currentPassword = $("panel-password-current").value, newPassword = $("panel-password-new").value;
+    if (!currentPassword) { setError("panel-password-error", "Введите текущий пароль панели."); $("panel-password-current").focus(); return; }
+    if (Array.from(newPassword).length < 12 || Array.from(newPassword).length > 1024) { setError("panel-password-error", "Новый пароль должен содержать от 12 до 1024 символов."); $("panel-password-new").focus(); return; }
+    if (newPassword !== $("panel-password-confirm").value) { setError("panel-password-error", "Новые пароли не совпадают."); $("panel-password-confirm").focus(); return; }
+    pendingActions.add("password"); sessionGeneration += 1; clearTimeout(pollTimer); updateControls();
+    try {
+      const result = await api("/api/session/password", { method: "POST", body: { current_password: currentPassword, new_password: newPassword } });
+      if (result.authenticated === true && typeof result.csrf === "string" && result.csrf) {
+        session = { authenticated: true, setup_required: false, csrf: result.csrf };
+      } else if (!await refreshSession()) {
+        return;
+      }
+      $("panel-password-dialog").close();
+      toast("Пароль панели изменён. В этом браузере вход сохранён.");
+    } catch (error) {
+      if ($("panel-password-dialog").open) setError("panel-password-error", error.message);
+      else toast(error.message, true);
+    } finally {
+      clearPanelPasswords(); pendingActions.delete("password"); updateControls();
+      clearTimeout(pollTimer); poll();
+    }
+  });
+
+  ["workers", "auto-resume", "preflight-check", "remote-reconcile"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
   $("settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const workers = Number($("workers").value);
     if (!Number.isInteger(workers) || workers < 1 || workers > 16) { setError("settings-error", "Укажите целое число потоков от 1 до 16."); return; }
-    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
+    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked, remote_reconcile: $("remote-reconcile").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
     if (success) { settingsDirty = false; if (snapshot) renderSettings(snapshot); }
   });
 

@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import secrets
+import struct
+import zlib
 import subprocess
 import tempfile
 import time
@@ -93,6 +95,13 @@ def smoke(image: str, *, version: str | None = None) -> None:
         state, photos = base / "state", base / "photos"
         state.mkdir(mode=0o700)
         photos.mkdir(mode=0o755)
+        def png_chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+        photo_bytes = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+                       + png_chunk(b"IDAT", zlib.compress(b"\x00\x20\x80\xf0\xff")) + png_chunk(b"IEND", b""))
+        photo = photos / "smoke.png"
+        photo.write_bytes(photo_bytes)
+        photo.chmod(0o644)
         # GitHub's Ubuntu runner has a non-root host account. This fallback also
         # allows a developer running the script as root to exercise a non-root UID.
         uid = os.getuid() or 23456
@@ -111,18 +120,20 @@ def smoke(image: str, *, version: str | None = None) -> None:
                          "--mount", f"type=bind,src={photos},dst=/photos,readonly"]
             try:
                 docker(*args, image)
+                if not mounted:
+                    docker("cp", str(photo), f"{name}:/photos/smoke.png")
                 bound = json.loads(docker("inspect", name))[0]["NetworkSettings"]["Ports"]["8787/tcp"][0]
                 origin = f"http://127.0.0.1:{bound['HostPort']}"
                 opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
-                def request(path, data=None, csrf=None, expected=200):
-                    headers = {"Origin": origin}
+                def request(path, data=None, csrf=None, expected=200, *, method=None, extra_headers=None):
+                    headers = {"Origin": origin, **(extra_headers or {})}
                     body = None
                     if data is not None:
                         body = json.dumps(data).encode()
                         headers.update({"Content-Type": "application/json", "X-CSRF-Token": csrf or ""})
                     try:
-                        response = opener.open(Request(origin + path, data=body, headers=headers), timeout=5)
+                        response = opener.open(Request(origin + path, data=body, headers=headers, method=method), timeout=5)
                     except HTTPError as error:
                         response = error
                     with response:
@@ -172,6 +183,44 @@ def smoke(image: str, *, version: str | None = None) -> None:
                 changed, _ = request("/api/settings", {"workers": 2, "auto_resume": True,
                                                         "preflight_check": False}, session["csrf"])
                 require(changed["settings"]["preflight_check"] is False, "The preflight setting was not saved")
+                require(initial["settings"]["remote_reconcile"] is False, "Remote comparison must be opt-in")
+                require(initial["quota"] is None, "An account-free image must not invent quota values")
+                sources, _ = request("/api/sources/add", {"path":"/photos", "alias":"Fixture", "remote_prefix":"/Smoke"}, session["csrf"])
+                source_id = sources["sources"][0]["id"]
+                request("/api/scan", {}, session["csrf"])
+                deadline = time.monotonic() + 30
+                while True:
+                    scanned, _ = request("/api/state")
+                    if scanned["activity"]["phase"] != "scanning":
+                        break
+                    require(time.monotonic() < deadline, "Fixture scan did not finish")
+                    time.sleep(0.1)
+                require(scanned["stats"]["total"] == 1, "Real container did not scan the mounted source")
+                tasks, _ = request("/api/jobs")
+                task = tasks["jobs"][0]
+                require(task["status"] == "pending", "Account-free scan must not upload")
+                body, headers = request(task["preview_url"])
+                require(body == photo_bytes and headers.get("Content-Type", "").startswith("image/png"),
+                        "Authenticated photo preview did not preserve source bytes")
+                body, headers = request(task["download_url"])
+                require(body == photo_bytes and headers.get("Content-Disposition", "").startswith("attachment"),
+                        "Download must preserve bytes and set attachment disposition")
+                body, headers = request(task["preview_url"], expected=206, extra_headers={"Range":"bytes=0-7"})
+                require(body == photo_bytes[:8] and headers.get("Content-Range") == f"bytes 0-7/{len(photo_bytes)}",
+                        "Byte range response is incorrect")
+                body, headers = request(task["preview_url"], method="HEAD")
+                require(body == b"" and int(headers["Content-Length"]) == len(photo_bytes), "HEAD must not stream bytes")
+                paused, _ = request("/api/tasks/pause", {"id":task["id"]}, session["csrf"])
+                require(paused["stats"]["paused"] == 1, "Individual task pause was not persisted")
+                request("/api/tasks/resume", {"id":task["id"]}, session["csrf"])
+                request("/api/tasks/pause", {"id":task["id"]}, session["csrf"])
+                old_csrf = session["csrf"]
+                next_password = secrets.token_urlsafe(24)
+                session, _ = request("/api/session/password", {"current_password":password, "new_password":next_password}, old_csrf)
+                require(session["authenticated"] is True and session["csrf"] != old_csrf, "Password change must rotate the session")
+                request("/api/settings", {"workers":2,"auto_resume":True}, old_csrf, expected=403)
+                password = next_password
+                request("/api/settings", {"workers":2,"auto_resume":True,"preflight_check":False,"remote_reconcile":True}, session["csrf"])
                 if mounted:
                     saved = docker("exec", name, "python", "-c",
                                    "from pathlib import Path; import json, stat; "
@@ -202,6 +251,16 @@ def smoke(image: str, *, version: str | None = None) -> None:
                             "The preflight setting did not survive a container restart")
                     require("upload_large_files" not in restored["settings"],
                             "Restart must not restore the removed ordinary upload setting")
+                    require(restored["settings"]["remote_reconcile"] is True, "Comparison setting was not restored")
+                    require(restored["stats"]["paused"] == 1, "Individual task pause did not survive restart")
+                    body, _ = request(task["preview_url"])
+                    require(body == photo_bytes, "Restored queue cannot open the original source")
+                request("/api/tasks/clear", {"scope":"all"}, session["csrf"])
+                cleared, _ = request("/api/state")
+                require(cleared["stats"]["total"] == 0 and len(cleared["sources"]) == 1,
+                        "Queue clear must retain source registrations")
+                request("/api/sources/remove", {"id":source_id}, session["csrf"])
+                require(photo.read_bytes() == photo_bytes, "Source controls changed host originals")
                 # Execute the Dockerfile's health command as the configured user,
                 # rather than waiting for the scheduled interval.
                 check = config["Config"]["Healthcheck"]["Test"]

@@ -1,3 +1,3 @@
 """Personal photo import client, reconstructed from Cloud Mail's upload flow."""
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"

@@ -1,15 +1,20 @@
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from mailru_photos.api import FileIdentity
+from mailru_photos.content import open_task_content
 from mailru_photos.web import WebApplication
 
 
 class FakeService:
     def __init__(self):
         self.calls = []
+        self.content_sources = {}
 
     def snapshot(self):
         return {"configured": False, "authenticated": False, "stats": {"total": 0}}
@@ -48,6 +53,15 @@ class FakeService:
     def settings(self, **kwargs):
         self.calls.append(("settings", kwargs))
 
+    def refresh_quota(self):
+        self.calls.append(('refresh_quota',))
+
+    def task_source(self, task_id):
+        self.calls.append(('task_source', task_id))
+        if task_id not in self.content_sources:
+            raise FileNotFoundError('Offline missing task')
+        return self.content_sources[task_id]
+
     def start(self):
         self.calls.append(("start",))
 
@@ -70,7 +84,7 @@ class WebTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def request(self, path, *, method="GET", data=None, host="localhost:8787", origin="http://localhost:8787", csrf=None, body=None, content_type="application/json"):
+    def request(self, path, *, method="GET", data=None, host="localhost:8787", origin="http://localhost:8787", csrf=None, body=None, content_type="application/json", headers=None):
         target, _, query = path.partition("?")
         raw = body if body is not None else json.dumps(data or {}).encode()
         environ = {"REQUEST_METHOD": method, "PATH_INFO": target, "QUERY_STRING": query,
@@ -79,10 +93,18 @@ class WebTests(unittest.TestCase):
                    "wsgi.url_scheme": "http", "REMOTE_ADDR": "127.0.0.1",
                    "wsgi.input": io.BytesIO(raw), "CONTENT_LENGTH": str(len(raw)),
                    "CONTENT_TYPE": content_type}
+        for name, value in (headers or {}).items():
+            environ['HTTP_' + name.upper().replace('-', '_')] = value
         reply = {}
         def respond(status, headers):
             reply.update(status=int(status.split()[0]), headers=dict(headers))
-        payload = b"".join(self.app(environ, respond))
+        response = self.app(environ, respond)
+        try:
+            payload = b"".join(response)
+        finally:
+            close = getattr(response, 'close', None)
+            if callable(close):
+                close()
         if "Set-Cookie" in reply["headers"]:
             self.cookie = reply["headers"]["Set-Cookie"].split(";", 1)[0]
         if payload and reply["headers"]["Content-Type"].startswith("application/json"):
@@ -177,6 +199,27 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response['status'], 400)
         self.assertEqual(len(self.service.calls), calls)
 
+    def test_remote_reconcile_setting_and_quota_refresh_are_authenticated_mutations(self):
+        self.request('/api/session')
+        self.assertEqual(self.request('/api/quota/refresh', method='POST')['status'], 401)
+        self.authenticate()
+        self.assertEqual(self.request('/api/quota/refresh', method='POST', csrf='bad')['status'], 403)
+        self.assertEqual(self.request('/api/quota/refresh', method='POST')['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('refresh_quota',))
+        for choice in (False, True):
+            response = self.request('/api/settings', method='POST', data={
+                'workers': 2, 'auto_resume': True, 'remote_reconcile': choice})
+            self.assertEqual(response['status'], 200)
+            self.assertIs(self.service.calls[-1][1]['remote_reconcile'], choice)
+        response = self.request('/api/settings', method='POST', data={'workers': 2, 'auto_resume': True})
+        self.assertEqual(response['status'], 200)
+        self.assertIsNone(self.service.calls[-1][1]['remote_reconcile'])
+        before = list(self.service.calls)
+        for choice in (None, 0, 1, 'true'):
+            self.assertEqual(self.request('/api/settings', method='POST', data={
+                'workers': 2, 'auto_resume': True, 'remote_reconcile': choice})['status'], 400)
+        self.assertEqual(self.service.calls, before)
+
     def test_removed_large_upload_setting_is_rejected_without_partial_change(self):
         self.authenticate()
         before = list(self.service.calls)
@@ -237,6 +280,121 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.service.calls[-1], ("login", "test@example.invalid", "mail-test-password-only"))
         self.assertNotIn(b"mail-test-password-only", response["body"])
         self.assertNotIn("mail-test-password-only", (self.path / "web_access.json").read_text())
+
+    def test_panel_password_change_rotates_session_without_touching_mail_service(self):
+        self.authenticate()
+        old_cookie, old_csrf = self.cookie, self.csrf
+        response = self.request('/api/session/password', method='POST', data={
+            'current_password': 'panel-test-only-password', 'new_password': 'new-panel-only-password'})
+        self.assertEqual(response['status'], 200)
+        self.assertTrue(response['data']['authenticated'])
+        self.assertNotEqual(self.cookie, old_cookie)
+        self.assertNotEqual(self.csrf, old_csrf)
+        self.assertIsNone(self.app.access.read_session(old_cookie))
+        self.assertTrue(self.app.access.read_session(self.cookie)['authenticated'])
+        self.assertEqual(self.service.calls, [])
+        self.assertNotIn(b'new-panel-only-password', response['body'])
+        self.assertNotIn('new-panel-only-password', (self.path / 'web_access.json').read_text())
+        self.assertEqual(self.request('/api/start', method='POST', csrf=old_csrf)['status'], 403)
+        self.app = WebApplication(self.service, self.path)
+        self.assertEqual(self.request('/api/state')['status'], 200)
+        self.app.access.login('new-panel-only-password', 'new-offline-peer')
+
+    def test_panel_password_change_requires_auth_origin_csrf_and_correct_old_password(self):
+        payload = {'current_password': 'panel-test-only-password', 'new_password': 'new-panel-only-password'}
+        self.request('/api/session')
+        self.assertEqual(self.request('/api/session/password', method='POST', data=payload)['status'], 401)
+        self.authenticate()
+        before = (self.path / 'web_access.json').read_bytes()
+        for changes in ({'origin': 'http://wrong.invalid'}, {'csrf': 'invalid'}):
+            self.assertEqual(self.request('/api/session/password', method='POST', data=payload, **changes)['status'], 403)
+        for _ in range(8):
+            response = self.request('/api/session/password', method='POST', data={**payload, 'current_password': 'wrong-current-password'})
+            self.assertEqual(response['status'], 400)
+            self.assertEqual(response['data']['error']['code'], 'invalid_current_password')
+        self.assertEqual(self.request('/api/session/password', method='POST', data=payload)['status'], 429)
+        self.assertEqual((self.path / 'web_access.json').read_bytes(), before)
+        self.assertEqual(self.request('/api/state')['status'], 200)
+
+    def test_failed_password_replace_keeps_old_disk_state_memory_and_session(self):
+        self.authenticate()
+        before = (self.path / 'web_access.json').read_bytes()
+        memory = json.loads(json.dumps(self.app.access.data))
+        cookie = self.cookie
+        with patch('mailru_photos.web.os.replace', side_effect=OSError('private-error-do-not-echo')):
+            response = self.request('/api/session/password', method='POST', data={
+                'current_password': 'panel-test-only-password', 'new_password': 'new-panel-only-password'})
+        self.assertEqual(response['status'], 500)
+        self.assertNotIn(b'private-error', response['body'])
+        self.assertEqual(self.app.access.data, memory)
+        self.assertEqual((self.path / 'web_access.json').read_bytes(), before)
+        self.assertEqual(self.cookie, cookie)
+        self.assertEqual(self.request('/api/state')['status'], 200)
+        self.assertEqual(list(self.path.glob('.panel-*')), [])
+
+    def content_fixture(self):
+        root = self.path / 'media'
+        root.mkdir()
+        path = root / 'семья.jpg'
+        data = b'\xff\xd8\xff0123456789'
+        path.write_bytes(data)
+        self.service.content_sources[1] = (root, path, FileIdentity.from_stat(path.stat()))
+        return data
+
+    def test_task_content_requires_panel_auth_and_serves_original_bytes_ranges_and_head(self):
+        data = self.content_fixture()
+        self.assertEqual(self.request('/api/tasks/1/content')['status'], 401)
+        self.assertEqual(self.request('/api/tasks/1/content', method='HEAD')['status'], 401)
+        self.assertEqual(self.service.calls, [])
+        self.authenticate()
+        response = self.request('/api/tasks/1/content?download=0')
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(response['body'], data)
+        self.assertEqual(response['headers']['Content-Type'], 'image/jpeg')
+        self.assertTrue(response['headers']['Content-Disposition'].startswith('inline;'))
+        response = self.request('/api/tasks/1/content?download=1', headers={'Range': 'bytes=3-6'})
+        self.assertEqual(response['status'], 206)
+        self.assertEqual(response['body'], data[3:7])
+        self.assertTrue(response['headers']['Content-Disposition'].startswith('attachment;'))
+        self.assertEqual(response['headers']['Content-Range'], f'bytes 3-6/{len(data)}')
+        response = self.request('/api/tasks/1/content', method='HEAD', headers={'Range': 'bytes=3-6'})
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(response['body'], b'')
+        self.assertEqual(response['headers']['Content-Length'], str(len(data)))
+        response = self.request('/api/tasks/1/content', headers={'Range': 'bytes=999-'})
+        self.assertEqual(response['status'], 416)
+        self.assertEqual(response['headers']['Content-Range'], f'bytes */{len(data)}')
+
+    def test_content_has_no_arbitrary_path_parameter_and_changed_source_is_not_served(self):
+        self.content_fixture()
+        self.authenticate()
+        for target in ('/api/tasks/1/content?path=/etc/passwd', '/api/tasks/1/content?download=2',
+                       '/api/tasks/1/content?download=', '/api/tasks/1/content?download=0&download=1'):
+            with self.subTest(target=target):
+                self.assertEqual(self.request(target)['status'], 400)
+        self.assertEqual(self.service.calls, [])
+        self.assertEqual(self.request('/api/tasks/999/content')['status'], 404)
+        self.assertEqual(self.request('/api/tasks/../etc/passwd/content')['status'], 404)
+        source = self.service.content_sources[1]
+        source[1].write_bytes(b'changed file')
+        response = self.request('/api/tasks/1/content')
+        self.assertEqual(response['status'], 409)
+        self.assertNotIn(b'changed file', response['body'])
+
+    def test_failure_to_send_streaming_headers_closes_file_descriptor(self):
+        self.content_fixture()
+        self.authenticate()
+        response = open_task_content(*self.service.content_sources[1])
+        descriptor = response._fd
+        environ = {'REQUEST_METHOD': 'GET', 'PATH_INFO': '/api/tasks/1/content', 'QUERY_STRING': '',
+                   'HTTP_HOST': 'localhost:8787', 'HTTP_COOKIE': self.cookie, 'wsgi.url_scheme': 'http'}
+        def disconnected(*args):
+            raise BrokenPipeError('Offline disconnected browser')
+        with patch('mailru_photos.web.open_task_content', return_value=response):
+            with self.assertRaises(BrokenPipeError):
+                self.app(environ, disconnected)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
 
     def test_job_listing_is_bounded_and_filter_validated(self):
         self.authenticate()

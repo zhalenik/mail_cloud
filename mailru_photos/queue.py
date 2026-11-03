@@ -55,6 +55,7 @@ _SCHEMA_OBJECTS = frozenset({
     ("index", "upload_results_job"),
     ("index", "commit_evidence_job"),
     ("index", "upload_results_origin"), ("index", "commit_evidence_origin"),
+    ("index", "jobs_reconcile"),
 })
 _JOB_SUMMARY_COLUMNS = (
     "id,root_id,relative_path,local_path,remote_path,status,size,attempts,present,"
@@ -485,6 +486,8 @@ class Queue:
             "CREATE INDEX IF NOT EXISTS commit_evidence_job ON commit_evidence(job_id)",
             "CREATE INDEX IF NOT EXISTS upload_results_origin ON upload_results(origin_job_id)",
             "CREATE INDEX IF NOT EXISTS commit_evidence_origin ON commit_evidence(origin_job_id)",
+            "CREATE INDEX IF NOT EXISTS jobs_reconcile ON jobs(id) WHERE present=1 AND paused=0 AND remove_requested=0 "
+            f"AND status IN ('pending','failed') AND size>0 AND size<={UNLIMITED_MAX_BYTES}",
         )
         for statement in statements:
             self._db.execute(statement)
@@ -777,7 +780,7 @@ class Queue:
                 self._db.execute("UPDATE jobs SET remove_requested=1,updated_at=? WHERE id=?", (time.time(), job_id))
             elif row["remove_requested"]:
                 raise QueueBusyError("This task is already being removed.")
-            elif row["status"] == "uploaded":
+            elif row["status"] == "uploaded" or (row["status"] == "skipped" and row["skip_reason"] == "remote_exists"):
                 return self._task_dict(row)
             elif action == "pause":
                 self._db.execute("UPDATE jobs SET paused=1,updated_at=? WHERE id=?", (time.time(), job_id))
@@ -863,7 +866,7 @@ class Queue:
             now = time.time()
             try:
                 if selected_prefix != root["remote_prefix"]:
-                    mutable = ("root_id=? AND status<>'uploaded' AND NOT EXISTS "
+                    mutable = ("root_id=? AND status<>'uploaded' AND NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists') AND NOT EXISTS "
                                "(SELECT 1 FROM commit_intents WHERE job_id=jobs.id)")
                     # Temporarily free old keys inside this transaction. This
                     # permits a destination below the old prefix without false
@@ -1015,8 +1018,8 @@ class Queue:
                             self._db.execute(
                                 "UPDATE jobs SET present=0, updated_at=?, "
                                 "status=CASE WHEN status='uploaded' THEN status ELSE 'skipped' END, "
-                                "skip_reason=CASE WHEN status='uploaded' THEN skip_reason ELSE 'missing' END, "
-                                "last_error=CASE WHEN status='uploaded' THEN last_error "
+                                "skip_reason=CASE WHEN status='uploaded' OR skip_reason='remote_exists' THEN skip_reason ELSE 'missing' END, "
+                                "last_error=CASE WHEN status='uploaded' OR skip_reason='remote_exists' THEN last_error "
                                 "ELSE 'Absent or excluded in the latest complete source scan' END "
                                 "WHERE root_id=? AND present=1 AND (seen_scan IS NULL OR seen_scan<>?)",
                                 (time.time(), root.id, result.scan_id),
@@ -1071,7 +1074,7 @@ class Queue:
         return row
 
     def _update_unchanged_source(self, row: sqlite3.Row, values: tuple, scan_id: int, now: float) -> None:
-        frozen = (row["status"] == "uploaded" or self._db.execute(
+        frozen = (row["status"] == "uploaded" or (row["status"] == "skipped" and row["skip_reason"] == "remote_exists") or self._db.execute(
             "SELECT 1 FROM commit_intents WHERE job_id=?", (row["id"],)).fetchone() is not None)
         remote_path = row["remote_path"] if frozen else values[4]
         remote_key = row["remote_key"] if frozen else values[5]
@@ -1541,6 +1544,69 @@ class Queue:
                 (time.time(), int(include_permanent)),
             ).rowcount
 
+    def reconcile_candidates(self, *, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        """One bounded keyset page for an optional, read-only cloud comparison.
+
+        No upload claims are created. The reconciliation pass owns the run
+        lock, and final adoption rechecks eligibility and the source snapshot.
+        """
+        if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("after_id must be nonnegative and limit must be in 1..500")
+        with self._mutex:
+            self._require_idle_sources()
+            return [dict(row) for row in self._db.execute(
+                "SELECT id,root_id,relative_path,local_path,remote_path,size,mtime_ns,device,inode "
+                "FROM jobs INDEXED BY jobs_reconcile WHERE id>? AND present=1 AND paused=0 AND remove_requested=0 "
+                f"AND status IN ('pending','failed') AND size>0 AND size<={UNLIMITED_MAX_BYTES} "
+                "AND NOT EXISTS (SELECT 1 FROM commit_intents WHERE job_id=jobs.id) ORDER BY id LIMIT ?",
+                (after_id, limit),
+            )]
+
+    def mark_remote_existing(self, candidate: Mapping[str, Any], *, remote_hash: str) -> bool:
+        """Record an exact-path content observation, never an upload/billing proof.
+
+        Return False when a concurrent pause/removal/source change makes this
+        candidate stale. The caller has already compared the cloud hash and
+        size; the local snapshot and current mapping are rechecked here.
+        """
+        if (not isinstance(remote_hash, str) or len(remote_hash) != 40
+                or any(char not in "0123456789abcdefABCDEF" for char in remote_hash)):
+            raise ValueError("A valid Mail Cloud hash is required")
+        expected = (candidate["size"], candidate["mtime_ns"], candidate["device"], int(candidate["inode"]))
+        if not 0 < expected[0] <= UNLIMITED_MAX_BYTES:
+            return False
+        with self._transaction():
+            account = self._get_meta("_account_id")
+            if not account:
+                raise QueueConfigurationError("Bind the authenticated account before comparing cloud files.")
+            if self._get_meta("_scan_token"):
+                raise QueueBusyError("Wait for scanning to finish before comparing cloud files.")
+            row = self._db.execute("SELECT * FROM jobs WHERE id=?", (candidate["id"],)).fetchone()
+            if (row is None or not row["present"] or row["paused"] or row["remove_requested"]
+                    or row["status"] not in ("pending", "failed")
+                    or any(row[key] != candidate[key] for key in ("root_id", "relative_path", "local_path", "remote_path"))
+                    or (row["size"], row["mtime_ns"], row["device"], int(row["inode"])) != expected
+                    or self._db.execute("SELECT 1 FROM commit_intents WHERE job_id=?", (row["id"],)).fetchone()):
+                return False
+            try:
+                if _snapshot(row["local_path"]) != expected:
+                    return False
+            except OSError:
+                return False
+            observation = {
+                "remote_exists": True, "account_id": account, "path": row["remote_path"],
+                "hash": remote_hash.upper(), "size": row["size"], "observed_at": time.time(),
+                "quota_status": "unknown",
+            }
+            self._db.execute(
+                "UPDATE jobs SET status='skipped',skip_reason='remote_exists',claim_token=NULL,"
+                "next_attempt=NULL,last_error=NULL,remote_hash=?,remote_id=NULL,verified_metadata=?,"
+                "storage_mode=NULL,uploaded_at=NULL,updated_at=? WHERE id=?",
+                (remote_hash.upper(), json.dumps(observation, ensure_ascii=False, allow_nan=False),
+                 observation["observed_at"], row["id"]),
+            )
+            return True
+
     def stats(self, *, now: float | None = None, storage_mode: str | None = None,
               include_missing: bool = False) -> dict[str, Any]:
         current = time.time() if now is None else now
@@ -1566,6 +1632,9 @@ class Queue:
             permanent = self._db.execute(
                 f"SELECT COUNT(*) FROM jobs WHERE {selected} AND status='failed' AND next_attempt IS NULL"
             ).fetchone()[0]
+            existing = self._db.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE {selected} AND status='skipped' AND skip_reason='remote_exists'"
+            ).fetchone()[0]
             controls = self._db.execute(
                 f"SELECT COALESCE(SUM(paused),0) AS paused,COALESCE(SUM(remove_requested),0) AS removing,"
                 "COALESCE(SUM(CASE WHEN present=1 AND paused=0 AND remove_requested=0 AND (status IN ('pending','running') "
@@ -1579,6 +1648,7 @@ class Queue:
                 **counts, "total": sum(counts.values()), "total_bytes": sum(sizes.values()),
                 "uploaded_bytes": sizes["uploaded"], "bytes_by_status": sizes,
                 "ready": ready, "permanent_failures": permanent, "next_retry_at": next_retry,
+                "existing": existing,
                 "scan_active": bool(self._get_meta("_scan_token")),
                 "roots": self._db.execute("SELECT COUNT(*) FROM roots").fetchone()[0],
                 **dict(controls),

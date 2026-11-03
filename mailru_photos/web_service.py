@@ -13,13 +13,15 @@ import json
 import logging
 import math
 import os
+import sqlite3
 from pathlib import Path
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import quote
 
 from . import __version__
-from .api import CloudAPI, PROTOCOL_VERSION, ProtocolError
+from .api import CloudAPI, FileIdentity, PROTOCOL_VERSION, ProtocolError
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .cli import write_json
 from .queue import FileChangedError, Queue, QueueBusyError, QueueError, STATES, _file_lock
@@ -28,6 +30,20 @@ from .transport import Cancelled, TransportError
 
 LOGGER = logging.getLogger("mailru_photos.service")
 LOGGER.addHandler(logging.NullHandler())
+
+
+class _QuotaObservedAPI:
+    """Observe genuine quota responses without extra requests or token managers."""
+    def __init__(self, api, callback):
+        self._api, self._callback = api, callback
+
+    def __getattr__(self, name):
+        return getattr(self._api, name)
+
+    def quota(self):
+        value = self._api.quota()
+        self._callback(value)
+        return value
 
 
 class WebService:
@@ -56,8 +72,10 @@ class WebService:
         self._closed = False
         self._files: dict[int, dict] = {}
         self._task_signals: dict[int, tuple[str, threading.Event]] = {}
+        self._quota_cache: dict | None = None
+        self._quota_error: str | None = None
         self._uploaded_in_run = 0
-        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True}
+        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True, "remote_reconcile": False}
         stored = self._read_json("web_settings.json", {})
         if isinstance(stored, dict):
             if type(stored.get("workers")) is int and 1 <= stored["workers"] <= 16:
@@ -66,6 +84,8 @@ class WebService:
                 self._settings["auto_resume"] = stored["auto_resume"]
             if type(stored.get("preflight_check")) is bool:
                 self._settings["preflight_check"] = stored["preflight_check"]
+            if type(stored.get("remote_reconcile")) is bool:
+                self._settings["remote_reconcile"] = stored["remote_reconcile"]
         previous = self._read_json("web_activity.json", {})
         self._logout_requested = isinstance(previous, dict) and previous.get("logout_requested") is True
         self._resume_upload = (isinstance(previous, dict) and previous.get("resume_upload") is True
@@ -302,7 +322,7 @@ class WebService:
         return {"ok": True, "removed_tasks": removed}
 
     def settings(self, workers: int | None = None, auto_resume: bool | None = None,
-                 preflight_check: bool | None = None) -> dict:
+                 preflight_check: bool | None = None, remote_reconcile: bool | None = None) -> dict:
         with self._lock:
             self._ensure_idle()
             updated = dict(self._settings)
@@ -318,6 +338,10 @@ class WebService:
                 if type(preflight_check) is not bool:
                     raise ValueError("Предварительная проверка должна быть включена или выключена.")
                 updated["preflight_check"] = preflight_check
+            if remote_reconcile is not None:
+                if type(remote_reconcile) is not bool:
+                    raise ValueError("Сверка с Облаком должна быть включена или выключена.")
+                updated["remote_reconcile"] = remote_reconcile
             write_json(self.state_dir / "web_settings.json", updated)
             self._settings = updated
             return {"ok": True, "settings": dict(self._settings)}
@@ -344,6 +368,64 @@ class WebService:
         parent = str(current.parent) if any(current.parent == r or current.parent.is_relative_to(r) for r in self.allowed_roots) else None
         return {"path": str(current), "parent": parent, "roots": roots,
                 "directories": directories, "truncated": truncated}
+
+    def task_source(self, task_id: int) -> tuple[Path, Path, FileIdentity]:
+        task_id = self._source_id(task_id)
+        with self._queue() as queue:
+            row = queue.get_job(task_id)
+            if row is None:
+                raise FileNotFoundError("Задача больше не существует в текущей очереди.")
+            source = next((root for root in queue.roots() if root.id == row["root_id"]), None)
+        if source is None:
+            raise FileNotFoundError("Исходная папка задачи больше не подключена.")
+        self._allowed_path(source.path, exists=False)
+        root, path = Path(source.path), Path(row["local_path"])
+        # Do not resolve the file here: the content reader opens each path
+        # component without following symlinks, then validates its identity.
+        if not path.is_absolute() or not path.is_relative_to(root) or ".." in path.parts:
+            raise ValueError("Исходный файл находится за пределами подключённой папки.")
+        return root, path, FileIdentity(row["size"], row["mtime_ns"], row["device"], int(row["inode"]))
+
+    def _remember_quota(self, value: dict) -> None:
+        keys = ("used_bytes", "mail_bytes", "combined_used_bytes", "total_bytes")
+        if not isinstance(value, dict) or any(type(value.get(key)) is not int or value[key] < 0 for key in keys):
+            return  # Display telemetry cannot replace the protocol validator.
+        with self._lock:
+            self._quota_cache = {"used_bytes": value["combined_used_bytes"],
+                                 "cloud_bytes": value["used_bytes"], "mail_bytes": value["mail_bytes"],
+                                 "total_bytes": value["total_bytes"],
+                                 "free_bytes": max(0, value["total_bytes"] - value["combined_used_bytes"]),
+                                 "updated_at": time.time()}
+            self._quota_error = None
+
+    def refresh_quota(self) -> dict:
+        with self._lock:
+            self._ensure_idle()
+            if not self._authenticated:
+                raise ValueError("Сначала войдите в аккаунт Mail.")
+            self._ensure_configuration()
+            previous = (self._activity["phase"], self._activity["message"])
+        def perform():
+            api = None
+            try:
+                with self._queue() as queue, queue.exclusive_run():
+                    api = self._new_api()
+                    account = api.require_account(queue.account_id)
+                    queue.bind_account(account.email)
+                    api.quota()
+            except Cancelled:
+                raise
+            except (AuthError, ProtocolError, TransportError) as error:
+                with self._lock:
+                    self._quota_error = str(error)
+                    if isinstance(error, AuthError):
+                        self._authenticated = False
+                self._event("Не удалось обновить квоту. Последние полученные значения сохранены.", "warning")
+            finally:
+                if api is not None:
+                    api.close_thread()
+            return previous
+        return self._launch("quota", perform)
 
     def _task_controls_available(self) -> bool:
         return (not self._closed and not self._shutting_down and not self._logout_requested
@@ -421,6 +503,12 @@ class WebService:
             item = {k: v for k, v in row.items() if k in fields}
             item["paused"] = bool(row.get("paused"))
             item["remove_requested"] = bool(row.get("remove_requested"))
+            content_url = f"/api/tasks/{row['id']}/content"
+            item["download_url"] = content_url + "?download=1"
+            item["preview_url"] = (content_url + "?download=0"
+                                   if Path(row["local_path"]).suffix.casefold() in {".jpg", ".jpeg", ".png", ".webp", ".gif"} else None)
+            item["cloud_url"] = ("https://cloud.mail.ru/home" + quote(row["remote_path"], safe="/")
+                                 if row["status"] == "uploaded" or row.get("skip_reason") == "remote_exists" else None)
             item["progress"] = None
             current = active.get(row["id"])
             if row["status"] == "running" and current:
@@ -436,12 +524,20 @@ class WebService:
     def snapshot(self) -> dict:
         with self._lock:
             activity = copy.deepcopy(self._activity)
+            quota = copy.deepcopy(self._quota_cache)
+            if quota is not None:
+                quota.update(stale=bool(self._quota_error) or time.time() - quota["updated_at"] > 120,
+                             error=self._quota_error, refreshing=self._operation == "quota")
             activity["current_files"] = copy.deepcopy(list(self._files.values()))
             result = {"version": __version__, "configured": self._configuration is not None,
                       "authenticated": self._authenticated, "destination": None, "account": None,
                       "sources": [], "stats": {**{s: 0 for s in STATES}, "total": 0, "total_bytes": 0,
                                                 "uploaded_bytes": 0, "ready": 0, "permanent_failures": 0},
                       "activity": activity, "settings": dict(self._settings),
+                      "quota": quota, "quota_error": self._quota_error,
+                      "quota_refreshing": self._operation == "quota",
+                      "quota_refresh_available": self._authenticated and self._operation is None
+                          and not self._closed and not self._logout_requested and not self._auto_pending,
                       "task_controls_available": self._task_controls_available(),
                       "queue_clear_available": self._configuration is not None and self._operation is None
                           and not self._closed and not self._logout_requested,
@@ -473,7 +569,7 @@ class WebService:
             self._invalidate_stats()
             self._resume_upload = upload_intent
             self._auto_pending = False
-            self._activity.update(phase=name if name in {"login", "scanning"} else "checking",
+            self._activity.update(phase=name if name in {"login", "scanning", "quota"} else "checking",
                                   message="Запускаем операцию…", last_error=None, started_at=time.time(),
                                   scan=None, probe_wait_until=None)
             self._persist_activity()
@@ -539,7 +635,8 @@ class WebService:
             raise Cancelled("Приостановлено.")
 
     def _new_api(self):
-        return self._api_factory(TokenManager(TokenStore(self.state_dir / "auth.dat")), stop=self._stop)
+        api = self._api_factory(TokenManager(TokenStore(self.state_dir / "auth.dat")), stop=self._stop)
+        return _QuotaObservedAPI(api, self._remember_quota)
 
     def _complete_logout(self) -> None:
         """Run only after the active task and its workers have drained.
@@ -558,6 +655,8 @@ class WebService:
         else:
             TokenStore(self.state_dir / "auth.dat").clear()
         self._authenticated = False
+        self._quota_cache = None
+        self._quota_error = None
         self._logout_requested = False
         self._resume_upload = False
         self._auto_pending = False
@@ -609,6 +708,13 @@ class WebService:
                         raise AuthError("Сервер вернул другой аккаунт; вход не сохранён.")
                     self._check_stop()
                     queue.bind_account(account.email)
+                    try:
+                        self._remember_quota(api.quota())
+                    except (ProtocolError, TransportError) as error:
+                        with self._lock:
+                            self._quota_error = str(error)
+                    self._check_stop()
+                    # A quota read may refresh the in-memory token too.
                     TokenStore(self.state_dir / "auth.dat").save(memory.value)
                     previous = queue.get_metadata("probe")
                     if isinstance(previous, dict) and previous.get("result") == "provisional_pass":
@@ -649,6 +755,55 @@ class WebService:
             raise QueueError(f"Сканирование завершилось с ошибками: {result.error_count}. Проверьте доступ к папкам.")
         LOGGER.info("scan_complete seen=%d added=%d changed=%d",
                     result.seen, result.added, result.changed)
+        self._reconcile_queue(queue)
+
+    def _reconcile_queue(self, queue: Queue) -> None:
+        if not self._settings["remote_reconcile"]:
+            return
+        if not self._authenticated:
+            self._event("Локальное сканирование завершено. Для сверки с Облаком войдите в Mail и пересканируйте папки.", "warning")
+            return
+        self._phase("reconciling", "Сверяем найденные задачи с файлами в Облаке…")
+        api = None
+        def progress(report):
+            with self._lock:
+                self._activity["reconcile"] = {key: report.get(key) for key in
+                    ("checked", "matched", "errors", "cancelled", "auth_required")}
+                self._activity["message"] = (f"Проверено задач: {report.get('checked', 0):,}. "
+                                              f"Уже в Облаке: {report.get('matched', 0):,}.")
+        try:
+            with queue.exclusive_run():
+                api = self._new_api()
+                account = api.require_account(queue.account_id)
+                queue.bind_account(account.email)
+                # Optional by construction: disabled installations do not even
+                # import the reconciliation implementation.
+                from .reconcile import reconcile
+                report = reconcile(queue, api, stop=self._stop, progress=progress)
+                queue.set_metadata("last_reconcile", {"at": time.time(), **report})
+                progress(report)
+                if report.get("auth_required"):
+                    with self._lock:
+                        self._authenticated = False
+                if report.get("errors"):
+                    self._event("Сверка с Облаком завершена с замечаниями. Локальная очередь сохранена.", "warning")
+                else:
+                    self._event(f"Сверка завершена. Уже в Облаке: {report.get('matched', 0):,}.")
+        except Cancelled:
+            raise
+        except (QueueError, sqlite3.Error):
+            raise
+        except Exception as error:
+            with self._lock:
+                if isinstance(error, AuthError):
+                    self._authenticated = False
+            self._event(f"Дополнительная сверка не завершена ({type(error).__name__}). Локальное сканирование сохранено.", "warning")
+            queue.set_metadata("last_reconcile", {"at": time.time(), "errors": 1, "aborted": type(error).__name__})
+        finally:
+            if api is not None:
+                api.close_thread()
+            self._invalidate_stats()
+        self._check_stop()
 
     def scan(self) -> dict:
         if self._configuration is None:
@@ -830,9 +985,9 @@ class WebService:
         if stats.get("paused"):
             return "paused", (f"Доступные задачи обработаны. На индивидуальной паузе: {stats['paused']:,}. "
                               "Продолжите нужные задачи в очереди.")
-        failed, skipped = stats.get("failed", 0), stats.get("skipped", 0)
+        failed, skipped, existing = stats.get("failed", 0), stats.get("skipped", 0), stats.get("existing", 0)
         if failed or skipped:
-            return "completed", (f"Обработка завершена. Ошибок: {failed:,}; пропущено: {skipped:,}. "
+            return "completed", (f"Обработка завершена. Уже в Облаке: {existing:,}; ошибок: {failed:,}; пропущено: {skipped - existing:,}. "
                                  "Подробности и повтор — в очереди задач.")
         return "completed", "Все фото и видео загружены и проверены."
 

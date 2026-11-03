@@ -275,6 +275,122 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(state['stats']['paused'], 1)
         self.assertFalse(self.service._stop.is_set())
 
+    def test_quota_cache_combines_cloud_and_mail_without_network_on_poll(self):
+        self.assertIsNone(self.service.snapshot()['quota'])
+        self.assertEqual(self.cloud.quota_calls, 0)
+        self.cloud.quota = lambda: {'used_bytes':10, 'mail_bytes':20, 'combined_used_bytes':30, 'total_bytes':100}
+        self.service.refresh_quota()
+        state = self.done()
+        quota = state['quota']
+        self.assertEqual((quota['used_bytes'], quota['cloud_bytes'], quota['mail_bytes'], quota['free_bytes']), (30,10,20,70))
+        self.assertFalse(quota['stale'])
+        measured = quota['updated_at']
+        with patch.object(self.cloud, 'quota', side_effect=AssertionError('GET state must use cache')):
+            self.assertEqual(self.service.snapshot()['quota']['updated_at'], measured)
+        self.assertTrue(self.service.snapshot()['quota_refresh_available'])
+
+    def test_quota_failure_retains_previous_values_and_marks_them_stale(self):
+        self.service.refresh_quota(); state = self.done()
+        previous = state['quota']
+        self.cloud.quota_values = [TransportError('Offline quota unavailable')]
+        self.service.refresh_quota(); state = self.done()
+        self.assertEqual(state['quota']['used_bytes'], previous['used_bytes'])
+        self.assertEqual(state['quota']['updated_at'], previous['updated_at'])
+        self.assertTrue(state['quota']['stale'])
+        self.assertIn('Offline quota', state['quota']['error'])
+        self.assertIsNotNone(state['quota_error'])
+        self.assertTrue(state['authenticated'])
+
+    def test_upload_measurements_update_quota_without_extra_cloud_calls(self):
+        self.photos_count(1)
+        self.service.settings(preflight_check=False)
+        self.service.start(); state = self.done()
+        self.assertEqual(state['quota']['cloud_bytes'], 100)
+        self.assertEqual(state['quota']['used_bytes'], 100)
+        self.assertEqual(self.cloud.quota_calls, 2, 'Use the existing baseline/final guard reads')
+        self.service.logout(); state = self.done()
+        self.assertIsNone(state['quota'])
+        self.assertFalse(state['quota_refresh_available'])
+
+    def test_quota_refresh_uses_controller_and_external_cli_locks(self):
+        self.service._operation = 'upload'
+        try:
+            self.assertFalse(self.service.snapshot()['quota_refresh_available'])
+            with self.assertRaises(QueueBusyError):
+                self.service.refresh_quota()
+        finally:
+            self.service._operation = None
+        with self.service._queue() as external, external.exclusive_run():
+            self.service.refresh_quota()
+            state = self.done()
+        self.assertIsNone(state['quota'])
+        self.assertEqual(self.cloud.quota_calls, 0)
+        self.assertEqual(state['activity']['phase'], 'error')
+
+    def test_disabled_reconciliation_does_not_call_optional_module(self):
+        self.photos_count(1)
+        with patch('mailru_photos.reconcile.reconcile', side_effect=AssertionError('Disabled optional pass')) as reconcile:
+            self.service.scan(); state = self.done()
+            self.assertFalse(reconcile.called)
+        self.assertTrue(state['last_scan']['complete'])
+        self.assertEqual(state['stats']['pending'], 1)
+        self.assertEqual(self.cloud.account_calls, 0)
+
+    def test_optional_reconciliation_marks_existing_without_new_upload_or_proof(self):
+        self.photos_count(1)
+        path = self.photos / '000.jpg'
+        digest, identity = cloud_hash(path)
+        self.cloud.remote['/Archive/Photos/000.jpg'] = {'hash':digest, 'size':identity.size}
+        self.service.settings(remote_reconcile=True)
+        self.service.scan(); state = self.done()
+        self.assertTrue(state['last_scan']['complete'])
+        self.assertEqual(state['stats']['existing'], 1, state)
+        self.assertEqual(state['stats']['uploaded'], 0)
+        job = self.service.jobs()['jobs'][0]
+        self.assertEqual(job['skip_reason'], 'remote_exists')
+        self.assertIsNone(job['storage_mode'])
+        self.assertTrue(job['cloud_url'].startswith('https://cloud.mail.ru/home/'))
+        with self.service._queue() as queue:
+            self.assertEqual(queue.upload_history(job['id']), [])
+        self.service.start(); state = self.done()
+        self.assertEqual(self.cloud.commits, [])
+        self.service.close()
+        replacement = self.make_service()
+        self.assertTrue(replacement.snapshot()['settings']['remote_reconcile'])
+
+    def test_optional_module_failure_leaves_scan_and_normal_uploader_usable(self):
+        self.photos_count(2)
+        self.service.settings(remote_reconcile=True)
+        with patch('mailru_photos.reconcile.reconcile', side_effect=RuntimeError('Optional module fixture failure')):
+            self.service.scan(); state = self.done()
+        self.assertTrue(state['last_scan']['complete'])
+        self.assertEqual(state['stats']['pending'], 2)
+        self.assertEqual(state['activity']['phase'], 'idle')
+        self.service.settings(remote_reconcile=False, preflight_check=False)
+        self.service.start(); state = self.done()
+        self.assertEqual(state['stats']['uploaded'], 2)
+
+    def test_task_source_and_links_use_id_and_encoded_private_cloud_path(self):
+        path = self.photos / 'Фото #?%.JPG'
+        path.write_bytes(b'original source fixture')
+        self.service.scan(); self.done()
+        task = self.service.jobs()['jobs'][0]
+        source, local, identity = self.service.task_source(task['id'])
+        self.assertEqual(source, self.photos)
+        self.assertEqual(local, path)
+        self.assertEqual(identity.size, path.stat().st_size)
+        self.assertEqual(task['preview_url'], f"/api/tasks/{task['id']}/content?download=0")
+        self.assertEqual(task['download_url'], f"/api/tasks/{task['id']}/content?download=1")
+        self.assertIsNone(task['cloud_url'])
+        self.service.settings(preflight_check=False)
+        self.service.start(); self.done()
+        uploaded = self.service.jobs()['jobs'][0]
+        self.assertIn('%23%3F%25.JPG', uploaded['cloud_url'])
+        self.assertNotIn('#', uploaded['cloud_url'])
+        self.service.control_task(task['id'], 'remove')
+        with self.assertRaises(FileNotFoundError):
+            self.service.task_source(task['id'])
+
     def test_start_scans_automatically_probes_and_uploads_all_files(self):
         self.photos_count(3)
         self.service.start()
@@ -510,7 +626,7 @@ class WebServiceTests(unittest.TestCase):
         write_json(self.state / 'web_settings.json', {'workers': 3, 'auto_resume': False})
         replacement = self.make_service()
         self.assertEqual(replacement.snapshot()['settings'],
-                         {'workers': 3, 'auto_resume': False, 'preflight_check': True})
+                         {'workers': 3, 'auto_resume': False, 'preflight_check': True, 'remote_reconcile': False})
 
     def test_container_lifecycle_logs_do_not_echo_private_messages(self):
         private_message = "test-only-sensitive-value"
@@ -759,7 +875,7 @@ class WebServiceTests(unittest.TestCase):
         replacement = self.make_service()
         self.assertFalse(replacement.resume_if_requested())
         state = replacement.snapshot()
-        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'preflight_check': True})
+        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'preflight_check': True, 'remote_reconcile': False})
         self.assertEqual(state['activity']['phase'], 'paused')
 
     def test_dashboard_and_jobs_share_stats_until_expiry_without_sharing_mutable_data(self):

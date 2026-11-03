@@ -989,7 +989,7 @@ class QueueTests(unittest.TestCase):
     def schema_two_controls_fixture(self):
         self.queue._db.execute("DROP TABLE commit_evidence")
         for name in ("jobs_pending", "jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry",
-                     "jobs_retry_unlimited", "jobs_retry_regular", "jobs_paused"):
+                     "jobs_retry_unlimited", "jobs_retry_regular", "jobs_paused", "jobs_reconcile"):
             self.queue._db.execute(f"DROP INDEX {name}")
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN paused")
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN remove_requested")
@@ -1140,6 +1140,72 @@ class QueueTests(unittest.TestCase):
                             self.queue._db.set_progress_handler(None, 0)
                         self.assertEqual(claimed.id, target_id)
                         self.assertLess(steps, 50, "Claim scanned the entire controlled task prefix")
+
+    def test_existing_remote_observation_keeps_actual_path_through_move_and_mapping_changes(self):
+        from mailru_photos.api import cloud_hash
+        original = self.photo("original.jpg")
+        self.queue.scan()
+        candidate = self.queue.reconcile_candidates()[0]
+        digest, _ = cloud_hash(original)
+        self.assertTrue(self.queue.mark_remote_existing(candidate, remote_hash=digest))
+        before = self.queue.get_job(candidate["id"])
+        self.queue.update_root(1, "/NewDestination")
+        self.assertEqual(self.queue.get_job(candidate["id"])["remote_path"], candidate["remote_path"])
+        self.assertTrue(self.queue.scan().complete)
+        moved = self.source / "moved.jpg"
+        original.rename(moved)
+        result = self.queue.scan()
+        self.assertEqual((result.moved, result.added, result.missing), (1, 0, 0))
+        current = self.queue.get_job(candidate["id"])
+        self.assertEqual(current["remote_path"], candidate["remote_path"])
+        self.assertEqual(current["local_path"], str(moved))
+        self.assertEqual(current["verified_metadata"], before["verified_metadata"])
+        self.assertEqual(self.queue.stats()["existing"], 1)
+        self.assertIsNone(self.queue.claim())
+        moved.write_bytes(b"changed after remote observation")
+        self.assertEqual(self.queue.scan().changed, 1)
+        updated = self.queue.get_job(candidate["id"])
+        self.assertEqual(updated["remote_path"], "/NewDestination/moved.jpg")
+        self.assertEqual(updated["status"], "pending")
+        self.assertIsNone(updated["verified_metadata"])
+        self.assertIsNone(updated["remote_hash"])
+        self.assertEqual(self.queue.stats()["existing"], 0)
+        self.assertEqual(self.queue.upload_history(candidate["id"]), [])
+
+    def test_existing_observation_stays_complete_when_unchanged_original_returns(self):
+        from mailru_photos.api import cloud_hash
+        original = self.photo()
+        self.queue.scan()
+        candidate = self.queue.reconcile_candidates()[0]
+        digest, _ = cloud_hash(original)
+        self.queue.mark_remote_existing(candidate, remote_hash=digest)
+        elsewhere = self.base / "temporarily-away.jpg"
+        original.rename(elsewhere)
+        self.queue.scan()
+        self.assertEqual(self.queue.stats()["total"], 0)
+        history = self.queue.get_job(candidate["id"], include_missing=True)
+        self.assertEqual(history["skip_reason"], "remote_exists")
+        elsewhere.rename(original)
+        self.queue.scan()
+        self.assertEqual(self.queue.stats()["existing"], 1)
+        self.assertIsNone(self.queue.claim())
+        before = self.queue.get_job(candidate["id"])
+        self.queue.request_control(candidate["id"], "pause")
+        self.queue.request_control(candidate["id"], "resume")
+        self.assertEqual(self.queue.get_job(candidate["id"]), before)
+
+    def test_optional_reconcile_index_is_installed_once_without_schema_version_change(self):
+        self.photo()
+        self.queue.scan()
+        self.queue._db.execute("DROP INDEX jobs_reconcile")
+        with Queue(self.db, destination="/Archive") as upgraded:
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(len(upgraded.reconcile_candidates()), 1)
+            version = upgraded._db.execute("PRAGMA data_version").fetchone()[0]
+            with Queue(self.db, destination="/Archive") as reopened:
+                self.assertEqual(reopened._db.total_changes, 0)
+                self.assertEqual(len(reopened.reconcile_candidates()), 1)
+            self.assertEqual(upgraded._db.execute("PRAGMA data_version").fetchone()[0], version)
 
     def test_concurrent_connections_never_claim_same_job(self):
         for n in range(80):

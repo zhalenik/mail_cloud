@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import OrderedDict
+import getpass
 import hashlib
 import hmac
 from http import HTTPStatus
@@ -17,6 +18,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import stat
@@ -28,7 +30,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .auth import AuthError
-from .queue import QueueBusyError, QueueError, _file_lock
+from .content import ContentError, FileResponse, open_task_content
+from .queue import QueueBusyError, QueueConfigurationError, QueueError, _file_lock
 
 MAX_BODY = 16384
 COOKIE = "mailru_panel"
@@ -129,16 +132,46 @@ class PanelAccess:
         return value, cookie
 
     def setup(self, password: str) -> None:
-        if not isinstance(password, str) or not 12 <= len(password) <= 1024:
-            raise WebError(400, "Для панели задайте пароль длиной от 12 до 1024 символов.")
+        self._validate_password(password)
         with self.lock:
             if self.configured:
                 raise WebError(409, "Пароль панели уже настроен. Выполните вход.", "already_configured")
-            salt = secrets.token_bytes(24)
-            digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ROUNDS)
-            self.data = {**self.data, "epoch": secrets.token_hex(12), "password": {
-                "salt": salt.hex(), "digest": digest.hex(), "rounds": PASSWORD_ROUNDS}}
-            _private_json(self.path, self.data)
+            self._store_password(password)
+
+    @staticmethod
+    def _validate_password(password: str) -> None:
+        if not isinstance(password, str) or not 12 <= len(password) <= 1024 or "\x00" in password:
+            raise WebError(400, "Для панели задайте пароль длиной от 12 до 1024 символов.")
+
+    def _store_password(self, password: str) -> None:
+        salt = secrets.token_bytes(24)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ROUNDS)
+        updated = {**self.data, "epoch": secrets.token_hex(12), "password": {
+            "salt": salt.hex(), "digest": digest.hex(), "rounds": PASSWORD_ROUNDS}}
+        # A failed write must leave both the active verifier/session epoch and
+        # the previous on-disk file usable. Publish memory state after replace.
+        _private_json(self.path, updated)
+        self.data = updated
+        self.failures.clear()
+
+    def change_password(self, current_password: str, new_password: str, peer: str) -> None:
+        self._validate_password(new_password)
+        with self.lock:
+            try:
+                self.login(current_password, peer)
+            except WebError as error:
+                if error.status == 401:
+                    # The panel session is still valid; a mistyped current
+                    # password must not log this browser out of the panel.
+                    raise WebError(400, "Текущий пароль панели указан неверно.", "invalid_current_password") from None
+                raise
+            self._store_password(new_password)
+
+    def recover_password(self, new_password: str) -> None:
+        """Offline owner recovery only; never exposed as an HTTP operation."""
+        self._validate_password(new_password)
+        with self.lock:
+            self._store_password(new_password)
 
     def login(self, password: str, peer: str) -> None:
         if not isinstance(password, str) or len(password) > 1024:
@@ -237,6 +270,7 @@ class WebApplication:
 
     def __call__(self, environ, start_response):
         cookie = None
+        extra_headers = []
         try:
             origin = self._origin(environ)
             path = environ.get("PATH_INFO", "/")
@@ -265,12 +299,19 @@ class WebApplication:
                 value = {"authenticated": session["authenticated"] and self.access.configured,
                          "setup_required": not self.access.configured, "csrf": session["csrf"]}
                 content_type = "application/json"
-            elif path in {"/api/session/setup", "/api/session/login", "/api/session/logout"} and method == "POST":
+            elif path in {"/api/session/setup", "/api/session/login", "/api/session/logout", "/api/session/password"} and method == "POST":
                 if path.endswith("/setup"):
                     self.access.setup(_text(data, "password", limit=1024))
                     authenticated = True
                 elif path.endswith("/login"):
                     self.access.login(_text(data, "password", limit=1024), environ.get("REMOTE_ADDR", "local"))
+                    authenticated = True
+                elif path.endswith("/password"):
+                    if not session or session.get("authenticated") is not True or not self.access.configured:
+                        raise WebError(401, "Войдите в панель управления.", "authentication_required")
+                    self.access.change_password(_text(data, "current_password", limit=1024),
+                                                _text(data, "new_password", limit=1024),
+                                                environ.get("REMOTE_ADDR", "local"))
                     authenticated = True
                 else:
                     authenticated = False
@@ -288,6 +329,9 @@ class WebApplication:
             status = 200
         except WebError as error:
             status, value, content_type = error.status, {"error": {"message": error.message, "code": error.code}}, "application/json"
+        except ContentError as error:
+            status, value, content_type = error.status, {"error": {"message": error.message, "code": error.code}}, "application/json"
+            extra_headers.extend(error.headers)
         except QueueBusyError as error:
             status, value, content_type = 409, {"error": {"message": str(error), "code": "busy"}}, "application/json"
         except (QueueError, AuthError, ValueError) as error:
@@ -295,12 +339,20 @@ class WebApplication:
         except Exception:
             # Do not expose arbitrary exception strings, credentials or traces.
             status, value, content_type = 500, {"error": {"message": "Не удалось выполнить запрос. Очередь сохранена.", "code": "internal_error"}}, "application/json"
+        if isinstance(value, FileResponse):
+            try:
+                start_response(f"{value.status} {HTTPStatus(value.status).phrase}", value.headers)
+            except BaseException:
+                value.close()
+                raise
+            return value
         if content_type == "application/json":
             value = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
         headers = [("Content-Type", content_type + "; charset=utf-8"), ("Content-Length", str(len(value))),
                    ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
                    ("Referrer-Policy", "no-referrer"), ("X-Frame-Options", "DENY"),
                    ("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")]
+        headers.extend(extra_headers)
         if cookie:
             headers.append(("Set-Cookie", cookie))
         start_response(f"{status} {HTTPStatus(status).phrase}", headers)
@@ -308,6 +360,18 @@ class WebApplication:
 
     def _api(self, path: str, method: str, data: dict, environ: dict):
         query = parse_qs(environ.get("QUERY_STRING", ""), max_num_fields=16)
+        content = re.fullmatch(r"/api/tasks/([0-9]+)/content", path)
+        if content is not None and method in {"GET", "HEAD"}:
+            options = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True, max_num_fields=4)
+            choice = options.get("download", ["0"])
+            if set(options) - {"download"} or len(choice) != 1 or choice[0] not in {"0", "1"}:
+                raise WebError(400, "Параметр download должен быть 0 или 1.")
+            try:
+                source = self.service.task_source(_integer(content[1], 1, 2**63 - 1))
+            except (QueueConfigurationError, FileNotFoundError):
+                raise WebError(404, "Задача не найдена. Обновите список.", "task_missing") from None
+            return open_task_content(*source, download=choice[0] == "1", head=method == "HEAD",
+                                     range_header=None if environ.get("HTTP_IF_RANGE") else environ.get("HTTP_RANGE"))
         if method == "GET":
             if path == "/api/state":
                 return self.service.snapshot()
@@ -364,19 +428,49 @@ class WebApplication:
             if type(include) is not bool:
                 raise WebError(400, "Некорректный параметр повторной попытки.")
             self.service.retry_failed(include_permanent=include)
+        elif path == "/api/quota/refresh":
+            self.service.refresh_quota()
         elif path == "/api/settings":
             workers = _integer(data.get("workers"), 1, 16)
             if type(data.get("auto_resume")) is not bool:
                 raise WebError(400, "Укажите настройку продолжения после перезапуска.")
             if "preflight_check" in data and type(data["preflight_check"]) is not bool:
                 raise WebError(400, "Предварительная проверка должна быть включена или выключена.")
+            if "remote_reconcile" in data and type(data["remote_reconcile"]) is not bool:
+                raise WebError(400, "Сверка с Облаком должна быть включена или выключена.")
             if "upload_large_files" in data:
                 raise WebError(400, "Настройка обычной загрузки больших файлов удалена. Обновите страницу панели.")
             self.service.settings(workers=workers, auto_resume=data["auto_resume"],
-                                  preflight_check=data.get("preflight_check"))
+                                  preflight_check=data.get("preflight_check"), remote_reconcile=data.get("remote_reconcile"))
         else:
             raise WebError(404, "Неизвестная команда.")
         return self.service.snapshot()
+
+
+def reset_panel_password(state_dir: Path, *, read_password=None) -> None:
+    """Recover panel access while its controller is stopped.
+
+    No account token, queue, settings or source file is changed. The controller
+    lock is acquired before prompting so a running server cannot overwrite or
+    continue using a different in-memory verifier during recovery.
+    """
+    state_dir = Path(state_dir).expanduser().resolve()
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    read_password = read_password or getpass.getpass
+    try:
+        with _file_lock(state_dir / "web.run.lock"):
+            password = confirmation = ""
+            try:
+                password = read_password("Новый пароль панели (не менее 12 символов): ")
+                confirmation = read_password("Повторите новый пароль панели: ")
+                PanelAccess._validate_password(password)
+                if password != confirmation:
+                    raise WebError(400, "Пароли не совпали. Прежний пароль панели сохранён.")
+                PanelAccess(state_dir / "web_access.json").recover_password(password)
+            finally:
+                password = confirmation = ""
+    except QueueBusyError:
+        raise QueueBusyError("Панель сейчас работает. Остановите приложение или контейнер перед восстановлением пароля.") from None
 
 
 def main(argv=None) -> int:
@@ -387,15 +481,31 @@ def main(argv=None) -> int:
     parser.add_argument("--allow-root", action="append", type=Path, help="корень фотографий на сервере; можно указать несколько")
     parser.add_argument("--allowed-host", action="append", help="дополнительное имя/IP панели")
     parser.add_argument("--public-origin", default=os.environ.get("MAILRU_PUBLIC_ORIGIN") or None)
+    parser.add_argument("--reset-panel-password", action="store_true",
+                        help="задать новый пароль панели через скрытый ввод; приложение должно быть остановлено")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    state = args.state.expanduser().resolve()
+    if args.reset_panel_password:
+        try:
+            reset_panel_password(state)
+        except (KeyboardInterrupt, EOFError):
+            print("Восстановление пароля отменено.", flush=True)
+            return 130
+        except (ValueError, QueueError, WebError) as error:
+            print(f"Не удалось изменить пароль панели: {error}", flush=True)
+            return 2
+        except OSError:
+            print("Не удалось сохранить пароль панели. Проверьте доступ к каталогу состояния.", flush=True)
+            return 2
+        print("Новый пароль панели сохранён. Прежние сеансы завершены; аккаунт Mail и очередь сохранены.", flush=True)
+        return 0
     try:
         from waitress import create_server
     except ImportError:
         parser.error("Для GUI установите requirements-web.txt или запустите готовую Docker-конфигурацию.")
     from .web_service import WebService
-    state = args.state.expanduser().resolve()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     hosts = ["localhost", "127.0.0.1", "::1"] + (args.allowed_host or [])
     hosts.extend(item.strip() for item in os.environ.get("MAILRU_ALLOWED_HOSTS", "").split(",") if item.strip())
