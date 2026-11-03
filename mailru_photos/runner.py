@@ -14,7 +14,7 @@ from typing import Any, Callable, ContextManager
 
 from .api import (PROTOCOL_VERSION, CloudAPI, FileIdentity, FileVerificationError,
                   ProtocolError, RemoteConflict, RemoteError, SourceChanged,
-                  UnlimitedNotConfirmed, UnsupportedPhoto)
+                  UnlimitedNotConfirmed, UnsupportedPhoto, is_auth_failure)
 from .auth import AuthError
 from .queue import FileChangedError, Job, Queue, QueueError
 from .transport import Cancelled, SourceReadError, TaskCancelled, TransportError
@@ -240,8 +240,10 @@ def probe(queue: Queue, api: CloudAPI, *, count: int = 3, settle_seconds: float 
             while accepted_count < count:
                 if api.stop.is_set():
                     raise Cancelled("Проверка приостановлена.")
-                job = queue.claim(max_attempts=5, storage_mode="unlimited")
+                job = queue.claim(max_attempts=5, storage_mode="unlimited", stop=api.stop)
                 if job is None:
+                    if api.stop.is_set():
+                        raise Cancelled("Проверка приостановлена.")
                     retry_at = queue.stats(storage_mode="unlimited").get("next_retry_at")
                     if retry_at is None:
                         break
@@ -341,10 +343,14 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
     error_lock = threading.Lock()
     needs_recheck = False
     recheck_reason = ""
+    auth_required = False
 
     def stop_with(error: Exception, *, invalidate_probe: bool = False) -> None:
-        nonlocal needs_recheck, recheck_reason
+        nonlocal needs_recheck, recheck_reason, auth_required
         with error_lock:
+            # Another worker may already have recorded a different fatal
+            # failure. Never lose a later, explicit authentication rejection.
+            auth_required = auth_required or is_auth_failure(error)
             needs_recheck = needs_recheck or invalidate_probe
             if invalidate_probe and not recheck_reason:
                 recheck_reason = str(error)
@@ -393,8 +399,10 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                     except (ProtocolError, AuthError, TransportError) as error:
                         stop_with(error, invalidate_probe=isinstance(error, (ProtocolError, AuthError)))
                         return
-                    job = local.claim(max_attempts=max_attempts, storage_mode="unlimited")
+                    job = local.claim(max_attempts=max_attempts, storage_mode="unlimited", stop=api.stop)
                     if job is None:
+                        if api.stop.is_set():
+                            return
                         state = local.stats(storage_mode="unlimited")
                         next_retry = state.get("next_retry_at")
                         if next_retry is None:
@@ -410,6 +418,11 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                         local.mark_skipped(job, str(error))
                         emit("skipped", {"job_id": job.id, "reason": str(error)})
                     except RemoteError as error:
+                        if error.fatal:
+                            # Record the global cause before a database write
+                            # or UI observer could itself fail. In particular,
+                            # that secondary error must not erase auth_required.
+                            stop_with(error, invalidate_probe=True)
                         if error.unsupported:
                             local.mark_skipped(job, str(error))
                         elif error.retryable and job.attempts < max_attempts:
@@ -418,8 +431,6 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                         else:
                             local.mark_failed(job, str(error), retry_delay=None)
                         emit("remote_error", {"job_id": job.id, "status": error.status, "code": error.code})
-                        if error.fatal:
-                            stop_with(error, invalidate_probe=True)
                     except TransportError as error:
                         if api.stop.is_set():
                             local.release(job, "Network request interrupted by pause/shutdown")
@@ -450,8 +461,8 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                         api.stop.set()
                         return
                     except (ProtocolError, AuthError) as error:
-                        local.mark_failed(job, str(error), retry_delay=None)
                         stop_with(error, invalidate_probe=True)
+                        local.mark_failed(job, str(error), retry_delay=None)
                     except (QueueError, sqlite3.Error) as error:
                         stop_with(ProtocolError(f"Ошибка сохранения очереди: {type(error).__name__}. Загрузка остановлена."))
                     except Exception as error:
@@ -496,7 +507,7 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
         result = {"started_at": started, "finished_at": time.time(), "stopped": api.stop.is_set(),
                   "outcome": outcome, "errors": errors, "stats": final_stats, "baseline_cloud_bytes": baseline,
                   "last_quota": guard.last_quota, "protocol": PROTOCOL_VERSION,
-                  "preflight_check": require_probe}
+                  "preflight_check": require_probe, "auth_required": auth_required}
         queue.set_metadata("last_run", result)
         if needs_recheck:
             invalid = dict(evidence)

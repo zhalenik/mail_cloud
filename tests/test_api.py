@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from mailru_photos.api import (
     API_BASE, UPLOAD_BASE, MAX_MEDIA_BYTES, CloudAPI, FileIdentity, ProtocolError,
     RemoteConflict, RemoteError, SourceChanged, UnlimitedNotConfirmed, UnsupportedPhoto, cloud_hash, _retry_after,
+    is_auth_failure,
 )
 from mailru_photos.auth import Tokens
 from mailru_photos.transport import Cancelled, HTTP, Response, SourceReadError, TransportError, validate_url
@@ -542,10 +543,23 @@ class UploadBehaviorTests(unittest.TestCase):
 
     def test_repeated_unauthorized_does_not_loop(self):
         api, fake, tokens = self.api([response(403), response(403)])
-        with self.assertRaises(RemoteError):
+        with self.assertRaises(RemoteError) as caught:
             api.require_account()
+        self.assertTrue(is_auth_failure(caught.exception))
         self.assertEqual(tokens.refresh_calls, 1)
         self.assertEqual(len(fake.requests), 2)
+
+    def test_public_dispatcher_rejection_does_not_invalidate_account_credentials(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                api, fake, tokens = self.api([response(status)])
+                with self.assertRaises(RemoteError) as caught:
+                    api._metadata_endpoint()
+                self.assertFalse(is_auth_failure(caught.exception))
+                self.assertTrue(caught.exception.fatal, 'Discovery failure still stops the upload safely')
+                self.assertEqual(tokens.refresh_calls, 0)
+                self.assertEqual(len(fake.requests), 1)
+                self.assertNotIn('Authorization', fake.requests[0]['headers'])
 
     def test_redirect_is_not_followed_with_credentials(self):
         api, fake, _ = self.api([response(307, headers={"location": "https://other.example/collect"})])

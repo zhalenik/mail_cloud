@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -123,6 +124,14 @@ class StaleClaimError(QueueError):
 
 class FileChangedError(QueueError):
     """The claimed source changed; it was not marked successfully uploaded."""
+
+
+class SourceUnavailableError(FileChangedError):
+    """Source inspection failed; its task stays visible with evidence intact.
+
+    A FileChangedError subclass keeps the runner's existing per-file recovery
+    path: this claim is already finalized and other tasks may continue.
+    """
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1150,11 +1159,12 @@ class Queue:
         )
 
     def claim(self, *, now: float | None = None, max_attempts: int | None = None,
-              storage_mode: str | None = None) -> Job | None:
+              storage_mode: str | None = None, stop: threading.Event | None = None) -> Job | None:
         """Claim one ready file and validate the local snapshot before returning.
 
-        None means no work is *currently* ready, not that all work succeeded.
-        Check stats() for deferred/permanent failures and an active scan.
+        None means no work is *currently* ready or the supplied stop is set,
+        not that all work succeeded. Check stop before interpreting the result,
+        and stats() for deferred/permanent failures and an active scan.
         """
         if max_attempts is not None and max_attempts < 1:
             raise ValueError("max_attempts must be positive")
@@ -1163,6 +1173,10 @@ class Queue:
         retry_index = " INDEXED BY jobs_retry" if storage_mode is None else f" INDEXED BY jobs_retry_{storage_mode}"
         refreshed: set[int] = set()
         while True:
+            # A missing/inaccessible prefix can contain hundreds of thousands
+            # of tasks. Yield to global pause between candidate inspections.
+            if stop is not None and stop.is_set():
+                return None
             current = time.time() if now is None else now
             with self._transaction():
                 if self._get_meta("_scan_token"):
@@ -1194,8 +1208,10 @@ class Queue:
                 )
                 job = self._job(row, token, attempts)
             try:
-                snapshot = _snapshot(job.local_path)
-            except OSError:
+                snapshot = self._inspect_source(job)
+            except SourceUnavailableError:
+                continue
+            if snapshot is None:
                 self._invalidate_claim(job, None)
                 continue
             if snapshot != _job_snapshot(job):
@@ -1209,6 +1225,24 @@ class Queue:
             return _snapshot(job.local_path) == _job_snapshot(job)
         except OSError:
             return False
+
+    def _inspect_source(self, job: Job) -> tuple[int, int, int, int] | None:
+        """Distinguish an absent path from an inaccessible/unsafe source.
+
+        A permission or I/O error cannot establish disappearance or a content
+        change. Keep the source snapshot and any commit evidence, record one
+        visible failure, and leave an explicit resume available to the user.
+        """
+        try:
+            return _snapshot(job.local_path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            code = errno.errorcode.get(error.errno, type(error).__name__)
+            message = (f"Не удалось проверить исходный файл ({code}). "
+                       f"Проверьте доступ к файлу и тип исходного объекта: {job.local_path}")
+            self.mark_failed(job, message, retry_delay=None)
+            raise SourceUnavailableError(message) from None
 
     def _require_claim(self, job: Job) -> sqlite3.Row:
         row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job.id,)).fetchone()
@@ -1267,10 +1301,7 @@ class Queue:
             raise ValueError("storage_mode must be 'unlimited' or 'regular'")
         if not isinstance(cloud_hash, str) or not cloud_hash or any(c in cloud_hash for c in ("\x00", "\n", "\r")):
             raise ValueError("cloud_hash must be a nonempty hash string")
-        try:
-            snapshot = _snapshot(job.local_path)
-        except OSError:
-            snapshot = None
+        snapshot = self._inspect_source(job)
         if snapshot != _job_snapshot(job):
             self._invalidate_claim(job, snapshot)
             raise FileChangedError(f"Source changed before remote commit: {job.local_path}")
@@ -1387,10 +1418,7 @@ class Queue:
             self._archive_intent(job.id)
         # The accepted remote receipt is already durable before inspecting a
         # local file that may have been replaced, moved, or removed meanwhile.
-        try:
-            snapshot = _snapshot(job.local_path)
-        except OSError:
-            snapshot = None
+        snapshot = self._inspect_source(job)
         if snapshot != _job_snapshot(job):
             self._invalidate_claim(job, snapshot)
             raise FileChangedError(f"Source changed after saving {storage_mode} confirmation: {job.local_path}")
@@ -1429,10 +1457,7 @@ class Queue:
                  job.size, job.mtime_ns, job.device, str(job.inode), remote_hash, remote_id, evidence, now),
             )
             self._archive_intent(job.id)
-        try:
-            snapshot = _snapshot(job.local_path)
-        except OSError:
-            snapshot = None
+        snapshot = self._inspect_source(job)
         if snapshot != _job_snapshot(job):
             self._invalidate_claim(job, snapshot)
             raise FileChangedError(f"Source changed during upload: {job.local_path}")

@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-from .api import FileIdentity, ProtocolError, RemoteError, SourceChanged, cloud_hash
+from .api import FileIdentity, ProtocolError, RemoteError, SourceChanged, cloud_hash, is_auth_failure
 from .auth import AuthError
 from .queue import Queue, QueueConfigurationError
 from .transport import Cancelled, SourceReadError, TransportError
@@ -147,12 +147,12 @@ def reconcile(queue: Queue, api: Any, *, stop: threading.Event,
                         finish = True
                 except AuthError as error:
                     failed(candidate, error, "Для сверки требуется повторная авторизация Mail.ru.")
-                    summary["auth_required"] = True
+                    summary["auth_required"] = is_auth_failure(error)
                     summary["aborted"] = "auth"
                     finish = True
                 except RemoteError as error:
                     failed(candidate, error)
-                    summary["auth_required"] = error.status in (401, 403)
+                    summary["auth_required"] = is_auth_failure(error)
                     summary["aborted"] = "auth" if summary["auth_required"] else "remote"
                     finish = True
                 except TransportError as error:

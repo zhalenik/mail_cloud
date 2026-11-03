@@ -21,7 +21,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from . import __version__
-from .api import CloudAPI, FileIdentity, PROTOCOL_VERSION, ProtocolError
+from .api import CloudAPI, FileIdentity, PROTOCOL_VERSION, ProtocolError, is_auth_failure
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .cli import write_json
 from .queue import FileChangedError, Queue, QueueBusyError, QueueError, STATES, _file_lock
@@ -87,9 +87,10 @@ class WebService:
             if type(stored.get("remote_reconcile")) is bool:
                 self._settings["remote_reconcile"] = stored["remote_reconcile"]
         previous = self._read_json("web_activity.json", {})
+        self._auth_required = isinstance(previous, dict) and previous.get("auth_required") is True
         self._logout_requested = isinstance(previous, dict) and previous.get("logout_requested") is True
         self._resume_upload = (isinstance(previous, dict) and previous.get("resume_upload") is True
-                               and not self._logout_requested)
+                               and not self._logout_requested and not self._auth_required)
         self._auto_pending = self._resume_upload and self._settings["auto_resume"]
         self._activity = {"phase": "paused" if self._resume_upload else "idle",
                           "message": "Очередь восстановлена после остановки." if self._resume_upload else "Готово к работе.",
@@ -115,6 +116,9 @@ class WebService:
                 self._complete_logout()
             else:
                 self._authenticated = self._has_auth()
+                if self._auth_required:
+                    self._quota_error = "Для обновления данных требуется повторный вход в Mail.ru."
+                    self._activity.update(phase="paused", message="Для продолжения требуется повторный вход в Mail.ru.")
         except BaseException:
             self._server_lock.__exit__(None, None, None)
             raise
@@ -183,6 +187,8 @@ class WebService:
             queue.set_metadata("probe", {**previous, "result": "invalidated", "reason": "sources_changed"})
 
     def _has_auth(self) -> bool:
+        if self._auth_required:
+            return False
         try:
             TokenStore(self.state_dir / "auth.dat").load()
             return True
@@ -209,6 +215,7 @@ class WebService:
         write_json(self.state_dir / "web_activity.json", {
             "version": 1, "resume_upload": self._resume_upload,
             "logout_requested": self._logout_requested,
+            "auth_required": self._auth_required,
             "phase": self._activity["phase"], "updated_at": time.time(),
         })
 
@@ -398,6 +405,18 @@ class WebService:
                                  "updated_at": time.time()}
             self._quota_error = None
 
+    def _invalidate_auth(self) -> None:
+        """Retain the last measured quota, but stop presenting it as current."""
+        with self._lock:
+            self._authenticated = False
+            self._auth_required = True
+            self._resume_upload = False
+            self._auto_pending = False
+            self._quota_error = "Для обновления данных требуется повторный вход в Mail.ru."
+            # Keep the explicit rejection across a controller restart even
+            # though its saved tokens are retained for a subsequent login.
+            self._persist_activity()
+
     def refresh_quota(self) -> dict:
         with self._lock:
             self._ensure_idle()
@@ -418,8 +437,8 @@ class WebService:
             except (AuthError, ProtocolError, TransportError) as error:
                 with self._lock:
                     self._quota_error = str(error)
-                    if isinstance(error, AuthError):
-                        self._authenticated = False
+                    if is_auth_failure(error):
+                        self._invalidate_auth()
                 self._event("Не удалось обновить квоту. Последние полученные значения сохранены.", "warning")
             finally:
                 if api is not None:
@@ -530,7 +549,8 @@ class WebService:
                              error=self._quota_error, refreshing=self._operation == "quota")
             activity["current_files"] = copy.deepcopy(list(self._files.values()))
             result = {"version": __version__, "configured": self._configuration is not None,
-                      "authenticated": self._authenticated, "destination": None, "account": None,
+                      "authenticated": self._authenticated, "auth_required": self._auth_required,
+                      "destination": None, "account": None,
                       "sources": [], "stats": {**{s: 0 for s in STATES}, "total": 0, "total_bytes": 0,
                                                 "uploaded_bytes": 0, "ready": 0, "permanent_failures": 0},
                       "activity": activity, "settings": dict(self._settings),
@@ -608,8 +628,8 @@ class WebService:
                 safe = str(error) if isinstance(error, (QueueError, AuthError, ProtocolError, TransportError, ProbeRequired, ValueError)) else f"Ошибка {type(error).__name__}; очередь сохранена."
                 with self._lock:
                     self._resume_upload = False
-                    if isinstance(error, AuthError):
-                        self._authenticated = False
+                    if is_auth_failure(error):
+                        self._invalidate_auth()
                 self._phase("error", safe, error=safe)
         finally:
             with self._lock:
@@ -655,6 +675,7 @@ class WebService:
         else:
             TokenStore(self.state_dir / "auth.dat").clear()
         self._authenticated = False
+        self._auth_required = False
         self._quota_cache = None
         self._quota_error = None
         self._logout_requested = False
@@ -711,6 +732,12 @@ class WebService:
                     try:
                         self._remember_quota(api.quota())
                     except (ProtocolError, TransportError) as error:
+                        if is_auth_failure(error):
+                            # New credentials remain in memory until all
+                            # authenticated checks accept them. A transient
+                            # quota outage may be ignored; rejection may not.
+                            raise AuthError("Сервер отклонил авторизацию при проверке квоты; вход не сохранён.",
+                                            code="auth_rejected") from None
                         with self._lock:
                             self._quota_error = str(error)
                     self._check_stop()
@@ -722,6 +749,7 @@ class WebService:
                     queue.set_metadata("last_auth", {"result": "success", "at": time.time(), "stage": "user_info", "client_id": tokens.client_id})
                     with self._lock:
                         self._authenticated = True
+                        self._auth_required = False
                 except AuthError as error:
                     queue.set_metadata("last_auth", {"result": "failed", "at": time.time(), **error.safe_diagnostics()})
                     raise
@@ -783,8 +811,7 @@ class WebService:
                 queue.set_metadata("last_reconcile", {"at": time.time(), **report})
                 progress(report)
                 if report.get("auth_required"):
-                    with self._lock:
-                        self._authenticated = False
+                    self._invalidate_auth()
                 if report.get("errors"):
                     self._event("Сверка с Облаком завершена с замечаниями. Локальная очередь сохранена.", "warning")
                 else:
@@ -794,9 +821,8 @@ class WebService:
         except (QueueError, sqlite3.Error):
             raise
         except Exception as error:
-            with self._lock:
-                if isinstance(error, AuthError):
-                    self._authenticated = False
+            if is_auth_failure(error):
+                self._invalidate_auth()
             self._event(f"Дополнительная сверка не завершена ({type(error).__name__}). Локальное сканирование сохранено.", "warning")
             queue.set_metadata("last_reconcile", {"at": time.time(), "errors": 1, "aborted": type(error).__name__})
         finally:
@@ -918,8 +944,9 @@ class WebService:
                 if type(requested) is not int or not 1 <= requested <= 10:
                     raise ProtocolError("Некорректное число образцов сохранённой проверки.")
                 while len(report["samples"]) < requested:
-                    job = queue.claim(max_attempts=5, storage_mode="unlimited")
+                    job = queue.claim(max_attempts=5, storage_mode="unlimited", stop=self._stop)
                     if job is None:
+                        self._check_stop()
                         retry_at = queue.stats(storage_mode="unlimited").get("next_retry_at")
                         if retry_at is not None:
                             if api.stop.wait(max(0.1, min(10, retry_at - time.time()))):
@@ -1004,6 +1031,11 @@ class WebService:
             if not isinstance(last_scan, dict) or last_scan.get("complete") is not True:
                 self._scan_queue(queue)
             self._check_stop()
+            if not self._authenticated:
+                # The optional comparison may have discovered rejected
+                # credentials during this launch. Do not start an uploader
+                # with the same saved tokens after that explicit rejection.
+                raise AuthError("Для продолжения требуется повторный вход в Mail.ru.", code="auth_rejected")
             skipped = queue.skip_large_disabled()
             if skipped:
                 self._emit("large_files_skipped", {"count": skipped})
@@ -1053,9 +1085,16 @@ class WebService:
                 self._phase("uploading", "Загружаем фото и видео в безлимит…")
                 result = run(queue, api, workers=self._settings["workers"], emit=self._emit,
                              file_progress=True, require_probe=preflight_check, task_scope=self._task_scope)
+                if result.get("auth_required"):
+                    # A user pause or shutdown can race the server rejection.
+                    # Preserve its meaning even when the visible phase should
+                    # remain paused while workers drain.
+                    self._invalidate_auth()
                 if self._pause_requested or self._shutting_down:
                     raise Cancelled("Приостановлено.")
                 if result.get("stopped"):
+                    if result.get("auth_required"):
+                        raise AuthError("Для продолжения требуется повторный вход в Mail.ru.", code="auth_rejected")
                     raise ProtocolError((result.get("errors") or ["Загрузка остановлена; очередь сохранена."])[0])
                 return self._completion(queue.stats())
             finally:

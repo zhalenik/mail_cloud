@@ -1,0 +1,72 @@
+[
+  {
+    "version": "0.4.3",
+    "source_commit": "6fb4900a147816c7bc6632d046de7960f6cdffa7",
+    "target_version": "0.6.0",
+    "schema_before": 1,
+    "schema_after": 3,
+    "current_tasks": 5,
+    "uploaded": 1,
+    "paused": 0,
+    "rescan_added": 0,
+    "confirmed_intent_preserved": true,
+    "detached_history_preserved": true,
+    "reopen_writes": 0
+  },
+  {
+    "version": "0.4.4",
+    "source_commit": "07c47a639680f1a56d70ad8fe0a1e8a09d134835",
+    "target_version": "0.6.0",
+    "schema_before": 1,
+    "schema_after": 3,
+    "current_tasks": 5,
+    "uploaded": 1,
+    "paused": 0,
+    "rescan_added": 0,
+    "confirmed_intent_preserved": true,
+    "detached_history_preserved": true,
+    "reopen_writes": 0
+  },
+  {
+    "version": "0.5.0",
+    "source_commit": "363cfba34adf9e2ebbcaa2531b3a1e378fcee54d",
+    "target_version": "0.6.0",
+    "schema_before": 2,
+    "schema_after": 3,
+    "current_tasks": 5,
+    "uploaded": 1,
+    "paused": 0,
+    "rescan_added": 0,
+    "confirmed_intent_preserved": true,
+    "detached_history_preserved": true,
+    "reopen_writes": 0
+  },
+  {
+    "version": "0.5.1",
+    "source_commit": "982fa269ebe5ea1eefe33bd669459c86159eb4c9",
+    "target_version": "0.6.0",
+    "schema_before": 3,
+    "schema_after": 3,
+    "current_tasks": 5,
+    "uploaded": 1,
+    "paused": 1,
+    "rescan_added": 0,
+    "confirmed_intent_preserved": true,
+    "detached_history_preserved": true,
+    "reopen_writes": 0
+  },
+  {
+    "version": "0.5.2",
+    "source_commit": "1025b7813e8210b197b89aaceee5a89cecc54e85",
+    "target_version": "0.6.0",
+    "schema_before": 3,
+    "schema_after": 3,
+    "current_tasks": 5,
+    "uploaded": 1,
+    "paused": 1,
+    "rescan_added": 0,
+    "confirmed_intent_preserved": true,
+    "detached_history_preserved": true,
+    "reopen_writes": 0
+  }
+]

@@ -3,17 +3,19 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+import errno
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 from mailru_photos.media import UNLIMITED_MAX_BYTES
 from mailru_photos.queue import (
     FileChangedError, Queue, QueueBusyError, QueueConfigurationError, QueueError,
-    MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, ScanCollisionError, StaleClaimError,
+    MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, ScanCollisionError, SourceUnavailableError, StaleClaimError,
 )
 
 
@@ -1206,6 +1208,200 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual(reopened._db.total_changes, 0)
                 self.assertEqual(len(reopened.reconcile_candidates()), 1)
             self.assertEqual(upgraded._db.execute("PRAGMA data_version").fetchone()[0], version)
+
+    def test_permission_and_io_failures_stay_visible_without_starving_other_tasks(self):
+        from mailru_photos.queue import _snapshot
+        names = ("permission.jpg", "io.jpg", "healthy.jpg")
+        for name in names:
+            self.photo(name)
+        self.queue.scan()
+        claimed = [self.queue.claim() for _ in names]
+        by_name = {job.relative_path: job for job in claimed}
+        for job in claimed:
+            if job.relative_path != "healthy.jpg":
+                self.queue.save_commit_intent(job, "hash-" + job.relative_path)
+                if job.relative_path == "permission.jpg":
+                    self.queue.confirm_unlimited_commit(job, "hash-" + job.relative_path)
+            self.queue.release(job)
+        intents = [dict(row) for row in self.queue._db.execute("SELECT * FROM commit_intents ORDER BY job_id")]
+        sentinel = "private-error-message-sentinel"
+        def inspect(path):
+            if path == by_name["permission.jpg"].local_path:
+                raise PermissionError(errno.EACCES, sentinel)
+            if path == by_name["io.jpg"].local_path:
+                raise OSError(errno.EIO, sentinel)
+            return _snapshot(path)
+        with patch("mailru_photos.queue._snapshot", side_effect=inspect):
+            healthy = self.queue.claim()
+            self.assertEqual(healthy.id, by_name["healthy.jpg"].id)
+            self.queue.mark_uploaded(healthy, remote_hash="healthy-proof")
+            self.assertIsNone(self.queue.claim())
+        failures = self.queue.list_jobs("failed")
+        self.assertEqual(len(failures), 2)
+        self.assertEqual(self.queue.stats()["total"], 3)
+        self.assertEqual(self.queue.stats()["permanent_failures"], 2)
+        self.assertEqual(self.queue.stats()["uploaded"], 1)
+        self.assertEqual([dict(row) for row in self.queue._db.execute("SELECT * FROM commit_intents ORDER BY job_id")], intents)
+        for row in failures:
+            self.assertEqual(row["present"], 1)
+            self.assertIsNone(row["next_attempt"])
+            self.assertNotEqual(row["skip_reason"], "missing")
+            self.assertNotIn(sentinel, row["last_error"])
+            self.assertIn("EACCES" if row["relative_path"] == "permission.jpg" else "EIO", row["last_error"])
+            self.assertTrue(Path(row["local_path"]).exists())
+        with Queue(self.db, destination="/Archive") as reopened:
+            self.assertEqual(len(reopened.list_jobs("failed")), 2)
+            self.assertEqual(reopened._db.total_changes, 0)
+        failed_id = by_name["permission.jpg"].id
+        self.queue.request_control(failed_id, "resume")
+        retried = self.queue.claim()
+        self.assertEqual(retried.id, failed_id)
+        self.assertIs(self.queue.get_commit_intent(retried)["unlimited_confirmed"], True)
+
+    def test_claim_honors_global_stop_between_inaccessible_or_missing_candidates(self):
+        for number in range(5):
+            self.photo(f"{number}.jpg")
+        self.queue.scan()
+        original_rows = self.queue.list_jobs()
+        first_id = original_rows[0]["id"]
+        for error in (PermissionError(errno.EACCES, "denied"), FileNotFoundError(errno.ENOENT, "missing")):
+            with self.subTest(error=type(error).__name__):
+                # Restore only the previous candidate's fixture state; other
+                # tasks must remain completely untouched during both calls.
+                self.queue._db.execute("UPDATE jobs SET status='pending',present=1,next_attempt=0,"
+                                       "attempts=0,skip_reason=NULL,last_error=NULL WHERE id=?", (first_id,))
+                stop = threading.Event()
+                def inspect(path):
+                    self.assertEqual(path, original_rows[0]["local_path"])
+                    stop.set()
+                    raise error
+                with patch("mailru_photos.queue._snapshot", side_effect=inspect) as snapshot:
+                    self.assertIsNone(self.queue.claim(stop=stop))
+                self.assertEqual(snapshot.call_count, 1)
+                for untouched in original_rows[1:]:
+                    self.assertEqual(self.queue.get_job(untouched["id"]), untouched)
+                before = self.queue._db.total_changes
+                with patch("mailru_photos.queue._snapshot", side_effect=AssertionError("already stopped")):
+                    self.assertIsNone(self.queue.claim(stop=stop))
+                self.assertEqual(self.queue._db.total_changes, before)
+
+    def test_inspection_failure_before_new_commit_preserves_previous_intent(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "same-hash")
+        old = dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone())
+        with patch("mailru_photos.queue._snapshot", side_effect=PermissionError(errno.EACCES, "no access")):
+            with self.assertRaises(SourceUnavailableError):
+                self.queue.save_commit_intent(job, "same-hash")
+        self.assertEqual(dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone()), old)
+        row = self.queue.get_job(job.id)
+        self.assertEqual((row["status"], row["present"]), ("failed", 1))
+        self.assertEqual(self.queue.upload_history(job.id), [])
+
+    def test_accepted_commit_survives_inspection_permission_error_and_can_resume(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "server-accepted")
+        with patch("mailru_photos.queue._snapshot", side_effect=PermissionError(errno.EACCES, "denied after reply")):
+            with self.assertRaises(SourceUnavailableError):
+                self.queue.confirm_unlimited_commit(job, "server-accepted")
+        row = self.queue.get_job(job.id)
+        self.assertEqual((row["status"], row["present"]), ("failed", 1))
+        self.assertEqual(row["size"], job.size)
+        receipt = self.queue.commit_history(job.id)[0]
+        self.assertEqual(receipt["stage"], "accepted")
+        self.assertEqual(receipt["source_size"], job.size)
+        self.assertEqual(self.queue.upload_history(job.id), [])
+        self.queue.request_control(job.id, "resume")
+        resumed = self.queue.claim()
+        self.assertIs(self.queue.get_commit_intent(resumed)["unlimited_confirmed"], True)
+        self.queue.mark_uploaded(resumed, remote_hash="server-accepted", verified_metadata={"path": job.remote_path})
+        self.assertEqual(self.queue.get_job(job.id)["status"], "uploaded")
+
+    def test_verified_remote_proof_is_kept_when_final_source_inspection_fails(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "verified-before-io-error")
+        self.queue.confirm_unlimited_commit(job, "verified-before-io-error")
+        with patch("mailru_photos.queue._snapshot", side_effect=OSError(errno.EIO, "filesystem unavailable")):
+            with self.assertRaises(SourceUnavailableError):
+                self.queue.mark_uploaded(job, remote_hash="verified-before-io-error",
+                                         verified_metadata={"path": job.remote_path, "stat_matched": True})
+        row = self.queue.get_job(job.id)
+        self.assertEqual((row["status"], row["present"]), ("failed", 1))
+        self.assertEqual(self.queue.stats()["uploaded"], 0)
+        proof = self.queue.upload_history(job.id)[0]
+        self.assertEqual(proof["remote_hash"], "verified-before-io-error")
+        self.assertEqual(proof["source_size"], job.size)
+        self.assertEqual(self.queue.commit_history(job.id)[0]["stage"], "accepted")
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM commit_intents").fetchone()[0], 1)
+
+    def test_inspection_failure_honors_active_pause_or_remove_request(self):
+        for action in ("pause", "remove"):
+            with self.subTest(action=action):
+                source = self.base / action
+                source.mkdir()
+                (source / "image.jpg").write_bytes(b"offline image bytes" * 10)
+                with Queue(self.base / (action + ".sqlite3"), destination="/Archive", account_id="fixture") as queue:
+                    queue.add_root(source, "camera")
+                    queue.scan()
+                    job = queue.claim()
+                    queue.save_commit_intent(job, "accepted")
+                    queue.confirm_unlimited_commit(job, "accepted")
+                    queue.request_control(job.id, action)
+                    with patch("mailru_photos.queue._snapshot", side_effect=OSError(errno.EIO, "offline")):
+                        with self.assertRaises(SourceUnavailableError):
+                            queue.mark_uploaded(job, remote_hash="accepted")
+                    if action == "pause":
+                        row = queue.get_job(job.id)
+                        self.assertEqual((row["status"], row["present"]), ("failed", 1))
+                        self.assertIs(row["paused"], True)
+                    else:
+                        self.assertIsNone(queue.get_job(job.id, include_missing=True))
+                    self.assertEqual(queue.upload_history(job.id)[0]["remote_hash"], "accepted")
+                    self.assertEqual(queue.commit_history(job.id)[0]["stage"], "accepted")
+
+    def test_replacing_source_with_symlink_never_yields_a_claim_for_its_target(self):
+        unsafe = self.photo("changed.jpg")
+        healthy = self.photo("healthy.jpg")
+        self.queue.scan()
+        unsafe_id = next(row["id"] for row in self.queue.list_jobs() if row["local_path"] == str(unsafe))
+        outside = self.base / "outside.jpg"
+        outside.write_bytes(b"do not follow or upload" * 10)
+        unsafe.unlink()
+        try:
+            unsafe.symlink_to(outside)
+        except OSError:
+            self.skipTest("Symlink creation is unavailable")
+        job = self.queue.claim()
+        self.assertEqual(job.local_path, str(healthy))
+        self.queue.release(job)
+        # Enumeration order is arbitrary; mark healthy done so every unsafe
+        # pending candidate is inspected before asserting the final result.
+        self.queue.mark_uploaded(self.queue.claim(), remote_hash="healthy")
+        self.assertIsNone(self.queue.claim())
+        row = self.queue.get_job(unsafe_id)
+        self.assertEqual((row["status"], row["present"]), ("failed", 1))
+        self.assertTrue(unsafe.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"do not follow or upload" * 10)
+        self.assertEqual(self.queue.upload_history(unsafe_id), [])
+
+    def test_enoent_and_enotdir_still_remove_only_truly_absent_sources_from_current_totals(self):
+        absent = self.photo("absent.jpg")
+        nested = self.photo("folder/nested.jpg")
+        self.queue.scan()
+        absent.unlink()
+        nested.unlink()
+        nested.parent.rmdir()
+        nested.parent.write_bytes(b"parent is now a file")
+        self.assertIsNone(self.queue.claim())
+        self.assertEqual(self.queue.stats()["total"], 0)
+        self.assertEqual(self.queue.stats(include_missing=True)["total"], 2)
+        for row in self.queue.list_jobs(include_missing=True):
+            self.assertEqual((row["present"], row["skip_reason"]), (0, "missing"))
 
     def test_concurrent_connections_never_claim_same_job(self):
         for n in range(80):

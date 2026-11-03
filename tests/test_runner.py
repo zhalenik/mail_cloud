@@ -22,6 +22,7 @@ from mailru_photos.api import (
     AccountInfo, CloudAPI, FileIdentity, PROTOCOL_VERSION, ProtocolError,
     FileVerificationError, RemoteConflict, RemoteError, SourceChanged, UnsupportedPhoto, cloud_hash,
 )
+from mailru_photos.auth import AuthError
 from mailru_photos.queue import Queue
 from mailru_photos.media import UNLIMITED_MAX_BYTES
 from mailru_photos.runner import ProbeRequired, QuotaGuard, probe, run
@@ -547,6 +548,7 @@ class RunnerTests(unittest.TestCase):
             api.failures[Path(row['local_path']).name] = [error]
         result = run(self.queue, api, workers=1)
         self.assertFalse(result['stopped'])
+        self.assertFalse(result['auth_required'])
         self.assertEqual(result['outcome'], 'finished_with_errors')
         self.assertEqual(result['stats']['failed'], len(failures))
         self.assertEqual(result['stats']['uploaded'], 1)
@@ -576,7 +578,11 @@ class RunnerTests(unittest.TestCase):
     def test_auth_and_unknown_protocol_errors_still_stop_all_tasks(self):
         self.make_photos(3)
         first = self.queue.list_jobs()[0]
-        for error in (RemoteError(403), ProtocolError('Unknown protocol structure')):
+        for error, auth_required in ((AuthError('Expired fixture credentials'), True),
+                                     (RemoteError(401), True), (RemoteError(403), True),
+                                     (RemoteError(403, authenticated=False), False),
+                                     (ProtocolError('Unknown protocol structure'), False),
+                                     (RemoteError(400, 'CONDITION/OVERQUOTA'), False)):
             with self.subTest(error=type(error).__name__):
                 self.queue.retry_failed(include_permanent=True)
                 self.seed_pass()
@@ -584,10 +590,93 @@ class RunnerTests(unittest.TestCase):
                 api.failures[Path(first['local_path']).name] = [error]
                 result = run(self.queue, api, workers=1)
                 self.assertTrue(result['stopped'])
+                self.assertIs(result['auth_required'], auth_required)
+                self.assertIs(self.queue.get_metadata('last_run')['auth_required'], auth_required)
                 self.assertEqual(result['stats']['pending'], 2)
                 self.assertEqual(result['stats']['uploaded'], 0)
                 self.assertEqual(api.commits, [])
                 self.assertEqual(self.queue.get_metadata('probe')['result'], 'needs_recheck')
+
+    def test_final_quota_guard_preserves_auth_failure_in_result(self):
+        self.make_photos(0)
+        for error, auth_required in ((AuthError('Expired fixture refresh'), True),
+                                     (RemoteError(401), True), (RemoteError(403), True),
+                                     (TransportError('Proxy response contains HTTP 403'), False)):
+            with self.subTest(error=type(error).__name__):
+                self.seed_pass()
+                api = FakeCloud(quota_values=[100, error])
+                result = run(self.queue, api, workers=1)
+                self.assertTrue(result['stopped'])
+                self.assertIs(result['auth_required'], auth_required)
+                self.assertEqual(result['stats']['uploaded'], 0)
+                self.assertEqual(api.commits, [])
+
+    def test_run_claim_cancellation_is_saved_without_claiming_or_auth_error(self):
+        self.make_photos(3)
+        self.seed_pass()
+        api = FakeCloud()
+        original = Queue.claim
+        def cancel_claim(queue, *, stop=None, **kwargs):
+            self.assertIs(stop, api.stop)
+            stop.set()
+            return original(queue, stop=stop, **kwargs)
+        with patch.object(Queue, 'claim', new=cancel_claim):
+            result = run(self.queue, api, workers=1)
+        self.assertTrue(result['stopped'])
+        self.assertFalse(result['auth_required'])
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['stats']['pending'], 3)
+        self.assertEqual(result['stats']['running'], 0)
+        self.assertEqual(api.commits, [])
+        self.assertEqual(self.queue.get_metadata('probe')['result'], 'provisional_pass')
+
+    def test_probe_claim_cancellation_is_interrupted_not_insufficient_samples(self):
+        self.make_photos(3)
+        api = FakeCloud(stop=InstantEvent())
+        original = Queue.claim
+        def cancel_claim(queue, *, stop=None, **kwargs):
+            self.assertIs(stop, api.stop)
+            stop.set()
+            return original(queue, stop=stop, **kwargs)
+        with patch.object(Queue, 'claim', new=cancel_claim), self.assertRaises(Cancelled):
+            probe(self.queue, api, count=1, settle_seconds=30)
+        self.assertEqual(self.queue.get_metadata('probe')['result'], 'interrupted')
+        self.assertEqual(self.queue.stats()['pending'], 3)
+        self.assertEqual(api.commits, [])
+
+    def test_later_auth_failure_is_not_hidden_by_another_workers_first_error(self):
+        self.make_photos(2)
+        self.seed_pass()
+        first = self.queue.list_jobs()[0]['id']
+        entered = threading.Barrier(2)
+        api = FakeCloud()
+        def fail(local, client, job, **kwargs):
+            entered.wait(timeout=2)
+            if job.id == first:
+                raise ProtocolError('First failure is not authentication')
+            if not client.stop.wait(2):
+                raise AssertionError('First worker did not record its failure')
+            raise AuthError('Credentials were also rejected by another worker')
+        with patch('mailru_photos.runner.process_job', side_effect=fail):
+            result = run(self.queue, api, workers=2)
+        self.assertTrue(result['stopped'])
+        self.assertTrue(result['auth_required'])
+        self.assertEqual(result['errors'], ['First failure is not authentication'])
+        self.assertEqual(result['stats']['failed'], 2)
+        self.assertEqual(self.queue.get_metadata('last_run')['auth_required'], True)
+
+    def test_auth_rejection_is_not_erased_if_saving_the_failed_task_also_fails(self):
+        self.make_photos(1)
+        self.seed_pass()
+        api = FakeCloud()
+        first = self.queue.list_jobs()[0]
+        api.failures[Path(first['local_path']).name] = [RemoteError(403)]
+        with patch.object(Queue, 'mark_failed', side_effect=sqlite3.OperationalError('offline write failure')):
+            result = run(self.queue, api, workers=1)
+        self.assertTrue(result['stopped'])
+        self.assertTrue(result['auth_required'])
+        self.assertEqual(result['stats']['uploaded'], 0)
+        self.assertEqual(api.commits, [])
 
     def test_database_confirmation_failure_stops_other_tasks(self):
         self.make_photos(3)
@@ -737,6 +826,7 @@ class RunnerTests(unittest.TestCase):
         result = run(self.queue, api, workers=3)
         self.assertTrue(result["stopped"])
         self.assertEqual(result["outcome"], "stopped")
+        self.assertFalse(result['auth_required'])
         self.assertGreaterEqual(result["stats"]["uploaded"], 50)
         self.assertLess(result["stats"]["uploaded"], 90)
         self.assertGreater(result["stats"]["pending"], 0)

@@ -40,14 +40,28 @@ class ProtocolError(RuntimeError):
 
 
 class RemoteError(ProtocolError):
-    def __init__(self, status: int, code: str = "REMOTE_ERROR", *, retry_after: float | None = None):
+    def __init__(self, status: int, code: str = "REMOTE_ERROR", *, retry_after: float | None = None,
+                 authenticated: bool = True):
         self.status, self.code, self.retry_after = status, code, retry_after
+        self.auth_required = authenticated and status in (401, 403)
         self.retryable = status == 429 or status >= 500 or code == "CONDITION/BADBLOB"
         self.unsupported = code in {"NOT/SUPPORTED", "CONDITION/BODYTOOBIG"}
         self.fatal = status in {401, 403} or code in {
             "CONDITION/OVERQUOTA", "CONDITION/NOT_ACCEPTABLE", "CONDITION/NOT_ACCEPTABLE/UNLIM_UPL_TOTAL"
         }
         super().__init__(f"Mail.ru: HTTP {status}, {code}")
+
+
+def is_auth_failure(error: BaseException) -> bool:
+    """Recognize rejected Cloud credentials without parsing messages or URLs.
+
+    Authenticated Cloud responses have already had their token-refresh
+    attempt. A public discovery response, an unrelated URL or an exception
+    carrying a ``status`` attribute is not evidence of a rejected account.
+    """
+    return isinstance(error, AuthError) or (
+        isinstance(error, RemoteError) and error.auth_required
+    )
 
 
 class RemoteConflict(ProtocolError):
@@ -303,9 +317,10 @@ class CloudAPI:
         raise AuthError("Сервер не принял авторизацию после обновления токена.")
 
     @staticmethod
-    def _require(response: Response, *statuses: int) -> Response:
+    def _require(response: Response, *statuses: int, authenticated: bool = True) -> Response:
         if response.status not in statuses:
-            raise RemoteError(response.status, _error_code(response), retry_after=_retry_after(response))
+            raise RemoteError(response.status, _error_code(response), retry_after=_retry_after(response),
+                              authenticated=authenticated)
         return response
 
     def account_info(self) -> AccountInfo:
@@ -330,7 +345,8 @@ class CloudAPI:
         with self._directory_lock:
             if self._metadata_url and time.monotonic() < self._metadata_until:
                 return self._metadata_url
-            response = self._require(self._request("GET", DISPATCHER, authenticated=False), 200)
+            response = self._require(self._request("GET", DISPATCHER, authenticated=False), 200,
+                                     authenticated=False)
             try:
                 endpoint = response.body.decode("ascii").split()[0]
             except (UnicodeError, IndexError):

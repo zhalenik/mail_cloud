@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from mailru_photos.api import PROTOCOL_VERSION, ProtocolError, cloud_hash
+from mailru_photos.api import PROTOCOL_VERSION, ProtocolError, RemoteError, cloud_hash
 from mailru_photos.auth import AuthError, TokenStore, Tokens
 from mailru_photos.cli import write_json
 from mailru_photos.media import UNLIMITED_MAX_BYTES
@@ -301,6 +301,116 @@ class WebServiceTests(unittest.TestCase):
         self.assertIsNotNone(state['quota_error'])
         self.assertTrue(state['authenticated'])
 
+    def test_quota_rejected_credentials_disconnects_account_and_retains_stale_values(self):
+        for number, error in enumerate((AuthError('Expired quota fixture'), RemoteError(401), RemoteError(403))):
+            with self.subTest(error=type(error).__name__):
+                state_dir = self.root / f'quota-auth-{number}'
+                state_dir.mkdir()
+                TokenStore(state_dir / 'auth.dat').save(Tokens('saved-access', 'saved-refresh', EMAIL))
+                service = self.make_service(state_dir=state_dir)
+                self.cloud.quota_values = [100]
+                service.refresh_quota(); before = self.done(service)['quota']
+                self.cloud.quota_values = [error]
+                service.refresh_quota(); state = self.done(service)
+                self.assertFalse(state['authenticated'])
+                self.assertFalse(state['quota_refresh_available'])
+                self.assertTrue(state['quota']['stale'])
+                self.assertEqual(state['quota']['updated_at'], before['updated_at'])
+                self.assertEqual(state['quota']['used_bytes'], before['used_bytes'])
+                self.assertTrue(state['quota']['error'])
+                self.assertTrue((state_dir / 'auth.dat').is_file(), 'Never discard tokens as a side effect')
+
+    def test_failed_run_rejection_updates_auth_indicator_and_stales_quota(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        self.service.settings(preflight_check=False)
+        first = self.service.jobs()['jobs'][0]
+        self.cloud.failures[Path(first['local_path']).name] = [RemoteError(403)]
+        self.service.start(); state = self.done()
+        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertFalse(state['authenticated'])
+        self.assertTrue(state['quota']['stale'])
+        self.assertTrue(state['quota']['error'])
+        self.assertFalse(state['quota_refresh_available'])
+        self.assertEqual(state['stats']['pending'], 1)
+        self.assertEqual(state['stats']['failed'], 1)
+        self.assertEqual(self.cloud.commits, [])
+        with self.service._queue() as queue:
+            self.assertTrue(queue.get_metadata('last_run')['auth_required'])
+        with self.assertRaises(ValueError):
+            self.service.start()
+
+    def test_auth_rejection_survives_restart_until_successful_login(self):
+        self.service.refresh_quota(); self.done()
+        self.cloud.quota_values = [RemoteError(403)]
+        self.service.refresh_quota(); state = self.done()
+        self.assertTrue(state['auth_required'])
+        self.service.close()
+        activity = json.loads((self.state / 'web_activity.json').read_text())
+        self.assertTrue(activity['auth_required'], 'Graceful shutdown must preserve the rejection')
+        # Even an older pending upload intention must not override an explicit
+        # rejected-authentication marker when the controller restarts.
+        activity['resume_upload'] = True
+        write_json(self.state / 'web_activity.json', activity)
+        replacement = self.make_service()
+        self.assertFalse(replacement.snapshot()['authenticated'])
+        self.assertTrue(replacement.snapshot()['auth_required'])
+        account_calls = self.cloud.account_calls
+        self.assertFalse(replacement.resume_if_requested())
+        self.assertEqual(self.cloud.account_calls, account_calls)
+        self.assertTrue((self.state / 'auth.dat').is_file())
+        class Auth:
+            def login(self, email, password):
+                return Tokens('accepted-relogin-access', 'accepted-relogin-refresh', email)
+        replacement._auth_client_factory = Auth
+        self.cloud.quota_values = [100]
+        replacement.login(EMAIL, 'disposable-fixture-password'); state = self.done(replacement)
+        self.assertTrue(state['authenticated'])
+        self.assertFalse(state['auth_required'])
+        self.assertFalse(state['quota']['stale'])
+        replacement.close()
+        restored = self.make_service()
+        self.assertTrue(restored.snapshot()['authenticated'])
+        self.assertFalse(restored.snapshot()['auth_required'])
+
+    def test_manual_pause_racing_auth_rejection_does_not_lose_the_rejection(self):
+        self.photos_count(1)
+        self.service.settings(preflight_check=False)
+        def reject_after_pause(*args, **kwargs):
+            self.service.pause()
+            raise RemoteError(403)
+        with patch.object(self.cloud, '_upload_blob', side_effect=reject_after_pause):
+            self.service.start(); state = self.done()
+        self.assertEqual(state['activity']['phase'], 'paused')
+        self.assertFalse(state['authenticated'])
+        self.assertTrue(state['auth_required'])
+        self.assertTrue(state['quota']['stale'])
+        self.assertTrue(json.loads((self.state / 'web_activity.json').read_text())['auth_required'])
+        self.assertEqual(self.cloud.commits, [])
+
+    def test_old_activity_without_auth_required_keeps_saved_login(self):
+        state_dir = self.root / 'old-activity'
+        state_dir.mkdir()
+        TokenStore(state_dir / 'auth.dat').save(Tokens('old-access', 'old-refresh', EMAIL))
+        write_json(state_dir / 'web_activity.json', {'version': 1, 'phase': 'idle', 'resume_upload': False})
+        restored = self.make_service(state_dir=state_dir)
+        state = restored.snapshot()
+        self.assertTrue(state['authenticated'])
+        self.assertFalse(state['auth_required'])
+
+    def test_explicit_logout_clears_auth_rejection_without_deleting_queue(self):
+        self.photos_count(1)
+        self.service.scan(); self.done()
+        self.cloud.quota_values = [RemoteError(401)]
+        self.service.refresh_quota(); self.done()
+        self.service.logout(); state = self.done()
+        self.assertFalse(state['authenticated'])
+        self.assertFalse(state['auth_required'])
+        self.assertIsNone(state['quota'])
+        self.assertIsNone(state['quota_error'])
+        self.assertEqual(state['stats']['pending'], 1)
+        self.assertFalse((self.state / 'auth.dat').exists())
+
     def test_upload_measurements_update_quota_without_extra_cloud_calls(self):
         self.photos_count(1)
         self.service.settings(preflight_check=False)
@@ -369,6 +479,33 @@ class WebServiceTests(unittest.TestCase):
         self.service.settings(remote_reconcile=False, preflight_check=False)
         self.service.start(); state = self.done()
         self.assertEqual(state['stats']['uploaded'], 2)
+
+    def test_early_reconcile_account_rejection_updates_auth_and_keeps_local_scan(self):
+        self.photos_count(1)
+        self.service.settings(remote_reconcile=True)
+        self.service.refresh_quota(); self.done()
+        with patch.object(self.cloud, 'require_account', side_effect=RemoteError(401)):
+            self.service.scan(); state = self.done()
+        self.assertFalse(state['authenticated'])
+        self.assertTrue(state['quota']['stale'])
+        self.assertTrue(state['last_scan']['complete'])
+        self.assertEqual(state['stats']['pending'], 1)
+        self.assertEqual(state['activity']['phase'], 'idle')
+        self.assertEqual(self.cloud.commits, [])
+
+    def test_pipeline_does_not_upload_after_optional_comparison_loses_auth(self):
+        self.photos_count(2)
+        self.service.settings(remote_reconcile=True, preflight_check=False)
+        with patch.object(self.cloud, 'stat', side_effect=RemoteError(403)):
+            self.service.start(); state = self.done()
+        self.assertFalse(state['authenticated'])
+        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertTrue(state['last_scan']['complete'])
+        self.assertEqual(state['stats']['pending'], 2)
+        self.assertEqual(self.cloud.account_calls, 1, 'Only the comparison may validate this rejected account')
+        self.assertEqual(self.cloud.quota_calls, 0)
+        self.assertEqual(self.cloud.upload_calls, [])
+        self.assertEqual(self.cloud.commits, [])
 
     def test_task_source_and_links_use_id_and_encoded_private_cloud_path(self):
         path = self.photos / 'Фото #?%.JPG'
@@ -714,6 +851,31 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(state['activity']['phase'], 'completed', state)
         self.assertEqual(state['probe']['result'], 'provisional_pass')
         self.assertEqual(len(self.cloud.commits), 1)
+
+    def test_resumed_probe_claim_cancellation_remains_an_interruption(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        with self.service._queue() as queue:
+            queue.bind_account(EMAIL)
+            first = queue.list_jobs()[0]
+            queue.set_metadata('probe', {
+                'result': 'interrupted', 'protocol': PROTOCOL_VERSION, 'account': EMAIL,
+                'destination': '/Archive', 'started_at': time.time(), 'before': {'used_bytes': 100},
+                'samples': [], 'active_job_id': first['id'], 'measurements': [],
+            })
+        original = Queue.claim
+        def cancel_claim(queue, *, stop=None, **kwargs):
+            self.assertIs(stop, self.service._stop)
+            self.service.pause()
+            return original(queue, stop=stop, **kwargs)
+        with patch.object(Queue, 'claim', new=cancel_claim):
+            self.service.start(); state = self.done()
+        self.assertEqual(state['activity']['phase'], 'paused')
+        self.assertEqual(state['probe']['result'], 'interrupted')
+        self.assertEqual(state['stats']['pending'], 2)
+        self.assertTrue(state['authenticated'])
+        self.assertFalse(state['auth_required'])
+        self.assertEqual(self.cloud.commits, [])
 
     def test_old_confirmation_cannot_be_used_as_new_probe_sample(self):
         self.photos_count(1)
@@ -1101,6 +1263,47 @@ class WebServiceTests(unittest.TestCase):
         self.service.close()
         replacement = self.make_service()
         self.assertTrue(replacement.snapshot()['authenticated'])
+
+    def test_login_rejected_by_quota_does_not_replace_saved_credentials_or_probe(self):
+        class Auth:
+            def login(self, email, password):
+                return Tokens('rejected-new-access', 'rejected-new-refresh', email)
+        self.service._auth_client_factory = Auth
+        original_tokens = (self.state / 'auth.dat').read_bytes()
+        original_probe = {'result': 'provisional_pass', 'offline_fixture': True}
+        with self.service._queue() as queue:
+            queue.set_metadata('probe', original_probe)
+        self.service.refresh_quota(); self.done()
+        for error in (AuthError('Rejected refresh fixture'), RemoteError(401), RemoteError(403)):
+            with self.subTest(error=type(error).__name__):
+                self.cloud.quota_values = [error]
+                self.service.login(EMAIL, 'disposable-fixture-password'); state = self.done()
+                self.assertFalse(state['authenticated'])
+                self.assertEqual(state['activity']['phase'], 'error')
+                self.assertTrue(state['quota']['stale'])
+                self.assertEqual((self.state / 'auth.dat').read_bytes(), original_tokens)
+                with self.service._queue() as queue:
+                    self.assertEqual(queue.get_metadata('probe'), original_probe)
+                    self.assertEqual(queue.get_metadata('last_auth')['result'], 'failed')
+                self.assertNotIn('rejected-new-', json.dumps(state))
+                self.assertNotIn('disposable-fixture-password', json.dumps(state))
+
+    def test_login_can_survive_non_auth_quota_outage_without_fabricating_current_quota(self):
+        class Auth:
+            def login(self, email, password):
+                return Tokens('accepted-new-access', 'accepted-new-refresh', email)
+        self.service._auth_client_factory = Auth
+        self.service.refresh_quota(); self.done()
+        for error in (TransportError('Proxy HTTP 403 diagnostic'), RemoteError(503), ProtocolError('Missing quota field')):
+            with self.subTest(error=type(error).__name__):
+                self.cloud.quota_values = [error]
+                self.service.login(EMAIL, 'disposable-fixture-password'); state = self.done()
+                self.assertTrue(state['authenticated'])
+                self.assertEqual(state['activity']['phase'], 'idle')
+                self.assertTrue(state['quota']['stale'])
+                self.assertEqual(TokenStore(self.state / 'auth.dat').load().access_token, 'accepted-new-access')
+                with self.service._queue() as queue:
+                    self.assertEqual(queue.get_metadata('last_auth')['result'], 'success')
 
     def test_multiworker_pause_resume_with_concurrent_dashboard_polling(self):
         self.photos_count(126)

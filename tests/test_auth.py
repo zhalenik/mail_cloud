@@ -10,6 +10,8 @@ import urllib.request
 from pathlib import Path
 
 from mailru_photos.auth import AuthClient, AuthError, TokenManager, Tokens, TokenStore, _NoRedirect
+from mailru_photos.api import ProtocolError, RemoteError, is_auth_failure
+from mailru_photos.transport import TransportError
 
 
 class Response(io.BytesIO):
@@ -30,6 +32,21 @@ class Opener:
 
 
 class AuthenticationTests(unittest.TestCase):
+    def test_auth_failure_classification_uses_cloud_error_types_only(self):
+        for error in (AuthError('Rejected fixture credentials'), RemoteError(401), RemoteError(403)):
+            with self.subTest(error=type(error).__name__, status=getattr(error, 'status', None)):
+                self.assertTrue(is_auth_failure(error))
+        unrelated = [PermissionError('Local source access denied'),
+                     TransportError('HTTP 403 text from a proxy is not a Cloud rejection'),
+                     ProtocolError('HTTP 401 in a diagnostic string'),
+                     RemoteError(400), RemoteError(503), RemoteError(403, authenticated=False),
+                     urllib.error.HTTPError('https://unrelated.invalid/', 403, 'Forbidden', {}, None)]
+        for error in unrelated:
+            if not isinstance(error, (RemoteError, urllib.error.HTTPError)):
+                error.status = 403
+            with self.subTest(error=type(error).__name__):
+                self.assertFalse(is_auth_failure(error))
+
     def test_logout_removes_saved_tokens_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'auth.dat'

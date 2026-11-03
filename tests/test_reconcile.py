@@ -246,6 +246,8 @@ class ReconcileTests(unittest.TestCase):
         for error, reason, auth in ((TransportError("offline"), "network", False),
                                     (ProtocolError("unknown protocol"), "protocol", False),
                                     (RemoteError(503), "remote", False),
+                                    (RemoteError(403, authenticated=False), "remote", False),
+                                    (RemoteError(401), "auth", True),
                                     (RemoteError(403), "auth", True),
                                     (AuthError("expired"), "auth", True)):
             with self.subTest(error=type(error).__name__, reason=reason):

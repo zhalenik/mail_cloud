@@ -1,0 +1,299 @@
+{
+  "count": 300000,
+  "environment": {
+    "python": "3.12.14",
+    "sqlite": "3.53.1",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_count": 9,
+    "queue_source_sha256": "d2cd066ea18ea1f82924d04c4fc13eadcbc88202c05dd6fb67068b2e9efdb8b1"
+  },
+  "scope": {
+    "real_sqlite": true,
+    "journal_mode": "WAL",
+    "synchronous": "FULL",
+    "virtual_source_enumeration": true,
+    "virtual_stat": true,
+    "patched_snapshot": true,
+    "network_uploads": false,
+    "bulk_prefixes_are_sql_fixtures": true,
+    "fixture_verified_completions": 100,
+    "fixture_existing_observations": 25
+  },
+  "baseline_rss_mb": 20.82421875,
+  "measurements": {
+    "initial_scan": {
+      "seconds": 30.684318404004443,
+      "rss_mb": 24.875,
+      "peak_rss_mb": 24.6953125,
+      "disk_mb": {
+        "db": 217.484,
+        "-wal": 7.835,
+        "-shm": 0.031
+      },
+      "result": {
+        "scan_id": 1,
+        "seen": 300000,
+        "added": 300000,
+        "changed": 0,
+        "moved": 0,
+        "unchanged": 0,
+        "missing": 0,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 30.68319774200063,
+        "complete": true,
+        "cancelled": false
+      }
+    },
+    "stats_initial": {
+      "median_ms": 250.94801600062056,
+      "p95_ms": 270.42925800196826,
+      "min_ms": 234.87771499640075,
+      "max_ms": 270.42925800196826,
+      "samples": 3,
+      "rss_mb": 30.4375
+    },
+    "list_offset_0": {
+      "median_ms": 0.4060279970872216,
+      "p95_ms": 1.3216579973232,
+      "min_ms": 0.30876499658916146,
+      "max_ms": 1.3216579973232,
+      "samples": 7,
+      "rss_mb": 30.44921875
+    },
+    "list_offset_150000": {
+      "median_ms": 4.275461003999226,
+      "p95_ms": 4.538437999144662,
+      "min_ms": 4.0108110042638145,
+      "max_ms": 4.538437999144662,
+      "samples": 7,
+      "rss_mb": 30.484375
+    },
+    "list_offset_299900": {
+      "median_ms": 8.411686001636554,
+      "p95_ms": 8.977648998552468,
+      "min_ms": 7.91595499322284,
+      "max_ms": 8.977648998552468,
+      "samples": 7,
+      "rss_mb": 30.48828125
+    },
+    "candidate_after_0": {
+      "median_ms": 1.2521449971245602,
+      "p95_ms": 1.5057689961395226,
+      "min_ms": 0.8955299999797717,
+      "max_ms": 1.5057689961395226,
+      "samples": 7,
+      "rss_mb": 31.0859375
+    },
+    "candidate_after_150000": {
+      "median_ms": 0.9627890030969866,
+      "p95_ms": 1.2637719992198981,
+      "min_ms": 0.893837001058273,
+      "max_ms": 1.2637719992198981,
+      "samples": 7,
+      "rss_mb": 31.2890625
+    },
+    "candidate_after_299500": {
+      "median_ms": 1.2582339986693114,
+      "p95_ms": 4.6526259975507855,
+      "min_ms": 0.9808859977056272,
+      "max_ms": 4.6526259975507855,
+      "samples": 7,
+      "rss_mb": 31.29296875
+    },
+    "claim_first": {
+      "median_ms": 0.4547099961200729,
+      "p95_ms": 1.3325330000952817,
+      "max_ms": 1.3325330000952817,
+      "samples": 11,
+      "claimed_id": 1,
+      "sqlite_vm_operations_upper_bound": 500
+    },
+    "claim_last_after_terminal_prefix": {
+      "median_ms": 0.8964110020315275,
+      "p95_ms": 3.3899549962370656,
+      "max_ms": 3.3899549962370656,
+      "samples": 11,
+      "claimed_id": 300000,
+      "sqlite_vm_operations_upper_bound": 400
+    },
+    "claim_last_after_paused_prefix": {
+      "median_ms": 0.36204400385031477,
+      "p95_ms": 0.9294690025853924,
+      "max_ms": 0.9294690025853924,
+      "samples": 11,
+      "claimed_id": 300000,
+      "sqlite_vm_operations_upper_bound": 500
+    },
+    "claim_retry_after_paused_prefix": {
+      "median_ms": 0.5154190002940595,
+      "p95_ms": 1.233652998053003,
+      "max_ms": 1.233652998053003,
+      "samples": 11,
+      "claimed_id": 300000,
+      "sqlite_vm_operations_upper_bound": 500
+    },
+    "stats_paused_prefix": {
+      "median_ms": 252.37442499928875,
+      "p95_ms": 269.4841990014538,
+      "min_ms": 228.83822800213238,
+      "max_ms": 269.4841990014538,
+      "samples": 3,
+      "rss_mb": 31.60546875
+    },
+    "unchanged_rescan": {
+      "seconds": 29.438681728002848,
+      "rss_mb": 31.60546875,
+      "peak_rss_mb": 31.3203125,
+      "disk_mb": {
+        "db": 219.316,
+        "-wal": 151.146,
+        "-shm": 0.312
+      },
+      "result": {
+        "scan_id": 2,
+        "seen": 300000,
+        "added": 0,
+        "changed": 0,
+        "moved": 0,
+        "unchanged": 300000,
+        "missing": 0,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 29.43695227799617,
+        "complete": true,
+        "cancelled": false
+      }
+    },
+    "moved_rescan": {
+      "seconds": 28.89909533800528,
+      "rss_mb": 31.609375,
+      "peak_rss_mb": 31.3203125,
+      "disk_mb": {
+        "db": 219.777,
+        "-wal": 151.146,
+        "-shm": 0.312
+      },
+      "result": {
+        "scan_id": 3,
+        "seen": 300000,
+        "added": 0,
+        "changed": 0,
+        "moved": 3000,
+        "unchanged": 297000,
+        "missing": 0,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 28.897831606002,
+        "complete": true,
+        "cancelled": false
+      }
+    },
+    "removed_rescan": {
+      "seconds": 27.27957091200369,
+      "rss_mb": 31.87890625,
+      "peak_rss_mb": 31.5703125,
+      "disk_mb": {
+        "db": 219.828,
+        "-wal": 151.146,
+        "-shm": 0.312
+      },
+      "result": {
+        "scan_id": 4,
+        "seen": 290000,
+        "added": 0,
+        "changed": 0,
+        "moved": 0,
+        "unchanged": 290000,
+        "missing": 10000,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 27.27875099400262,
+        "complete": true,
+        "cancelled": false
+      }
+    },
+    "reopen": {
+      "milliseconds": 0.828362004540395,
+      "writes": 0,
+      "rss_mb": 31.609375
+    },
+    "stats_final": {
+      "median_ms": 220.31006200268166,
+      "p95_ms": 225.048031003098,
+      "min_ms": 220.04526099772193,
+      "max_ms": 225.048031003098,
+      "samples": 3,
+      "rss_mb": 31.609375
+    }
+  },
+  "plans": {
+    "pending_claim": [
+      [
+        5,
+        0,
+        212,
+        "SCAN jobs USING INDEX jobs_pending"
+      ]
+    ],
+    "retry_claim": [
+      [
+        5,
+        0,
+        172,
+        "SEARCH jobs USING INDEX jobs_retry (next_attempt>? AND next_attempt<?)"
+      ]
+    ],
+    "task_list": [
+      [
+        8,
+        0,
+        212,
+        "SCAN jobs USING INDEX jobs_current"
+      ]
+    ],
+    "reconcile_candidates": [
+      [
+        5,
+        0,
+        192,
+        "SEARCH jobs USING INDEX jobs_reconcile (id>?)"
+      ],
+      [
+        12,
+        0,
+        0,
+        "CORRELATED SCALAR SUBQUERY 1"
+      ],
+      [
+        16,
+        12,
+        33,
+        "SEARCH commit_intents USING INTEGER PRIMARY KEY (rowid=?)"
+      ]
+    ]
+  },
+  "assertions": [
+    "initial count exactly matches virtual source count",
+    "unchanged rescan creates no tasks",
+    "3000 moves preserve task IDs and do not grow the queue",
+    "uploaded and existing observations retain their actual cloud paths after moves",
+    "10000 absent sources excluded from current totals and retained in history",
+    "paused prefix has remaining=0 and no claimable task",
+    "first/last/paused-prefix claims stay below 10000 SQLite VM operations",
+    "ordered claim/list/keyset queries require no temporary sort",
+    "reopen performs zero writes and preserves current counts, actual paths and proof history"
+  ],
+  "final_disk_mb": {
+    "db": 219.828
+  },
+  "final_rss_mb": 31.578125,
+  "peak_rss_mb": 31.5703125,
+  "rss_after_initial_scan_mb": 30.421875,
+  "total_seconds": 128.80455509200692,
+  "observed_peak_rss_mb": 31.87890625
+}
