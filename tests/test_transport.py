@@ -163,6 +163,46 @@ class ProxyTransportTests(unittest.TestCase):
 
 
 class NetworkDiagnosticTests(unittest.TestCase):
+    def test_task_cancel_closes_current_body_and_a_new_signal_can_reuse_worker(self):
+        import threading
+        class TaskEvent(threading.Event):
+            def check(self):
+                if self.is_set():
+                    raise transport.TaskCancelled('Offline task pause')
+        task = TaskEvent()
+        with mock.patch.object(transport, 'getproxies', return_value={}), \
+             mock.patch.object(transport.http.client, 'HTTPSConnection') as constructor:
+            connection = constructor.return_value
+            client = transport.HTTP(stop=task)
+            with self.assertRaises(transport.TaskCancelled):
+                client.request('PUT', 'https://uploader.cloud.mail.ru/resumable/TEST',
+                               stream=io.BytesIO(b'a' * (2 * 1024 * 1024)), length=2 * 1024 * 1024,
+                               progress=lambda count: task.set())
+            connection.send.assert_called_once()
+            connection.getresponse.assert_not_called()
+            connection.close.assert_called_once()
+            self.assertFalse(client._connections)
+            incoming = connection.getresponse.return_value
+            incoming.status, incoming.will_close = 200, False
+            incoming.read.return_value = b'{}'
+            incoming.getheaders.return_value = []
+            client.stop = threading.Event()
+            self.assertEqual(client.request('GET', 'https://cloud.mail.ru/api/v4/user/quota').status, 200)
+            self.assertEqual(constructor.call_count, 2)
+
+    def test_local_stream_read_error_is_not_misclassified_as_network_failure(self):
+        with mock.patch.object(transport, 'getproxies', return_value={}), \
+             mock.patch.object(transport.http.client, 'HTTPSConnection') as constructor:
+            stream = mock.Mock()
+            stream.read.side_effect = PermissionError('private-source-detail')
+            client = transport.HTTP()
+            with self.assertRaises(transport.SourceReadError) as caught:
+                client.request('PUT', 'https://uploader.cloud.mail.ru/resumable/TEST', stream=stream, length=100)
+            self.assertNotIn('private-source-detail', str(caught.exception))
+            constructor.return_value.close.assert_called_once()
+            constructor.return_value.getresponse.assert_not_called()
+            self.assertFalse(client._connections)
+
     def failed_request(self, error, *, method="GET",
                        url="https://cloud.mail.ru/api/v4/user/quota?access_token=DO-NOT-LEAK-URL",
                        stream=None, length=None):

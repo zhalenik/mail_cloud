@@ -7,9 +7,11 @@ sockets or external service are used.
 from __future__ import annotations
 
 from dataclasses import asdict
+import contextlib
 import json
 from pathlib import Path
 import posixpath
+import sqlite3
 import tempfile
 import threading
 import time
@@ -18,12 +20,12 @@ from unittest.mock import patch
 
 from mailru_photos.api import (
     AccountInfo, CloudAPI, FileIdentity, PROTOCOL_VERSION, ProtocolError,
-    RemoteError, UnsupportedPhoto, cloud_hash,
+    FileVerificationError, RemoteConflict, RemoteError, SourceChanged, UnsupportedPhoto, cloud_hash,
 )
 from mailru_photos.queue import Queue
 from mailru_photos.media import UNLIMITED_MAX_BYTES
 from mailru_photos.runner import ProbeRequired, QuotaGuard, probe, run
-from mailru_photos.transport import Cancelled, Response, TransportError
+from mailru_photos.transport import Cancelled, Response, SourceReadError, TaskCancelled, TransportError, check_cancelled
 
 
 EMAIL = "owner@example.test"
@@ -68,8 +70,7 @@ class FakeCloud(CloudAPI):
         self.max_active_uploads = 0
 
     def _check_stopped(self):
-        if self.stop.is_set():
-            raise Cancelled("Offline test cancellation")
+        check_cancelled(self.request_stop)
 
     def require_account(self, expected_email=None):
         self._check_stopped()
@@ -247,11 +248,13 @@ class RunnerTests(unittest.TestCase):
             return Response(200, {}, json.dumps(payload).encode())
         api._request = unconfirmed
         result = run(self.queue, api, workers=1, require_probe=False)
-        self.assertTrue(result["stopped"])
+        self.assertFalse(result["stopped"])
         self.assertEqual(result["stats"]["uploaded"], 0)
-        self.assertEqual(result["stats"]["failed"], 1)
-        self.assertEqual(result["stats"]["pending"], 2)
-        self.assertEqual(len(api.commits), 1)
+        self.assertEqual(result["stats"]["failed"], 3)
+        self.assertEqual(result["stats"]["pending"], 0)
+        self.assertEqual(len(api.commits), 3)
+        self.assertEqual(result['outcome'], 'finished_with_errors')
+        self.assertGreaterEqual(api.quota_calls, 5, 'Every unconfirmed commit forces a quota check')
 
     def test_skipping_probe_keeps_quota_monitoring(self):
         self.make_photos(5)
@@ -368,6 +371,280 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(api.max_active_uploads, 4)
         self.assertEqual(api.closed_threads, 4)
 
+    def test_pausing_one_task_keeps_other_workers_running_and_survives_restart(self):
+        self.make_photos(3)
+        self.seed_pass()
+        first = self.queue.list_jobs()[0]
+        signals = {}
+        @contextlib.contextmanager
+        def scope(job):
+            signal = threading.Event()
+            signals[job.id] = signal
+            try:
+                yield signal
+            finally:
+                signals.pop(job.id, None)
+        api = FakeCloud()
+        original = api._upload_blob
+        pause_once = True
+        def interrupt_first(path, digest, identity, **kwargs):
+            nonlocal pause_once
+            original(path, digest, identity, **kwargs)
+            if str(path) == first['local_path'] and pause_once:
+                pause_once = False
+                with Queue(self.queue.path, destination=self.queue.destination) as controls:
+                    controls.request_control(first['id'], 'pause')
+                signals[first['id']].set()
+                api._check_stopped()
+        api._upload_blob = interrupt_first
+        result = run(self.queue, api, workers=2, task_scope=scope)
+        self.assertFalse(api.stop.is_set())
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['outcome'], 'paused_tasks')
+        self.assertEqual(result['stats']['uploaded'], 2)
+        self.assertEqual(result['stats']['paused'], 1)
+        self.assertEqual(result['stats']['running'], 0)
+        self.assertEqual(signals, {})
+        queue_path = self.queue.path
+        self.queue.close()
+        self.queue = Queue(queue_path, destination='/Archive', account_id=EMAIL)
+        paused = self.queue.list_jobs(status='paused')
+        self.assertEqual([row['id'] for row in paused], [first['id']])
+        self.assertEqual(paused[0]['attempts'], 0)
+        self.queue.request_control(first['id'], 'resume')
+        resumed = run(self.queue, api, workers=2, task_scope=scope)
+        self.assertEqual(resumed['outcome'], 'complete')
+        self.assertEqual(resumed['stats']['uploaded'], 3)
+        self.assertEqual(len(api.commits), 3)
+        self.assertEqual(signals, {})
+
+    def test_task_pause_with_positive_commit_keeps_proof_and_resumes_without_second_add(self):
+        self.make_photos(2)
+        self.seed_pass()
+        first = self.queue.list_jobs()[0]
+        signals = {}
+        @contextlib.contextmanager
+        def scope(job):
+            signal = threading.Event()
+            signals[job.id] = signal
+            try:
+                yield signal
+            finally:
+                signals.pop(job.id, None)
+        api = FakeCloud()
+        original = api._request
+        def pause_after_ack(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if json.loads(kwargs['body'])['path'] == first['remote_path']:
+                with Queue(self.queue.path, destination=self.queue.destination) as controls:
+                    controls.request_control(first['id'], 'pause')
+                signals[first['id']].set()
+            return response
+        api._request = pause_after_ack
+        result = run(self.queue, api, workers=1, task_scope=scope)
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['stats']['uploaded'], 1)
+        self.assertEqual(result['stats']['paused'], 1)
+        saved = json.loads(self.queue._db.execute(
+            'SELECT intent_json FROM commit_intents WHERE job_id=?', (first['id'],)).fetchone()[0])
+        self.assertIs(saved['unlimited_confirmed'], True)
+        self.assertEqual(len(api.commits), 2)
+        self.queue.request_control(first['id'], 'resume')
+        resumed = run(self.queue, api, workers=1, task_scope=scope)
+        self.assertEqual(resumed['stats']['uploaded'], 2)
+        self.assertEqual(resumed['outcome'], 'complete')
+        self.assertEqual(len(api.commits), 2)
+        evidence = self.queue.upload_history(first['id'])[-1]['verified_metadata']
+        self.assertTrue(evidence['recovered_commit'])
+        self.assertEqual(evidence['unlimited_evidence'], 'saved_commit_response')
+
+    def test_durable_pause_without_ui_signal_is_checked_before_commit(self):
+        self.make_photos(2)
+        self.seed_pass()
+        first = self.queue.list_jobs()[0]
+        api = FakeCloud()
+        original = api._upload_blob
+        def durable_pause(path, digest, identity, **kwargs):
+            original(path, digest, identity, **kwargs)
+            if str(path) == first['local_path']:
+                with Queue(self.queue.path, destination=self.queue.destination) as controls:
+                    controls.request_control(first['id'], 'pause')
+        api._upload_blob = durable_pause
+        result = run(self.queue, api, workers=1)
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['stats']['uploaded'], 1)
+        self.assertEqual(result['stats']['paused'], 1)
+        self.assertNotIn(first['remote_path'], api.remote)
+
+    def test_remove_requested_with_positive_commit_keeps_receipt_and_continues(self):
+        self.make_photos(2)
+        self.seed_pass()
+        first = self.queue.list_jobs()[0]
+        signals = {}
+        @contextlib.contextmanager
+        def scope(job):
+            signal = threading.Event()
+            signals[job.id] = signal
+            try:
+                yield signal
+            finally:
+                signals.pop(job.id, None)
+        api = FakeCloud()
+        original = api._request
+        def remove_after_ack(method, url, **kwargs):
+            reply = original(method, url, **kwargs)
+            if json.loads(kwargs['body'])['path'] == first['remote_path']:
+                with Queue(self.queue.path, destination=self.queue.destination) as controls:
+                    controls.request_control(first['id'], 'remove')
+                signals[first['id']].set()
+            return reply
+        api._request = remove_after_ack
+        result = run(self.queue, api, workers=1, task_scope=scope)
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['stats']['uploaded'], 1)
+        self.assertEqual(result['stats']['total'], 1)
+        self.assertIsNone(self.queue.get_job(first['id']))
+        self.assertTrue(Path(first['local_path']).exists())
+        self.assertIn(first['remote_path'], api.remote)
+        receipts = self.queue.commit_history(first['id'])
+        accepted = [row for row in receipts if row['stage'] == 'accepted']
+        self.assertEqual(len(accepted), 1)
+        self.assertIs(json.loads(accepted[0]['intent_json'])['unlimited_confirmed'], True)
+        self.assertEqual(self.queue.upload_history(first['id']), [], 'A receipt without stat is not verified upload success')
+        self.assertEqual(len(api.commits), 2)
+
+    def test_source_change_after_positive_commit_keeps_receipt_without_stopping_others(self):
+        self.make_photos(2)
+        self.seed_pass()
+        first = self.queue.list_jobs()[0]
+        api = FakeCloud()
+        original = api._request
+        def replace_source_after_ack(method, url, **kwargs):
+            reply = original(method, url, **kwargs)
+            if json.loads(kwargs['body'])['path'] == first['remote_path']:
+                Path(first['local_path']).write_bytes(b'a newer local version' * 32)
+            return reply
+        api._request = replace_source_after_ack
+        result = run(self.queue, api, workers=1)
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['stats']['uploaded'], 1)
+        self.assertEqual(result['stats']['failed'], 1)
+        self.assertEqual(self.queue.get_job(first['id'])['skip_reason'], 'source_changed')
+        accepted = [row for row in self.queue.commit_history(first['id']) if row['stage'] == 'accepted']
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]['source_size'], first['size'])
+        self.assertEqual(self.queue.upload_history(first['id']), [])
+        self.assertEqual(len(api.commits), 2)
+
+    def test_file_failures_do_not_stop_later_tasks(self):
+        failures = [SourceReadError('Unreadable source'), SourceChanged('Changed source'),
+                    RemoteConflict('Existing object'), FileVerificationError('Hash mismatch'),
+                    RemoteError(400, 'INVALID/FILE')]
+        self.make_photos(len(failures) + 1)
+        self.seed_pass()
+        api = FakeCloud()
+        for row, error in zip(self.queue.list_jobs(), failures):
+            api.failures[Path(row['local_path']).name] = [error]
+        result = run(self.queue, api, workers=1)
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['outcome'], 'finished_with_errors')
+        self.assertEqual(result['stats']['failed'], len(failures))
+        self.assertEqual(result['stats']['uploaded'], 1)
+        self.assertEqual(result['stats']['running'], 0)
+        self.assertEqual(self.queue.get_metadata('probe')['result'], 'provisional_pass')
+
+    def test_unconfirmed_file_forces_quota_guard_before_next_task(self):
+        self.make_photos(3)
+        self.seed_pass()
+        api = FakeCloud()
+        original = api._request
+        def unconfirmed(*args, **kwargs):
+            reply = original(*args, **kwargs)
+            payload = json.loads(reply.body)
+            payload['is_unlim_upload'] = False
+            return Response(200, {}, json.dumps(payload).encode())
+        api._request = unconfirmed
+        api.quota_rule = lambda client: 200 if client.commits else 100
+        result = run(self.queue, api, workers=1)
+        self.assertTrue(result['stopped'])
+        self.assertEqual(result['stats']['failed'], 1)
+        self.assertEqual(result['stats']['pending'], 2)
+        self.assertEqual(result['stats']['uploaded'], 0)
+        self.assertEqual(len(api.commits), 1)
+        self.assertEqual(self.queue.get_metadata('probe')['result'], 'needs_recheck')
+
+    def test_auth_and_unknown_protocol_errors_still_stop_all_tasks(self):
+        self.make_photos(3)
+        first = self.queue.list_jobs()[0]
+        for error in (RemoteError(403), ProtocolError('Unknown protocol structure')):
+            with self.subTest(error=type(error).__name__):
+                self.queue.retry_failed(include_permanent=True)
+                self.seed_pass()
+                api = FakeCloud()
+                api.failures[Path(first['local_path']).name] = [error]
+                result = run(self.queue, api, workers=1)
+                self.assertTrue(result['stopped'])
+                self.assertEqual(result['stats']['pending'], 2)
+                self.assertEqual(result['stats']['uploaded'], 0)
+                self.assertEqual(api.commits, [])
+                self.assertEqual(self.queue.get_metadata('probe')['result'], 'needs_recheck')
+
+    def test_database_confirmation_failure_stops_other_tasks(self):
+        self.make_photos(3)
+        self.seed_pass()
+        api = FakeCloud()
+        with patch.object(Queue, 'confirm_unlimited_commit', side_effect=sqlite3.OperationalError('disk full')):
+            result = run(self.queue, api, workers=1)
+        self.assertTrue(result['stopped'])
+        self.assertEqual(result['stats']['uploaded'], 0)
+        self.assertEqual(len(api.commits), 1)
+        self.assertEqual(result['stats']['pending'], 2)
+        self.assertTrue(result['errors'])
+
+    def test_probe_uses_next_candidate_after_file_error_and_task_pause(self):
+        self.make_photos(3)
+        first, second, third = self.queue.list_jobs()
+        api = FakeCloud(stop=InstantEvent())
+        api.failures[Path(first['local_path']).name] = [SourceReadError('Unreadable probe candidate')]
+        @contextlib.contextmanager
+        def scope(job):
+            signal = threading.Event()
+            if job.id == second['id']:
+                self.queue.request_control(job.id, 'pause')
+                signal.set()
+            yield signal
+        report = probe(self.queue, api, count=1, settle_seconds=30, task_scope=scope)
+        self.assertEqual(report['result'], 'provisional_pass')
+        self.assertEqual(report['requested_count'], 1)
+        self.assertEqual(report['other_candidates'], 2)
+        self.assertEqual([sample['job_id'] for sample in report['samples']], [third['id']])
+        self.assertEqual(self.queue.stats()['failed'], 1)
+        self.assertEqual(self.queue.stats()['paused'], 1)
+        self.assertEqual(self.queue.stats()['uploaded'], 1)
+        self.assertFalse(api.stop.is_set())
+
+    def test_probe_waits_for_deferred_retry_without_treating_it_as_global_failure(self):
+        self.make_photos(1)
+        row = self.queue.list_jobs()[0]
+        queue = self.queue
+        class ReadyOnWait(InstantEvent):
+            def wait(self, timeout=None):
+                result = super().wait(timeout)
+                # Advance the fixture's retry deadline without a wall-clock
+                # sleep; the runner must first choose its bounded wait path.
+                queue._db.execute("UPDATE jobs SET next_attempt=0 WHERE status='failed' AND next_attempt IS NOT NULL")
+                return result
+        event = ReadyOnWait()
+        api = FakeCloud(stop=event)
+        api.failures[Path(row['local_path']).name] = [RemoteError(503)]
+        report = probe(self.queue, api, count=1, settle_seconds=30)
+        self.assertEqual(report['result'], 'provisional_pass')
+        self.assertEqual(self.queue.stats()['uploaded'], 1)
+        self.assertEqual(self.queue.get_job(row['id'])['attempts'], 2)
+        self.assertGreaterEqual(event.waits[0], 0.1)
+        self.assertLessEqual(event.waits[0], 10)
+        self.assertEqual(event.waits[1:], [15, 15])
+
     def test_lost_add_response_cannot_confirm_unlimited_or_complete_upload(self):
         self.make_photos(1)
         self.seed_pass()
@@ -378,7 +655,7 @@ class RunnerTests(unittest.TestCase):
         with patch("mailru_photos.runner.random.random", return_value=0):
             result = run(self.queue, api, workers=1, max_attempts=2)
         self.assertLess(time.monotonic() - started, 8)
-        self.assertEqual(result["outcome"], "stopped")
+        self.assertEqual(result["outcome"], "finished_with_errors")
         self.assertEqual(result["stats"]["uploaded"], 0)
         self.assertEqual(result["stats"]["failed"], 1)
         self.assertEqual(len(api.commits), 1)
@@ -387,7 +664,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.queue.upload_history(row["id"]), [])
         intent = json.loads(self.queue._db.execute("SELECT intent_json FROM commit_intents WHERE job_id=?", (row["id"],)).fetchone()[0])
         self.assertIsNot(intent.get("unlimited_confirmed"), True)
-        self.assertEqual(self.queue.get_metadata("probe")["result"], "needs_recheck")
+        self.assertEqual(self.queue.get_metadata("probe")["result"], "provisional_pass")
 
     def test_confirmed_unlimited_commit_survives_interrupted_stat_and_recovers(self):
         self.make_photos(1)
@@ -532,17 +809,18 @@ class RunnerTests(unittest.TestCase):
                     "commit_accepted": True, "recovered_commit": False, "stat_matched": False}
 
         api.upload_photo = incomplete_upload
-        with self.assertRaises(ProtocolError):
+        with self.assertRaises(ProbeRequired):
             probe(self.queue, api, count=1, settle_seconds=30)
         self.assertEqual(self.queue.stats()["uploaded"], 0)
-        self.assertEqual(self.queue.get_metadata("probe")["result"], "failed")
+        self.assertEqual(self.queue.get_metadata("probe")["result"], "insufficient_new_samples")
 
     def test_non_true_or_missing_unlimited_flag_cannot_qualify_even_with_saved_confirmation(self):
         cases = ({}, {"is_unlim_upload": False}, {"is_unlim_upload": 1},
                  {"is_unlim_upload": "true"}, {"is_unlim_upload": None})
-        self.make_photos(len(cases))
+        self.make_photos(1)
         for flag in cases:
             with self.subTest(flag=flag):
+                self.queue.retry_failed(include_permanent=True)
                 api = FakeCloud(stop=InstantEvent())
 
                 def incomplete_upload(path, remote_path, *, expected, save_intent, save_confirmation, **kwargs):
@@ -554,10 +832,10 @@ class RunnerTests(unittest.TestCase):
                             "unlimited_evidence": "commit_response", **flag}
 
                 api.upload_photo = incomplete_upload
-                with self.assertRaises(ProtocolError):
+                with self.assertRaises(ProbeRequired):
                     probe(self.queue, api, count=1, settle_seconds=30)
                 self.assertEqual(self.queue.stats()["uploaded"], 0)
-                self.assertEqual(self.queue.get_metadata("probe")["result"], "failed")
+                self.assertEqual(self.queue.get_metadata("probe")["result"], "insufficient_new_samples")
 
     def test_unlimited_result_without_durable_confirmation_cannot_mark_uploaded(self):
         self.make_photos(1)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import math
 import os
@@ -20,7 +21,8 @@ from urllib.parse import quote, urlencode, urlsplit
 from .auth import AuthError, TokenManager
 from .media import UNLIMITED_MAX_BYTES
 from .metadata import encode_mkdir, encode_quota, parse_mkdir_response, parse_quota_response
-from .transport import Cancelled, HTTP, Response, TransportError, validate_url
+from .transport import (Cancelled, HTTP, Response, SourceReadError, TransportError,
+                        check_cancelled, validate_url)
 
 
 API_BASE = "https://android-api.cloud.mail.ru"
@@ -56,6 +58,10 @@ class UnlimitedNotConfirmed(ProtocolError):
     """The server has not supplied a durable, positive per-file billing proof."""
 
 
+class FileVerificationError(ProtocolError):
+    """One remote object failed verification, without changing protocol rules."""
+
+
 class SourceChanged(ProtocolError):
     pass
 
@@ -86,6 +92,15 @@ class FileIdentity:
 def cloud_hash(path: str | Path, *, expected: FileIdentity | None = None,
                stop: threading.Event | None = None) -> tuple[str, FileIdentity]:
     """Streaming Mail Cloud content hash; names and EXIF are left untouched."""
+    check_cancelled(stop)
+    try:
+        return _cloud_hash(path, expected=expected, stop=stop)
+    except OSError:
+        raise SourceReadError("Не удалось прочитать исходный файл для вычисления хеша.") from None
+
+
+def _cloud_hash(path: str | Path, *, expected: FileIdentity | None = None,
+                stop: threading.Event | None = None) -> tuple[str, FileIdentity]:
     with open(path, "rb") as stream:
         identity = FileIdentity.from_stat(os.fstat(stream.fileno()))
         if expected is not None and identity != expected:
@@ -96,8 +111,7 @@ def cloud_hash(path: str | Path, *, expected: FileIdentity | None = None,
             calculator = hashlib.sha1(b"mrCloud")
             count = 0
             while block := stream.read(1024 * 1024):
-                if stop is not None and stop.is_set():
-                    raise Cancelled("Загрузка остановлена.")
+                check_cancelled(stop)
                 calculator.update(block)
                 count += len(block)
             if count != identity.size:
@@ -172,6 +186,8 @@ def _retry_after(response: Response) -> float | None:
 
 
 class CloudAPI:
+    _task_local_lock = threading.Lock()
+
     def __init__(self, tokens: TokenManager, *, stop: threading.Event | None = None,
                  transport_factory: Callable[[], HTTP] | None = None):
         self.tokens = tokens
@@ -190,7 +206,36 @@ class CloudAPI:
     def transport(self) -> HTTP:
         if not hasattr(self._local, "http"):
             self._local.http = self._factory()
+        # Persistent per-thread transports must never retain a previous
+        # task's cancellation signal when the same worker takes another task.
+        self._local.http.stop = self.request_stop
         return self._local.http
+
+    @property
+    def request_stop(self):
+        return getattr(getattr(self, "_local", None), "request_stop", self.stop)
+
+    @contextlib.contextmanager
+    def task_scope(self, stop):
+        # Some offline adapters intentionally omit CloudAPI.__init__. Keep
+        # that supported without sharing task signals between their threads.
+        if not hasattr(self, "_local"):
+            with self._task_local_lock:
+                if not hasattr(self, "_local"):
+                    self._local = threading.local()
+        previous = getattr(self._local, "request_stop", None)
+        self._local.request_stop = stop
+        if hasattr(self._local, "http"):
+            self._local.http.stop = stop
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._local.request_stop
+            else:
+                self._local.request_stop = previous
+            if hasattr(self._local, "http"):
+                self._local.http.stop = self.request_stop
 
     def close_thread(self) -> None:
         if hasattr(self._local, "http"):
@@ -198,12 +243,15 @@ class CloudAPI:
             del self._local.http
 
     def _wait(self, seconds: float) -> None:
-        if self.stop.wait(max(0, seconds)):
+        stop = self.request_stop
+        if stop.wait(max(0, seconds)):
+            check_cancelled(stop)
             raise Cancelled("Загрузка остановлена.")
 
     def _request(self, method: str, url: str, *, headers: dict[str, str] | None = None,
                  body: bytes = b"", stream=None, length=None, authenticated: bool = True,
                  token_query: bool = False, progress=None) -> Response:
+        check_cancelled(self.request_stop)
         # Retry only reads. A failed PUT/POST may already have been accepted;
         # retrying those belongs to the durable upload/reconciliation workflow.
         read_only = method == "GET" and not body and stream is None
@@ -362,6 +410,19 @@ class CloudAPI:
                      is_retried: bool = False) -> None:
         url = UPLOAD_BASE + "/resumable/" + digest
         deadline = time.monotonic() + 600
+        reported = 0
+
+        def report_until(position: int) -> None:
+            nonlocal reported
+            position = min(identity.size, max(reported, position))
+            delta = position - reported
+            reported = position
+            if progress is not None and delta:
+                progress(delta)
+
+        def sent(size: int) -> None:
+            report_until(reported + max(0, size))
+
         while True:
             status = self._request("PUT", self._upload_url(url, is_retried=is_retried), headers={"Content-Range": f"bytes */{identity.size}",
                                                         "Content-Type": "application/json"})
@@ -369,6 +430,7 @@ class CloudAPI:
                 # The APK requires a parseable Long, not a positive lifetime.
                 # In particular, a confirmed blob may return X-Valid-for: 0.
                 _integer(status.headers.get("x-valid-for"), "X-Valid-for")
+                report_until(identity.size)
                 return
             if status.status == 202:
                 if time.monotonic() > deadline:
@@ -388,6 +450,7 @@ class CloudAPI:
                 if offset > identity.size or not isinstance(target, str):
                     raise ProtocolError("Сервер вернул неверное смещение незавершённой загрузки.")
                 validate_url(target)
+                report_until(offset)
                 if offset == identity.size:
                     if time.monotonic() > deadline:
                         raise TransportError("Сервер не завершил обработку загруженных байтов.")
@@ -399,17 +462,21 @@ class CloudAPI:
             headers = {"Content-Type": "application/octet-stream"}
             if offset:
                 headers["Content-Range"] = f"bytes {offset}-{identity.size - 1}/{identity.size}"
-            with open(path, "rb") as stream:
-                if FileIdentity.from_stat(os.fstat(stream.fileno())) != identity:
-                    raise SourceChanged("Файл изменился перед передачей.")
-                stream.seek(offset)
-                uploaded = self._request("PUT", self._upload_url(target, is_retried=is_retried), headers=headers, stream=stream,
-                                         length=identity.size - offset, progress=progress)
-                if FileIdentity.from_stat(os.fstat(stream.fileno())) != identity:
-                    raise SourceChanged("Файл изменился во время передачи.")
+            try:
+                with open(path, "rb") as stream:
+                    if FileIdentity.from_stat(os.fstat(stream.fileno())) != identity:
+                        raise SourceChanged("Файл изменился перед передачей.")
+                    stream.seek(offset)
+                    uploaded = self._request("PUT", self._upload_url(target, is_retried=is_retried), headers=headers, stream=stream,
+                                             length=identity.size - offset, progress=sent if progress is not None else None)
+                    if FileIdentity.from_stat(os.fstat(stream.fileno())) != identity:
+                        raise SourceChanged("Файл изменился во время передачи.")
+            except OSError:
+                raise SourceReadError("Не удалось прочитать исходный файл для передачи.") from None
             self._require(uploaded, 201, 202)
             if uploaded.status == 201:
                 _integer(uploaded.headers.get("x-valid-for"), "X-Valid-for")
+                report_until(identity.size)
                 return
             self._wait(max(1, _integer(uploaded.headers.get("x-wait-for"), "X-Wait-for")))
 
@@ -426,7 +493,7 @@ class CloudAPI:
             raise UnsupportedPhoto("Файл слишком мал для поддерживаемого формата фото или видео.")
         if expected.size > MAX_MEDIA_BYTES:
             raise UnsupportedPhoto("Файл больше 2 ГБ (2 147 483 648 байт) — лимита автозагрузки фото и видео.")
-        digest, identity = cloud_hash(path, expected=expected, stop=self.stop)
+        digest, identity = cloud_hash(path, expected=expected, stop=self.request_stop)
         existing = self.stat(remote_path)
         if existing is not None:
             if (existing["hash"] == digest and existing["size"] == identity.size and prior_intent
@@ -443,8 +510,15 @@ class CloudAPI:
             raise RemoteConflict("Файл с этим путём уже есть в Облаке. Перезапись отключена.")
         self.ensure_parent(remote_path)
         self._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried)
-        if identity != FileIdentity.from_stat(os.stat(path, follow_symlinks=False)):
+        try:
+            current = FileIdentity.from_stat(os.stat(path, follow_symlinks=False))
+        except OSError:
+            raise SourceReadError("Исходный файл стал недоступен до подтверждения загрузки.") from None
+        if identity != current:
             raise SourceChanged("Файл изменился до подтверждения загрузки.")
+        # A durable pause may come from another process with no in-memory
+        # notification. Re-read it at the boundary before starting a commit.
+        check_cancelled(self.request_stop, force=True)
         save_intent(digest)
         payload = {
             "hash": digest, "last_modified": max(0, identity.mtime_ns // 1_000_000),
@@ -458,14 +532,14 @@ class CloudAPI:
                                                body=json.dumps(payload, ensure_ascii=False).encode("utf-8")), 200)
         added = _json(response)
         if added.get("name") != posixpath.basename(remote_path):
-            raise ProtocolError("Сервер вернул другое имя файла; массовая загрузка остановлена.")
+            raise FileVerificationError("Сервер вернул другое имя файла; задача не отмечена загруженной.")
         if added.get("path") not in (None, "", remote_path):
-            raise ProtocolError("Сервер вернул другой путь файла; массовая загрузка остановлена.")
+            raise FileVerificationError("Сервер вернул другой путь файла; задача не отмечена загруженной.")
         if added.get("is_unlim_upload") is not True:
             detail = ("false" if added.get("is_unlim_upload") is False else
                       "отсутствует" if "is_unlim_upload" not in added else "некорректного типа")
             raise UnlimitedNotConfirmed("Сервер добавил файл, но не подтвердил безлимит: is_unlim_upload="
-                                        + detail + ". Массовая загрузка остановлена; проверьте отчёт и квоту.")
+                                        + detail + ". Задача не отмечена загруженной; проверьте отчёт и квоту.")
         # Persist the server's positive per-file proof before the follow-up
         # stat. A matching hash alone cannot establish unlimited billing after
         # an ambiguous/lost commit response.
@@ -478,7 +552,7 @@ class CloudAPI:
                 break
             self._wait(1 + retry)
         if result is None or result["hash"] != digest or result["size"] != identity.size:
-            raise ProtocolError("После добавления не подтверждены хеш и размер файла в Облаке.")
+            raise FileVerificationError("После добавления не подтверждены хеш и размер файла в Облаке.")
         return {"hash": digest, "size": identity.size, "path": remote_path,
                 "nodeid": str(added.get("nodeid", "")), "commit_accepted": True,
                 "recovered_commit": False, "stat_matched": True,

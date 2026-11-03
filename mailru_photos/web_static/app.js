@@ -4,7 +4,7 @@
   const $ = (id) => document.getElementById(id);
   const numberFormat = new Intl.NumberFormat("ru-RU");
   const pageNames = { overview: "Обзор", queue: "Очередь задач", sources: "Исходные папки", settings: "Настройки" };
-  const busyPhases = new Set(["login", "logout", "scanning", "checking", "probing", "uploading", "pausing"]);
+  const busyPhases = new Set(["login", "logout", "scanning", "checking", "probing", "uploading", "pausing", "reconciling"]);
   const phaseInfo = {
     idle: ["Готов к работе", "Ожидание", "neutral", "cloud"],
     login: ["Подключаем аккаунт", "Подключение", "blue", "lock"],
@@ -12,6 +12,7 @@
     scanning: ["Ищем фото и видео", "Сканирование", "blue", "scan"],
     checking: ["Проверяем доступ к Облаку", "Проверка", "blue", "lock"],
     probing: ["Проверяем безлимит", "Проверка", "blue", "lock"],
+    reconciling: ["Проверяем файлы в Облаке", "Проверка", "blue", "scan"],
     uploading: ["Загружаем файлы", "Загрузка", "blue", "cloud"],
     pausing: ["Сохраняем прогресс", "Останавливаем", "orange", "pause"],
     paused: ["Загрузка приостановлена", "На паузе", "orange", "pause"],
@@ -20,14 +21,14 @@
   };
   const jobStates = {
     pending: ["Ожидает", "neutral"], running: ["В работе", "blue"], uploaded: ["Выполнена", "green"],
-    failed: ["Ошибка", "red"], skipped: ["Пропущена", "orange"]
+    failed: ["Ошибка", "red"], skipped: ["Пропущена", "orange"], paused: ["На паузе", "orange"]
   };
+  const transferStages = { hash: "Проверка файла", hashing: "Проверка файла", upload: "Передача", uploading: "Передача", blob_upload: "Передача", stat: "Проверка результата", verify: "Проверка результата", verifying: "Проверка результата", commit: "Подтверждение", add: "Подтверждение", unlimited_add: "Подтверждение", preparing: "Подготовка" };
   let session = { authenticated: false, setup_required: false, csrf: "" };
   let snapshot = null;
   let activePage = "overview";
   let pollTimer = null;
   let pollInFlight = false;
-  let pollCount = 0;
   let toastTimer = null;
   let jobsFilter = "all";
   let jobsOffset = 0;
@@ -43,6 +44,8 @@
   let accessBusy = false;
   let mailLogoutRequested = false;
   const pendingActions = new Set();
+  const pendingTaskActions = new Map();
+  const jobViews = new Map();
   const jobsLimit = 50;
 
   function finite(value, fallback = 0) {
@@ -235,8 +238,7 @@
     pollInFlight = true;
     try {
       await refreshState();
-      pollCount += 1;
-      if (activePage === "queue" && pollCount % 2 === 0) await loadJobs(false);
+      if (activePage === "queue") await loadJobs(false);
     } catch (error) {
       if (session.authenticated) setConnectivity(false, error.message + " Данные на экране могут быть устаревшими.");
     } finally {
@@ -248,7 +250,9 @@
 
   function phase() { return plain(snapshot && snapshot.activity && snapshot.activity.phase, "idle"); }
   function isBusy() { return busyPhases.has(phase()); }
-  function anyAction() { return pendingActions.size > 0; }
+  function anyAction() { return pendingActions.size > 0 || pendingTaskActions.size > 0; }
+  function canControlTasks() { return Boolean(snapshot && snapshot.task_controls_available === true && connected && session.authenticated && pendingActions.size === 0); }
+  function canClearQueue() { return Boolean(snapshot && snapshot.queue_clear_available === true && connected && session.authenticated && !anyAction()); }
 
   function updateControls() {
     if (!snapshot) return;
@@ -258,7 +262,7 @@
     const current = phase();
     $("start-upload").disabled = busy || transient || !snapshot.authenticated || !hasSources || !connected;
     $("scan-folders").disabled = busy || transient || !hasSources || !connected;
-    const pausable = ["scanning", "checking", "probing", "uploading", "pausing"].includes(current);
+    const pausable = ["scanning", "checking", "probing", "uploading", "pausing", "reconciling"].includes(current);
     setHidden("pause-upload", !pausable);
     setHidden("start-upload", pausable);
     $("pause-upload").disabled = current === "pausing" || pendingActions.has("pause") || !connected;
@@ -280,6 +284,14 @@
     $("workers").disabled = busy || transient;
     $("auto-resume").disabled = busy || transient;
     $("preflight-check").disabled = busy || transient;
+    const canClear = canClearQueue();
+    $("clear-queue").disabled = !canClear;
+    $("queue-clear-submit").disabled = !canClear;
+    $("queue-clear-options").disabled = !canClear;
+    setHidden("queue-clear-busy", snapshot.queue_clear_available === true || !connected);
+    setText("queue-clear-submit", pendingActions.has("clear") ? "Очищаем…" : $("queue-clear-all").checked ? "Очистить всю очередь" : "Убрать обработанные");
+    setHidden("task-controls-note", snapshot.task_controls_available === true || !connected || jobsTotal === 0);
+    jobViews.forEach(updateJobControls);
   }
 
   function renderState() {
@@ -393,7 +405,6 @@
       const size = Math.max(0, finite(file.size)), sent = Math.max(0, finite(file.sent));
       const percent = size > 0 ? Math.min(100, sent / size * 100) : 0;
       const stage = plain(file.stage);
-      const stageNames = { hash: "Проверка файла", hashing: "Проверка файла", upload: "Передача", uploading: "Передача", blob_upload: "Передача", stat: "Проверка", verify: "Проверка", verifying: "Проверка", commit: "Подтверждение", add: "Подтверждение", unlimited_add: "Подтверждение", preparing: "Подготовка" };
       const item = element("div", "active-file");
       const heading = element("div", "active-file-heading");
       const fileIcon = element("span", "file-icon"); fileIcon.appendChild(icon(mediaIcon(name)));
@@ -402,7 +413,7 @@
       const path = element("div", "active-file-path", fullPath); path.title = fullPath;
       label.append(title, path);
       appendStorageMode(label, file.storage_mode);
-      heading.append(fileIcon, label, element("span", "badge blue", stageNames[stage] || "Обработка"));
+      heading.append(fileIcon, label, element("span", "badge blue", transferStages[stage] || "Обработка"));
       const progress = element("div", "active-file-progress");
       const track = element("div", "progress-track"); track.setAttribute("role", "progressbar"); track.setAttribute("aria-label", name); track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100"); track.setAttribute("aria-valuenow", percent.toFixed(1));
       const fill = element("div", "progress-fill"); fill.style.width = percent + "%"; track.appendChild(fill);
@@ -504,36 +515,173 @@
     }
   }
 
+  function taskPrimaryAction(job) {
+    if (["uploaded", "skipped"].includes(job.status) || job.remove_requested === true) return null;
+    if (job.paused === true) return job.status === "running" ? ["pause", "Пауза…", "pause"] : ["resume", "Продолжить", "play"];
+    if (job.status === "failed") return ["resume", "Повторить", "retry"];
+    return ["pending", "running"].includes(job.status) ? ["pause", "Пауза", "pause"] : null;
+  }
+
+  function taskState(job) {
+    if (job.remove_requested === true) return ["Убирается…", "neutral"];
+    if (job.paused === true && job.status === "running") return ["Останавливается…", "orange"];
+    if (job.paused === true && !["uploaded", "skipped"].includes(job.status)) return jobStates.paused;
+    if (job.status === "failed" && job.next_attempt != null) return ["Повтор позже", "orange"];
+    return jobStates[job.status] || ["Неизвестно", "neutral"];
+  }
+
+  function createJobView(job) {
+    const row = element("tr", "task-row"); row.dataset.taskId = String(job.id);
+    const nameCell = element("td", "task-name-cell");
+    const name = element("div", "job-name"), fileIcon = icon("image"), label = element("span");
+    name.append(fileIcon, label);
+    const remote = element("div", "job-path");
+    const storage = element("span", "storage-mode", "Обычное хранение");
+    storage.title = "Режим загрузки с расходованием места по тарифу";
+    const detail = element("div", "job-detail"), actionError = element("div", "task-action-error");
+    actionError.setAttribute("role", "status"); actionError.hidden = true;
+    nameCell.append(name, remote, storage, detail, actionError);
+    const statusCell = element("td", "task-status-cell"), badge = element("span", "badge neutral");
+    const progress = element("div", "task-progress"), progressHeading = element("div", "task-progress-heading");
+    const stage = element("span"), percentage = element("span", "task-percent");
+    progressHeading.append(stage, percentage);
+    const track = element("div", "progress-track"), fill = element("div", "progress-fill"), transferred = element("div", "task-transferred");
+    track.setAttribute("role", "progressbar"); track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100");
+    track.appendChild(fill); progress.append(progressHeading, track, transferred); statusCell.append(badge, progress);
+    const size = element("td", "task-size"), attempts = element("td", "task-attempts"), actionsCell = element("td", "task-actions-cell"), actions = element("div", "task-actions");
+    const primary = element("button", "button compact task-primary"), primaryIcon = icon("pause", "small"), primaryLabel = element("span");
+    primary.type = "button"; primary.dataset.taskControl = "primary"; primary.append(primaryIcon, primaryLabel);
+    const remove = element("button", "button compact danger subtle task-remove"); remove.type = "button"; remove.dataset.taskControl = "remove"; remove.appendChild(icon("remove", "small"));
+    actions.append(primary, remove); actionsCell.appendChild(actions); row.append(nameCell, statusCell, size, attempts, actionsCell);
+    const view = { row, name, fileIcon, label, remote, storage, detail, actionError, badge, progress, stage, percentage, track, fill, transferred, size, attempts, actions, primary, primaryIcon, primaryLabel, remove, job, error: "" };
+    primary.addEventListener("click", () => {
+      const action = taskPrimaryAction(view.job);
+      if (action && primary.getAttribute("aria-disabled") !== "true") performTask(view, action[0]);
+    });
+    remove.addEventListener("click", () => { if (remove.getAttribute("aria-disabled") !== "true") performTask(view, "remove"); });
+    return view;
+  }
+
+  function updateJobControls(view) {
+    const job = view.job, pending = pendingTaskActions.get(job.id);
+    const action = taskPrimaryAction(job), allowed = canControlTasks() && !pending && job.remove_requested !== true;
+    const pausing = job.paused === true && job.status === "running";
+    const name = plain(job.relative_path, plain(job.local_path, "Файл"));
+    view.primary.hidden = !action;
+    if (action) {
+      view.primaryIcon.firstElementChild.setAttribute("href", "#i-" + action[2]);
+      view.primaryLabel.textContent = pending === "pause" ? "Пауза…" : pending === "resume" ? "Возврат…" : action[1];
+      view.primary.setAttribute("aria-label", action[1] + ": " + name);
+      view.primary.setAttribute("aria-disabled", String(!allowed || pausing));
+      view.primary.title = pausing ? "Дождитесь сохранения прогресса этой задачи." : action[0] === "resume" ? "Вернуть задачу в очередь. Общая пауза сохраняется." : "Приостановить только эту задачу.";
+    }
+    view.remove.setAttribute("aria-label", "Убрать задачу: " + name);
+    view.remove.setAttribute("aria-disabled", String(!allowed));
+    view.remove.title = "Убрать задачу из очереди. Файлы на сервере и в Облаке останутся.";
+    view.actions.setAttribute("aria-busy", String(Boolean(pending)));
+    view.actionError.textContent = view.error;
+    view.actionError.hidden = !view.error;
+  }
+
+  function updateJobView(view, job) {
+    view.job = job;
+    const fullName = plain(job.relative_path, plain(job.local_path, "Файл"));
+    view.label.textContent = fullName;
+    view.fileIcon.firstElementChild.setAttribute("href", "#i-" + mediaIcon(fullName));
+    view.name.title = plain(job.local_path, fullName);
+    view.remote.textContent = plain(job.remote_path); view.remote.title = plain(job.remote_path);
+    view.storage.hidden = job.storage_mode !== "regular";
+    const state = taskState(job);
+    view.badge.textContent = state[0]; view.badge.className = "badge " + state[1];
+    let detail = plain(job.last_error);
+    if (job.next_attempt != null && job.status === "failed") detail += (detail ? " · " : "") + "Автоматический повтор: " + dateTime(job.next_attempt);
+    if (!detail && job.status === "uploaded") detail = job.uploaded_at ? "Загружено: " + dateTime(job.uploaded_at) : "Файл сохранён в Облаке";
+    if (!detail && job.status === "skipped") detail = "Задача пропущена. Подробности — в журнале работы.";
+    view.detail.textContent = detail; view.detail.hidden = !detail;
+    view.detail.className = "job-detail" + (job.status === "failed" ? " failed" : "");
+    view.size.textContent = bytes(job.size); view.attempts.textContent = count(job.attempts);
+    const progress = job.progress && typeof job.progress === "object" ? job.progress : null;
+    const completed = job.status === "uploaded";
+    const hasProgress = completed || progress !== null;
+    view.progress.hidden = !hasProgress;
+    if (hasProgress) {
+      const total = completed ? Math.max(0, finite(job.size)) : Math.max(0, finite(progress.total, finite(job.size)));
+      const sent = completed ? total : Math.max(0, Math.min(total, finite(progress.sent)));
+      const percent = completed ? 100 : Math.max(0, Math.min(100, finite(progress.percent, total > 0 ? sent / total * 100 : 0)));
+      const stage = completed ? "Готово" : transferStages[plain(progress.stage)] || "Обработка";
+      const label = percent.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%";
+      view.stage.textContent = stage; view.percentage.textContent = label;
+      view.track.setAttribute("aria-label", "Передача: " + fullName);
+      view.track.setAttribute("aria-valuenow", percent.toFixed(1));
+      view.track.setAttribute("aria-valuetext", stage + ": " + label);
+      view.fill.style.width = percent + "%";
+      view.progress.classList.toggle("complete", completed);
+      view.transferred.textContent = bytes(sent) + " / " + bytes(total);
+    }
+    updateJobControls(view);
+  }
+
+  function restoreTaskFocus(focused, views) {
+    if (!focused) return;
+    const current = document.activeElement;
+    if (current === focused.element && current.isConnected && !current.hidden) return;
+    if (current && current !== document.body && current !== focused.element && current.isConnected) return;
+    const view = jobViews.get(focused.id) || views[Math.min(focused.index, views.length - 1)];
+    const target = view ? focused.control === "remove" || view.primary.hidden ? view.remove : view.primary : $("queue-title");
+    target.focus({ preventScroll: true });
+  }
+
   function renderJobs(jobs) {
-    const body = $("jobs-body"); body.replaceChildren();
+    const body = $("jobs-body");
+    const focusedElement = document.activeElement;
+    const focusedRow = focusedElement && focusedElement.closest ? focusedElement.closest("#jobs-body tr") : null;
+    const focused = focusedRow ? { element: focusedElement, id: Number(focusedRow.dataset.taskId), index: [...body.children].indexOf(focusedRow), control: focusedElement.dataset.taskControl } : null;
+    const present = new Set(), views = [];
+    jobs.forEach((job) => {
+      if (!Number.isSafeInteger(job.id) || job.id <= 0 || present.has(job.id)) return;
+      present.add(job.id);
+      const view = jobViews.get(job.id) || createJobView(job);
+      jobViews.set(job.id, view); updateJobView(view, job); views.push(view);
+    });
+    for (const [id, view] of jobViews) {
+      if (!present.has(id)) { view.row.remove(); jobViews.delete(id); }
+    }
+    views.forEach((view, index) => {
+      if (body.children[index] !== view.row) body.insertBefore(view.row, body.children[index] || null);
+    });
     setHidden("jobs-empty", jobs.length > 0);
     setText("jobs-empty-title", jobsFilter === "all" ? "В очереди пока нет задач" : "Таких задач сейчас нет");
     setText("jobs-empty-description", jobsFilter === "all" ? "Добавьте исходную папку и запустите сканирование." : "Выберите другой фильтр, чтобы посмотреть остальные задачи.");
-    jobs.forEach((job) => {
-      const row = document.createElement("tr");
-      const nameCell = document.createElement("td");
-      const name = element("div", "job-name");
-      const fullName = plain(job.relative_path, plain(job.local_path, "Файл"));
-      name.append(icon(mediaIcon(fullName)), element("span", "", fullName));
-      name.title = plain(job.local_path, fullName);
-      const remote = element("div", "job-path", plain(job.remote_path)); remote.title = plain(job.remote_path);
-      nameCell.append(name, remote);
-      appendStorageMode(nameCell, job.storage_mode);
-      const statusCell = document.createElement("td");
-      const state = jobStates[job.status] || ["Неизвестно", "neutral"];
-      statusCell.appendChild(element("span", "badge " + state[1], state[0]));
-      const detailCell = element("td", "job-detail" + (job.status === "failed" ? " failed" : ""));
-      let detail = plain(job.last_error);
-      if (!detail && job.status === "uploaded") detail = dateTime(job.uploaded_at) || "Файл сохранён в Облаке";
-      if (!detail && job.next_attempt) detail = "Повтор: " + dateTime(job.next_attempt);
-      if (!detail && job.status === "skipped") detail = "Смотрите журнал работы";
-      detailCell.textContent = detail || "—";
-      row.append(nameCell, statusCell, element("td", "", bytes(job.size)), element("td", "", count(job.attempts)), detailCell);
-      body.appendChild(row);
-    });
     setText("jobs-range", jobsTotal === 0 ? "0 задач" : "Задачи " + count(jobsOffset + 1) + "–" + count(jobsOffset + jobs.length) + " из " + count(jobsTotal));
     $("jobs-prev").disabled = jobsOffset === 0;
     $("jobs-next").disabled = jobsOffset + jobs.length >= jobsTotal;
+    setHidden("task-controls-note", snapshot && snapshot.task_controls_available === true || !connected || jobsTotal === 0);
+    restoreTaskFocus(focused, views);
+  }
+
+  async function performTask(view, action) {
+    const job = view.job;
+    if (!canControlTasks() || pendingTaskActions.has(job.id) || job.remove_requested === true) return;
+    if (action !== "remove" && (!taskPrimaryAction(job) || taskPrimaryAction(job)[0] !== action)) return;
+    if (action === "pause" && job.paused === true) return;
+    pendingTaskActions.set(job.id, action); view.error = ""; updateControls();
+    let accepted = false;
+    try {
+      await api("/api/tasks/" + action, { method: "POST", body: { id: job.id } });
+      accepted = true;
+      await refreshState();
+      if (activePage === "queue") await loadJobs(false);
+      if (action === "remove") toast("Убираем задачу из очереди. Файлы на сервере и в Облаке остаются.");
+      else if (action === "pause") toast("Запрос на паузу выбранной задачи принят.");
+      else if (phase() === "paused") toast("Задача возвращена в очередь. Общая пауза сохранена — нажмите «Продолжить загрузку», когда будете готовы.");
+      else if (snapshot && snapshot.queue_clear_available === true) toast("Задача возвращена в очередь. Запустите загрузку на странице «Обзор».");
+      else toast("Задача возвращена в очередь.");
+    } catch (error) {
+      view.error = accepted ? "Команда принята, но состояние не удалось обновить. " + error.message : error.message;
+      toast(view.error, true);
+    } finally {
+      pendingTaskActions.delete(job.id); updateControls();
+    }
   }
 
   async function perform(key, path, body = {}, options = {}) {
@@ -542,6 +690,7 @@
     if (options.errorId) setError(options.errorId);
     try {
       await api(path, { method: "POST", body });
+      if (options.resetJobs) jobsOffset = 0;
       if (options.close) $(options.close).close();
       await refreshState();
       if (activePage === "queue") await loadJobs(false);
@@ -777,6 +926,21 @@
     event.preventDefault(); $("retry-submit").disabled = true;
     try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задачи возвращены в очередь." }); }
     finally { $("retry-submit").disabled = false; }
+  });
+  $("clear-queue").addEventListener("click", () => {
+    if (!canClearQueue()) return;
+    $("queue-clear-form").reset();
+    setError("queue-clear-error"); updateControls(); showDialog("queue-clear-dialog");
+  });
+  ["queue-clear-finished", "queue-clear-all"].forEach((id) => $(id).addEventListener("change", updateControls));
+  $("queue-clear-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!canClearQueue()) return;
+    const scope = $("queue-clear-all").checked ? "all" : "finished";
+    const message = scope === "all" ? "Очередь очищена. Источники и файлы сохранены. Новые задачи появятся после ручного сканирования." : "Обработанные задачи убраны. Ожидающие загрузки и автоматического повтора сохранены.";
+    if (await perform("clear", "/api/tasks/clear", { scope }, { errorId: "queue-clear-error", close: "queue-clear-dialog", message, resetJobs: true })) {
+      $("queue-title").focus({ preventScroll: true });
+    }
   });
   ["workers", "auto-resume", "preflight-check"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
   $("settings-form").addEventListener("submit", async (event) => {

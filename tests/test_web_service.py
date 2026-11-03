@@ -103,6 +103,178 @@ class WebServiceTests(unittest.TestCase):
         self.assertIsNone(service._operation, 'Background operation did not finish')
         return service.snapshot()
 
+    def test_task_pause_resume_survives_restart_and_keeps_global_pause(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        task = self.service.jobs()['jobs'][0]
+        self.service.pause()
+        self.service.control_task(task['id'], 'pause')
+        self.assertTrue(self.service.jobs('paused')['jobs'][0]['paused'])
+        self.assertEqual(self.service.jobs('paused')['total'], 1)
+        self.service.close()
+        replacement = self.make_service()
+        self.assertEqual(replacement.snapshot()['stats']['paused'], 1)
+        replacement.control_task(task['id'], 'resume')
+        self.assertEqual(replacement.snapshot()['stats']['paused'], 0)
+        self.assertIsNone(replacement._operation)
+        self.assertFalse(replacement._resume_upload)
+        replacement.settings(preflight_check=False)
+        replacement.start()
+        self.assertEqual(self.done(replacement)['stats']['uploaded'], 2)
+
+    def test_task_signal_belongs_to_claim_and_does_not_set_global_stop(self):
+        self.photos_count(1)
+        self.service.scan(); self.done()
+        with self.service._queue() as queue:
+            job = queue.claim()
+            self.service._operation = 'upload'
+            self.service._activity['phase'] = 'uploading'
+            try:
+                with self.service._task_scope(job) as event:
+                    self.service._emit('file_started', {'job_id':job.id, 'path':job.remote_path, 'size':job.size})
+                    self.service._emit('upload_progress', {'job_id':job.id, 'bytes':job.size//2})
+                    row = self.service.jobs()['jobs'][0]
+                    self.assertGreater(row['progress']['percent'], 0)
+                    self.assertLess(row['progress']['percent'], 100)
+                    self.service.control_task(job.id, 'pause')
+                    self.assertTrue(event.is_set())
+                    self.assertFalse(self.service._stop.is_set())
+                    self.service.control_task(job.id, 'resume')
+                    self.assertTrue(event.is_set(), 'Never revive the old attempt signal')
+                    queue.release(job)
+                self.assertEqual(self.service._task_signals, {})
+                self.assertEqual(queue.stats()['remaining'], 1)
+            finally:
+                self.service._operation = None
+                self.service._files.clear()
+
+    def test_remove_and_clear_tasks_preserve_sources_files_and_completed_scan(self):
+        self.photos_count(3)
+        self.service.scan(); self.done()
+        previous = self.service.snapshot()
+        first = self.service.jobs()['jobs'][0]
+        self.service.control_task(first['id'], 'remove')
+        self.assertEqual(self.service.snapshot()['stats']['total'], 2)
+        self.assertTrue(Path(first['local_path']).exists())
+        cleared = self.service.clear_tasks('all')
+        self.assertEqual(cleared['removed_tasks'], 2)
+        state = self.service.snapshot()
+        self.assertEqual(state['sources'], previous['sources'])
+        self.assertEqual(state['last_scan'], previous['last_scan'])
+        self.service.start()
+        self.assertEqual(self.done()['stats']['total'], 0, 'Start must not undo a deliberate clear')
+        self.assertEqual(self.cloud.commits, [])
+        self.service.scan(); self.done()
+        self.assertEqual(self.service.snapshot()['stats']['total'], 3)
+
+    def test_task_controls_respect_external_run_lock_and_scan_exclusion(self):
+        self.photos_count(1)
+        self.service.scan(); self.done()
+        task_id = self.service.jobs()['jobs'][0]['id']
+        with self.service._queue() as external, external.exclusive_run():
+            with self.assertRaises(QueueBusyError):
+                self.service.control_task(task_id, 'remove')
+            with self.assertRaises(QueueBusyError):
+                self.service.clear_tasks('all')
+        for operation in ('scanning', 'login', 'logout'):
+            self.service._operation = operation
+            self.service._activity['phase'] = operation
+            try:
+                self.assertFalse(self.service.snapshot()['task_controls_available'])
+                with self.assertRaises(QueueBusyError):
+                    self.service.control_task(task_id, 'pause')
+                with self.assertRaises(QueueBusyError):
+                    self.service.clear_tasks('all')
+            finally:
+                self.service._operation = None
+        self.assertEqual(self.service.snapshot()['stats']['total'], 1)
+
+    def test_only_individually_paused_tasks_finish_without_failed_probe(self):
+        self.photos_count(1)
+        self.service.scan(); self.done()
+        task_id = self.service.jobs()['jobs'][0]['id']
+        self.service.control_task(task_id, 'pause')
+        with patch('mailru_photos.web_service.probe', side_effect=AssertionError('No runnable tasks')):
+            self.service.start()
+            state = self.done()
+        self.assertEqual(state['activity']['phase'], 'paused')
+        self.assertIsNone(state['activity']['last_error'])
+        self.assertEqual(state['stats']['paused'], 1)
+        self.assertFalse(state['stats']['failed'])
+
+    def test_pausing_one_active_task_does_not_stop_another_worker(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        first = self.service.jobs()['jobs'][0]
+        entered, release = threading.Event(), threading.Event()
+        original = self.cloud._upload_blob
+        def upload(path, digest, identity, **kwargs):
+            if str(path) == first['local_path']:
+                entered.set()
+                while not release.is_set():
+                    self.cloud._check_stopped()
+                    time.sleep(0.002)
+            return original(path, digest, identity, **kwargs)
+        self.cloud._upload_blob = upload
+        self.service.settings(preflight_check=False, workers=2)
+        self.service.start()
+        self.assertTrue(entered.wait(2))
+        self.assertTrue(self.service.snapshot()['task_controls_available'])
+        self.assertFalse(self.service.snapshot()['queue_clear_available'])
+        self.service.control_task(first['id'], 'pause')
+        state = self.done()
+        self.assertEqual(state['stats']['uploaded'], 1, state)
+        self.assertEqual(state['stats']['paused'], 1)
+        self.assertEqual(state['stats']['failed'], 0)
+        self.assertFalse(self.service._stop.is_set())
+        release.set()
+        self.service.control_task(first['id'], 'resume')
+        self.service.start()
+        self.assertEqual(self.done()['stats']['uploaded'], 2)
+        self.assertEqual(len(self.cloud.commits), 2)
+
+    def test_remove_at_positive_commit_preserves_receipt_without_false_success(self):
+        self.photos_count(1)
+        self.service.settings(preflight_check=False)
+        original = Queue.confirm_unlimited_commit
+        def confirmed_then_remove(queue, job, digest):
+            original(queue, job, digest)
+            self.service.control_task(job.id, 'remove')
+        with patch.object(Queue, 'confirm_unlimited_commit', confirmed_then_remove):
+            self.service.start()
+            state = self.done()
+        self.assertEqual(state['stats']['total'], 0, state)
+        self.assertEqual(len(self.cloud.commits), 1)
+        self.assertEqual(len(list(self.photos.iterdir())), 1)
+        with self.service._queue() as queue:
+            self.assertEqual(queue._db.execute("SELECT COUNT(*) FROM commit_evidence WHERE stage='accepted'").fetchone()[0], 1)
+            self.assertEqual(queue._db.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0], 0)
+        self.assertFalse(self.service._stop.is_set())
+
+    def test_probe_can_pause_its_current_task_and_continue_with_another(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        first = self.service.jobs()['jobs'][0]
+        entered = threading.Event()
+        original = self.cloud._upload_blob
+        def upload(path, digest, identity, **kwargs):
+            if str(path) == first['local_path']:
+                entered.set()
+                while True:
+                    self.cloud._check_stopped()
+                    time.sleep(0.002)
+            return original(path, digest, identity, **kwargs)
+        self.cloud._upload_blob = upload
+        self.service.start()
+        self.assertTrue(entered.wait(2))
+        self.assertEqual(self.service.snapshot()['activity']['phase'], 'probing')
+        self.service.control_task(first['id'], 'pause')
+        state = self.done()
+        self.assertEqual(state['probe']['result'], 'provisional_pass', state)
+        self.assertEqual(state['stats']['uploaded'], 1)
+        self.assertEqual(state['stats']['paused'], 1)
+        self.assertFalse(self.service._stop.is_set())
+
     def test_start_scans_automatically_probes_and_uploads_all_files(self):
         self.photos_count(3)
         self.service.start()
@@ -373,6 +545,22 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(len(self.cloud.commits), 1)
         self.assertEqual(len(self.cloud.upload_calls), 1)
 
+    def test_removed_probe_sample_retains_evidence_for_settling_after_restart(self):
+        self.photos_count(1)
+        self.events.cancel_next = 1
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['probe']['result'], 'interrupted')
+        task_id = self.service.jobs()['jobs'][0]['id']
+        self.service.control_task(task_id, 'remove')
+        self.service.close()
+        replacement = self.make_service()
+        replacement.start()
+        state = self.done(replacement)
+        self.assertEqual(state['probe']['result'], 'provisional_pass', state)
+        self.assertEqual(state['stats']['total'], 0)
+        self.assertEqual(len(self.cloud.commits), 1)
+
     def test_pause_after_positive_add_before_stat_recovers_same_probe(self):
         self.photos_count(2)
         self.service.scan()
@@ -429,7 +617,8 @@ class WebServiceTests(unittest.TestCase):
             })
         self.service.start()
         state = self.done()
-        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertEqual(state['activity']['phase'], 'completed')
+        self.assertEqual(state['probe']['result'], 'insufficient_new_samples')
         self.assertNotEqual(state['probe']['result'], 'provisional_pass')
         self.assertEqual(len(self.cloud.commits), 0)
 

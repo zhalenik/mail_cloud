@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import math
 import random
 import re
+import sqlite3
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, ContextManager
 
-from .api import (PROTOCOL_VERSION, CloudAPI, FileIdentity, ProtocolError, RemoteConflict,
-                  RemoteError, SourceChanged, UnsupportedPhoto)
+from .api import (PROTOCOL_VERSION, CloudAPI, FileIdentity, FileVerificationError,
+                  ProtocolError, RemoteConflict, RemoteError, SourceChanged,
+                  UnlimitedNotConfirmed, UnsupportedPhoto)
 from .auth import AuthError
-from .queue import FileChangedError, Job, Queue
-from .transport import Cancelled, TransportError
+from .queue import FileChangedError, Job, Queue, QueueError
+from .transport import Cancelled, SourceReadError, TaskCancelled, TransportError
+
+
+TaskScope = Callable[[Job], ContextManager[threading.Event | None]]
 
 
 class ProbeRequired(RuntimeError):
@@ -25,16 +31,85 @@ class QuotaChanged(ProtocolError):
     pass
 
 
-def process_job(queue: Queue, api: CloudAPI, job: Job, *, emit=None) -> dict[str, Any]:
-    """Optional UI events do not alter upload requests or verification rules."""
-    if emit is None:
-        return _process_job(queue, api, job)
-    emit("file_started", {"job_id": job.id, "path": job.remote_path, "size": job.size, "storage_mode": "unlimited"})
+class _TaskStop:
+    """A monotonic cancellation signal for one claim, never a global stop.
+
+    The UI event provides prompt in-process notifications. A bounded-frequency
+    durable read also covers restarts, another controller and registration races.
+    Only the owning worker reads its SQLite connection.
+    """
+    def __init__(self, global_stop, signal, read_control):
+        self.global_stop, self.signal, self.read_control = global_stop, signal, read_control
+        self._next_read = 0.0
+        self._cancelled = False
+
+    def _task_cancelled(self, *, force: bool = False) -> bool:
+        if self._cancelled:
+            return True
+        if self.signal is not None and self.signal.is_set():
+            self._cancelled = True
+        now = time.monotonic()
+        if not self._cancelled and (force or now >= self._next_read):
+            self._next_read = now + 0.25
+            self._cancelled = self.read_control() in {"pause", "remove"}
+        return self._cancelled
+
+    def is_set(self) -> bool:
+        return self.global_stop.is_set() or self._task_cancelled()
+
+    def check(self, *, force: bool = False) -> None:
+        if self.global_stop.is_set():
+            raise Cancelled("Загрузка остановлена.")
+        if self._task_cancelled(force=force):
+            raise TaskCancelled("Задача остановлена по запросу.")
+
+    def checkpoint(self) -> None:
+        self.check(force=True)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        remaining = timeout
+        while remaining is None or remaining > 0:
+            if self.is_set():
+                return True
+            interval = 0.25 if remaining is None else min(0.25, remaining)
+            if self.global_stop.wait(interval):
+                return True
+            if remaining is not None:
+                remaining -= interval
+        return self.is_set()
+
+
+@contextlib.contextmanager
+def _job_scope(queue: Queue, api: CloudAPI, job: Job, task_scope: TaskScope | None):
+    registration = task_scope(job) if task_scope is not None else contextlib.nullcontext(None)
+    with registration as signal:
+        read_control = getattr(queue, "task_control", None)
+        stop = _TaskStop(api.stop, signal, lambda: read_control(job) if callable(read_control) else None)
+        # The action might have arrived before registration exposed the event.
+        stop.check(force=True)
+        scope = getattr(api, "task_scope", None)
+        with scope(stop) if callable(scope) else contextlib.nullcontext():
+            try:
+                yield
+            except (Cancelled, TransportError):
+                # A pending network call may finish with a timeout/reset after
+                # cancellation. Keep this local unless the global stop is set.
+                stop.check(force=True)
+                raise
+
+
+def process_job(queue: Queue, api: CloudAPI, job: Job, *, emit=None,
+                task_scope: TaskScope | None = None) -> dict[str, Any]:
+    """Upload one claim; UI observation and cancellation do not relax proof."""
+    if emit is not None:
+        emit("file_started", {"job_id": job.id, "path": job.remote_path, "size": job.size, "storage_mode": "unlimited"})
     try:
-        return _process_job(queue, api, job, progress=lambda size: emit(
-            "upload_progress", {"job_id": job.id, "bytes": size}))
+        with _job_scope(queue, api, job, task_scope):
+            return _process_job(queue, api, job, progress=(lambda size: emit(
+                "upload_progress", {"job_id": job.id, "bytes": size})) if emit is not None else None)
     finally:
-        emit("file_finished", {"job_id": job.id})
+        if emit is not None:
+            emit("file_finished", {"job_id": job.id})
 
 
 def _process_job(queue: Queue, api: CloudAPI, job: Job, *, progress=None) -> dict[str, Any]:
@@ -59,7 +134,7 @@ def _process_job(queue: Queue, api: CloudAPI, job: Job, *, progress=None) -> dic
                      and result.get("unlimited_evidence") == "commit_response")
                     or (result.get("commit_accepted") is False and result.get("recovered_commit") is True
                         and result.get("unlimited_evidence") == "saved_commit_response"))):
-        raise ProtocolError("Не получено полное подтверждение безлимита, commit, пути, хеша и размера файла.")
+        raise FileVerificationError("Не получено полное подтверждение безлимита, commit, пути, хеша и размера файла.")
     confirmation = queue.get_commit_intent(job)
     if (not confirmation or confirmation.get("unlimited_confirmed") is not True
             or confirmation.get("storage_mode", "unlimited") != "unlimited"
@@ -80,8 +155,62 @@ def require_scanned(queue: Queue) -> None:
         raise ProbeRequired("Сначала выполните scan. Ошибки обхода папок нужно устранить до загрузки.")
 
 
+def process_probe_job(queue: Queue, api: CloudAPI, job: Job, *, baseline: int,
+                      emit: Callable[[str, dict], None] | None = None,
+                      file_progress: bool = False, task_scope: TaskScope | None = None) -> dict[str, Any] | None:
+    """Process one probe candidate, preserving global safeguards.
+
+    None means this task was paused, removed, unsupported or failed locally;
+    the caller may take another candidate. Auth/protocol/state failures and
+    global cancellation still propagate. This helper is also safe for a probe
+    resumed by the web controller after a process restart.
+    """
+    emit = emit or (lambda event, data: None)
+    try:
+        emit("probe_upload", {"job_id": job.id, "path": job.remote_path})
+        return process_job(queue, api, job, emit=emit if file_progress else None, task_scope=task_scope)
+    except TaskCancelled:
+        queue.release(job, "Task paused or removed during probe; preserve any remote commit")
+        emit("task_cancelled", {"job_id": job.id})
+    except (Cancelled, KeyboardInterrupt):
+        queue.release(job, "Interrupted probe; reconcile any remote commit before retry")
+        raise
+    except FileChangedError as error:
+        emit("file_changed", {"job_id": job.id, "reason": str(error)})
+    except UnsupportedPhoto as error:
+        queue.mark_skipped(job, str(error))
+        emit("skipped", {"job_id": job.id, "reason": str(error)})
+    except (SourceChanged, SourceReadError, RemoteConflict, FileVerificationError, UnlimitedNotConfirmed) as error:
+        queue.mark_failed(job, str(error), retry_delay=None)
+        emit("file_error", {"job_id": job.id, "reason": str(error)})
+        if isinstance(error, UnlimitedNotConfirmed):
+            api.require_account(queue.account_id)
+            if api.quota()["used_bytes"] != baseline:
+                raise QuotaChanged("Использование квоты изменилось после неподтверждённой задачи. Загрузка приостановлена.")
+    except RemoteError as error:
+        if error.unsupported:
+            queue.mark_skipped(job, str(error))
+        else:
+            delay = min(900, 2 ** job.attempts) if error.retryable and job.attempts < 5 else None
+            queue.mark_failed(job, str(error), retry_delay=delay)
+        emit("remote_error", {"job_id": job.id, "status": error.status, "code": error.code})
+        if error.fatal:
+            raise
+    except TransportError as error:
+        if api.stop.is_set():
+            queue.release(job, "Probe request interrupted by global pause/shutdown")
+            raise Cancelled("Проверка приостановлена; сетевой запрос завершился после остановки.") from None
+        queue.mark_failed(job, str(error), retry_delay=min(900, 2 ** job.attempts) if job.attempts < 5 else None)
+        emit("file_error", {"job_id": job.id, "reason": str(error)})
+    except (ProtocolError, AuthError) as error:
+        queue.mark_failed(job, str(error), retry_delay=None)
+        raise
+    return None
+
+
 def probe(queue: Queue, api: CloudAPI, *, count: int = 3, settle_seconds: float = 60,
-          emit: Callable[[str, dict], None] | None = None, file_progress: bool = False) -> dict[str, Any]:
+          emit: Callable[[str, dict], None] | None = None, file_progress: bool = False,
+          task_scope: TaskScope | None = None) -> dict[str, Any]:
     """Upload a few queued photos, then measure cloud usage twice.
 
     Each file requires an explicit is_unlim_upload=True add response, persisted
@@ -101,31 +230,35 @@ def probe(queue: Queue, api: CloudAPI, *, count: int = 3, settle_seconds: float 
             "protocol": PROTOCOL_VERSION, "account": account.email,
             "destination": queue.destination, "started_at": time.time(),
             "settle_seconds": settle_seconds, "before": before, "samples": [],
+            "requested_count": count,
             "measurements": [], "result": "incomplete", "live_test": True,
             "per_file_unlimited_flag": "is_unlim_upload_in_add_response",
         }
         queue.set_metadata("probe", report)
         try:
-            for _ in range(count):
+            accepted_count = 0
+            while accepted_count < count:
+                if api.stop.is_set():
+                    raise Cancelled("Проверка приостановлена.")
                 job = queue.claim(max_attempts=5, storage_mode="unlimited")
                 if job is None:
-                    break
+                    retry_at = queue.stats(storage_mode="unlimited").get("next_retry_at")
+                    if retry_at is None:
+                        break
+                    if api.stop.wait(max(0.1, min(10, retry_at - time.time()))):
+                        raise Cancelled("Проверка приостановлена во время ожидания повторной попытки.")
+                    continue
                 report["active_job_id"] = job.id
                 queue.set_metadata("probe", report)
-                try:
-                    emit("probe_upload", {"job_id": job.id, "path": job.remote_path})
-                    result = process_job(queue, api, job, emit=emit if file_progress else None)
-                except BaseException as error:
-                    if (isinstance(error, (Cancelled, KeyboardInterrupt))
-                            or isinstance(error, TransportError) and api.stop.is_set()):
-                        queue.release(job, "Interrupted probe; reconcile any remote commit before retry")
-                        if isinstance(error, TransportError):
-                            raise Cancelled("Проверка приостановлена; сетевой запрос завершился после остановки.") from None
-                    elif not isinstance(error, FileChangedError):
-                        message = str(error) if isinstance(error, (ProtocolError, AuthError, TransportError)) else type(error).__name__
-                        queue.mark_failed(job, message, retry_delay=None)
-                    raise
-                report["samples"].append(result)
+                result = process_probe_job(queue, api, job, baseline=before["used_bytes"],
+                                           emit=emit, file_progress=file_progress, task_scope=task_scope)
+                if result is not None and result.get("commit_accepted") is True:
+                    report["samples"].append(result)
+                    accepted_count += 1
+                else:
+                    # Keep report size bounded even when a large queue has
+                    # many failed candidates or recovered older commits.
+                    report["other_candidates"] = report.get("other_candidates", 0) + 1
                 report.pop("active_job_id", None)
                 # An interrupt during settling must retain already verified
                 # uploads in the report, as well as their queue states.
@@ -133,7 +266,7 @@ def probe(queue: Queue, api: CloudAPI, *, count: int = 3, settle_seconds: float 
             accepted = [sample for sample in report["samples"] if sample.get("commit_accepted") is True]
             if len(accepted) < count:
                 report["result"] = "insufficient_new_samples"
-                raise ProbeRequired("Для проверки не хватило новых подтверждённых загрузок. Добавьте фото или уменьшите --count.")
+                raise ProbeRequired("Для проверки не хватило новых подтверждённых загрузок. Проверьте задачи с ошибками и на паузе, добавьте файлы или уменьшите --count.")
             for step in range(2):
                 emit("probe_wait", {"seconds": settle_seconds / 2, "measurement": step + 1})
                 if api.stop.wait(settle_seconds / 2):
@@ -197,7 +330,7 @@ class QuotaGuard:
 
 def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
         emit: Callable[[str, dict], None] | None = None, file_progress: bool = False,
-        require_probe: bool = True) -> dict[str, Any]:
+        require_probe: bool = True, task_scope: TaskScope | None = None) -> dict[str, Any]:
     if not 1 <= workers <= 16 or not 1 <= max_attempts <= 20:
         raise ValueError("workers must be 1..16, max_attempts 1..20")
     if type(require_probe) is not bool:
@@ -269,7 +402,7 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                         api.stop.wait(max(0.1, min(10, next_retry - time.time())))
                         continue
                     try:
-                        result = process_job(local, api, job, emit=emit if file_progress else None)
+                        result = process_job(local, api, job, emit=emit if file_progress else None, task_scope=task_scope)
                         guard.completed()
                         emit("uploaded", {"job_id": job.id, "path": job.remote_path,
                                           "size": job.size, "recovered_commit": result["recovered_commit"]})
@@ -285,7 +418,7 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                         else:
                             local.mark_failed(job, str(error), retry_delay=None)
                         emit("remote_error", {"job_id": job.id, "status": error.status, "code": error.code})
-                        if error.fatal or (not error.retryable and not error.unsupported):
+                        if error.fatal:
                             stop_with(error, invalidate_probe=True)
                     except TransportError as error:
                         if api.stop.is_set():
@@ -294,13 +427,24 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                         delay = min(900, 2 ** job.attempts + random.random() * 3) if job.attempts < max_attempts else None
                         local.mark_failed(job, str(error), retry_delay=delay)
                         emit("retry", {"job_id": job.id, "retry_in": delay})
-                    except (SourceChanged, RemoteConflict) as error:
+                    except (SourceChanged, SourceReadError, RemoteConflict, FileVerificationError, UnlimitedNotConfirmed) as error:
                         local.mark_failed(job, str(error), retry_delay=None)
                         emit("file_error", {"job_id": job.id, "reason": str(error)})
+                        if isinstance(error, UnlimitedNotConfirmed):
+                            try:
+                                guard.check(force=True)
+                            except Cancelled:
+                                api.stop.set()
+                                return
+                            except (ProtocolError, AuthError, TransportError) as guard_error:
+                                stop_with(guard_error, invalidate_probe=isinstance(guard_error, (ProtocolError, AuthError)))
+                                return
                     except FileChangedError as error:
                         # Queue already invalidated this claim and preserved history.
                         emit("file_changed", {"job_id": job.id, "reason": str(error)})
-                        stop_with(error)
+                    except TaskCancelled:
+                        local.release(job, "Task paused or removed; preserve any remote commit")
+                        emit("task_cancelled", {"job_id": job.id})
                     except Cancelled:
                         local.release(job, "Interrupted; safe to resume")
                         api.stop.set()
@@ -308,9 +452,10 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                     except (ProtocolError, AuthError) as error:
                         local.mark_failed(job, str(error), retry_delay=None)
                         stop_with(error, invalidate_probe=True)
+                    except (QueueError, sqlite3.Error) as error:
+                        stop_with(ProtocolError(f"Ошибка сохранения очереди: {type(error).__name__}. Загрузка остановлена."))
                     except Exception as error:
                         # Never put arbitrary exception reprs/HTTP payloads in logs.
-                        local.mark_failed(job, f"Local error: {type(error).__name__}", retry_delay=None)
                         stop_with(ProtocolError(f"Локальная ошибка {type(error).__name__}. Очередь сохранена."))
             finally:
                 local.close()
@@ -345,6 +490,7 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                 stop_with(error, invalidate_probe=isinstance(error, (ProtocolError, AuthError)))
         final_stats = queue.stats()
         outcome = ("stopped" if api.stop.is_set() else
+                   "paused_tasks" if final_stats.get("paused", 0) and final_stats.get("remaining") == 0 else
                    "finished_with_errors" if final_stats["failed"] or final_stats["pending"] or final_stats["running"] else
                    "finished_with_skips" if final_stats["skipped"] else "complete")
         result = {"started_at": started, "finished_at": time.time(), "stopped": api.stop.is_set(),

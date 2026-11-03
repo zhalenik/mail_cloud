@@ -7,6 +7,7 @@ manual pause clears that intention, process shutdown deliberately preserves it.
 from __future__ import annotations
 
 import copy
+import contextlib
 import dataclasses
 import json
 import logging
@@ -22,7 +23,7 @@ from .api import CloudAPI, PROTOCOL_VERSION, ProtocolError
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .cli import write_json
 from .queue import FileChangedError, Queue, QueueBusyError, QueueError, STATES, _file_lock
-from .runner import ProbeRequired, probe, process_job, run
+from .runner import ProbeRequired, probe, process_job, process_probe_job, run
 from .transport import Cancelled, TransportError
 
 LOGGER = logging.getLogger("mailru_photos.service")
@@ -54,6 +55,7 @@ class WebService:
         self._shutting_down = False
         self._closed = False
         self._files: dict[int, dict] = {}
+        self._task_signals: dict[int, tuple[str, threading.Event]] = {}
         self._uploaded_in_run = 0
         self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True}
         stored = self._read_json("web_settings.json", {})
@@ -343,22 +345,93 @@ class WebService:
         return {"path": str(current), "parent": parent, "roots": roots,
                 "directories": directories, "truncated": truncated}
 
+    def _task_controls_available(self) -> bool:
+        return (not self._closed and not self._shutting_down and not self._logout_requested
+                and self._configuration is not None
+                and self._operation in (None, "upload")
+                and self._activity["phase"] not in {"scanning", "reconciling"}
+                and not (self._pause_requested and self._operation is not None))
+
+    @contextlib.contextmanager
+    def _task_scope(self, job):
+        """A signal belongs to one claim, never to a reusable worker thread."""
+        signal = threading.Event()
+        with self._lock:
+            self._task_signals[job.id] = (job.claim_token, signal)
+        try:
+            yield signal
+        finally:
+            with self._lock:
+                current = self._task_signals.get(job.id)
+                if current is not None and current[0] == job.claim_token:
+                    self._task_signals.pop(job.id, None)
+
+    def control_task(self, task_id: int, action: str) -> dict:
+        task_id = self._source_id(task_id)
+        if action not in {"pause", "resume", "remove"}:
+            raise ValueError("Неизвестное действие с задачей.")
+        with self._lock:
+            if not self._task_controls_available():
+                raise QueueBusyError("Дождитесь завершения текущей операции перед изменением задачи.")
+            with self._queue() as queue:
+                # Our upload thread owns the process run lock. Idle controls
+                # acquire it themselves so an external CLI cannot race them.
+                guard = queue.exclusive_run() if self._operation is None else contextlib.nullcontext()
+                with guard:
+                    queue.request_control(task_id, action)
+                current = self._task_signals.get(task_id)
+                if current is not None and action in {"pause", "remove"}:
+                    current[1].set()
+            self._invalidate_stats()
+            messages = {"pause": "Запрошена пауза задачи", "resume": "Задача возвращена в очередь",
+                        "remove": "Задача убрана из очереди; исходный файл сохранён"}
+            self._event(f"{messages[action]}: {task_id}.")
+        return {"ok": True, "task_id": task_id, "action": action}
+
+    def clear_tasks(self, scope: str = "all") -> dict:
+        if scope not in {"all", "finished"}:
+            raise ValueError("Выберите все задачи или обработанные задачи.")
+        with self._lock:
+            self._ensure_idle()
+            with self._queue() as queue, queue.exclusive_run():
+                removed = queue.clear_tasks(scope=scope)
+            self._invalidate_stats()
+            self._event(f"Из очереди убрано задач: {removed:,}. Файлы на диске и в Облаке сохранены.")
+        return {"ok": True, "removed_tasks": removed}
+
     def jobs(self, status: str | None = None, limit: int = 50, offset: int = 0) -> dict:
         if status in ("", "all"):
             status = None
-        if status is not None and status not in STATES:
-            raise ValueError("Неизвестный фильтр заданий.")
+        if status is not None and status not in (*STATES, "paused"):
+            raise ValueError("Неизвестный фильтр задач.")
         if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
-            raise ValueError("Некорректная страница списка заданий.")
+            raise ValueError("Некорректная страница списка задач.")
         if self._configuration is None:
             return {"jobs": [], "total": 0, "offset": offset, "limit": limit}
-        fields = {"id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
-                  "last_error", "skip_reason", "next_attempt", "uploaded_at", "storage_mode"}
+        fields = {"id", "root_id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
+                  "last_error", "skip_reason", "next_attempt", "uploaded_at", "storage_mode",
+                  "paused", "remove_requested"}
         with self._queue() as queue:
             rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True)
             stats = self._display_stats(queue)
-        return {"jobs": [{k: v for k, v in row.items() if k in fields} for row in rows],
-                "total": stats[status] if status else stats["total"], "offset": offset, "limit": limit}
+        with self._lock:
+            active = copy.deepcopy(self._files)
+        items = []
+        for row in rows:
+            item = {k: v for k, v in row.items() if k in fields}
+            item["paused"] = bool(row.get("paused"))
+            item["remove_requested"] = bool(row.get("remove_requested"))
+            item["progress"] = None
+            current = active.get(row["id"])
+            if row["status"] == "running" and current:
+                total = max(0, row["size"])
+                sent = min(total, max(0, current.get("sent", 0)))
+                item["progress"] = {"sent": sent, "total": total,
+                                    "percent": sent / total * 100 if total else 0,
+                                    "stage": current.get("stage", "preparing")}
+            items.append(item)
+        return {"jobs": items, "total": stats.get(status, 0) if status else stats["total"],
+                "offset": offset, "limit": limit}
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -369,6 +442,9 @@ class WebService:
                       "sources": [], "stats": {**{s: 0 for s in STATES}, "total": 0, "total_bytes": 0,
                                                 "uploaded_bytes": 0, "ready": 0, "permanent_failures": 0},
                       "activity": activity, "settings": dict(self._settings),
+                      "task_controls_available": self._task_controls_available(),
+                      "queue_clear_available": self._configuration is not None and self._operation is None
+                          and not self._closed and not self._logout_requested,
                       "last_scan": None, "probe": None, "events": copy.deepcopy(self._events)}
         if self._configuration is not None:
             with self._queue() as queue:
@@ -392,6 +468,7 @@ class WebService:
             self._shutting_down = False
             self._operation = name
             self._files.clear()
+            self._task_signals.clear()
             self._uploaded_in_run = 0
             self._invalidate_stats()
             self._resume_upload = upload_intent
@@ -413,7 +490,7 @@ class WebService:
                 if self._shutting_down and self._resume_upload:
                     with self._queue() as queue:
                         stats = queue.stats()
-                    remaining = stats["pending"] + stats["running"] + stats["failed"] - stats["permanent_failures"]
+                    remaining = stats["remaining"]
                     if remaining:
                         raise Cancelled("Остановка процесса; сохранено намерение продолжить очередь.")
                 self._resume_upload = False
@@ -442,6 +519,7 @@ class WebService:
             with self._lock:
                 self._invalidate_stats()
                 self._files.clear()
+                self._task_signals.clear()
                 self._activity["probe_wait_until"] = None
                 if self._logout_requested:
                     try:
@@ -579,7 +657,7 @@ class WebService:
             with self._queue() as queue:
                 self._scan_queue(queue)
                 total = queue.stats()["total"]
-            return "idle", f"Сканирование завершено. Файлов в очереди: {total:,}."
+            return "idle", f"Сканирование завершено. Задач в очереди: {total:,}."
         return self._launch("scanning", perform)
 
     def _emit(self, event: str, data: dict) -> None:
@@ -600,6 +678,7 @@ class WebService:
                     item["stage"] = "uploading"
             elif event == "file_finished":
                 self._files.pop(data["job_id"], None)
+                self._invalidate_stats()
             elif event == "probe_wait":
                 self._activity["probe_wait_until"] = time.time() + data["seconds"]
                 self._activity["message"] = "Проверяем, что фото и видео не расходуют квоту…"
@@ -668,44 +747,40 @@ class WebService:
             try:
                 active_id = report.get("active_job_id")
                 if type(active_id) is int:
-                    # mark_uploaded and report.samples are separate transactions.
-                    # History covers a power loss between those two commits.
+                    # The immutable origin ID also finds detached history after
+                    # the user removed a task during this interrupted probe.
                     history = [row for row in queue.upload_history(active_id)
                                if row.get("uploaded_at", 0) >= report["started_at"]
                                and row["verified_metadata"].get("protocol") == PROTOCOL_VERSION
                                and row["verified_metadata"].get("is_unlim_upload") is True
                                and row["verified_metadata"].get("stat_matched") is True
                                and self._proof_belongs_to_probe(row["verified_metadata"], report["started_at"])]
-                    if history:
-                        result = {"job_id": active_id, **history[-1]["verified_metadata"]}
-                    else:
-                        job = queue.claim(max_attempts=5, storage_mode="unlimited")
-                        if job is None or job.id != active_id:
-                            if job is not None:
-                                queue.release(job, "Waiting for the original interrupted probe job")
-                            raise ProtocolError("Не найдено исходное задание прерванной проверки; очередь сохранена.")
-                        try:
-                            intent = queue.get_commit_intent(job)
-                            if intent and intent.get("unlimited_confirmed") is True:
-                                confirmed = intent.get("unlimited_confirmed_at")
-                                created = intent.get("created_at")
-                                if not (type(confirmed) in (int, float) and type(created) in (int, float)
-                                        and report["started_at"] <= created <= confirmed <= time.time()):
-                                    raise ProtocolError("Подтверждение файла старше этой проверки; его нельзя использовать как новый образец.")
-                            result = process_job(queue, api, job, emit=self._emit)
-                        except Cancelled:
-                            queue.release(job, "Interrupted automatic probe; retain saved confirmation")
-                            raise
-                        except Exception as error:
-                            if isinstance(error, TransportError) and api.stop.is_set():
-                                queue.release(job, "Network request interrupted during resumed probe")
-                                raise Cancelled("Контрольная проверка приостановлена.") from None
-                            if not isinstance(error, FileChangedError):
-                                safe = str(error) if isinstance(error, (ProtocolError, AuthError, TransportError)) else type(error).__name__
-                                queue.mark_failed(job, safe, retry_delay=None)
-                            raise
-                    report["samples"].append(result)
+                    if history and not any(sample.get("job_id") == active_id for sample in report["samples"]):
+                        report["samples"].append({"job_id": active_id, **history[-1]["verified_metadata"]})
                     report.pop("active_job_id", None)
+                    queue.set_metadata("probe", report)
+                requested = report.get("requested_count", 1)
+                if type(requested) is not int or not 1 <= requested <= 10:
+                    raise ProtocolError("Некорректное число образцов сохранённой проверки.")
+                while len(report["samples"]) < requested:
+                    job = queue.claim(max_attempts=5, storage_mode="unlimited")
+                    if job is None:
+                        retry_at = queue.stats(storage_mode="unlimited").get("next_retry_at")
+                        if retry_at is not None:
+                            if api.stop.wait(max(0.1, min(10, retry_at - time.time()))):
+                                raise Cancelled("Контрольная проверка приостановлена.")
+                            continue
+                        report["result"] = "insufficient_new_samples"
+                        raise ProbeRequired("Нет доступных новых задач для завершения контрольной проверки.")
+                    report["active_job_id"] = job.id
+                    queue.set_metadata("probe", report)
+                    result = process_probe_job(queue, api, job, baseline=report["before"]["used_bytes"],
+                                               emit=self._emit, file_progress=True, task_scope=self._task_scope)
+                    report.pop("active_job_id", None)
+                    if result is not None and self._proof_belongs_to_probe(result, report["started_at"]):
+                        report["samples"].append(result)
+                    else:
+                        report["other_candidates"] = report.get("other_candidates", 0) + 1
                     queue.set_metadata("probe", report)
                 for sample in report["samples"]:
                     evidence = [row for row in queue.upload_history(sample["job_id"])
@@ -740,12 +815,26 @@ class WebService:
                 report["result"] = "failed"
                 raise
             except Exception:
-                report["result"] = "failed"
+                if report.get("result") != "insufficient_new_samples":
+                    report["result"] = "failed"
                 raise
             finally:
                 report["finished_at"] = time.time()
                 queue.set_metadata("probe", report)
         return report
+
+    @staticmethod
+    def _completion(stats: dict) -> tuple[str, str]:
+        if not stats.get("total"):
+            return "idle", "Очередь пуста. Чтобы найти файлы снова, нажмите «Пересканировать папки»."
+        if stats.get("paused"):
+            return "paused", (f"Доступные задачи обработаны. На индивидуальной паузе: {stats['paused']:,}. "
+                              "Продолжите нужные задачи в очереди.")
+        failed, skipped = stats.get("failed", 0), stats.get("skipped", 0)
+        if failed or skipped:
+            return "completed", (f"Обработка завершена. Ошибок: {failed:,}; пропущено: {skipped:,}. "
+                                 "Подробности и повтор — в очереди задач.")
+        return "completed", "Все фото и видео загружены и проверены."
 
     def _pipeline(self) -> tuple[str, str]:
         api = None
@@ -765,17 +854,15 @@ class WebService:
                 self._emit("large_files_skipped", {"count": skipped})
                 self._invalidate_stats()
             stats = queue.stats()
-            remaining = stats["pending"] + stats["running"] + stats["failed"] - stats["permanent_failures"]
+            remaining = stats["remaining"]
             old_probe = queue.get_metadata("probe", {})
             preflight_check = self._settings["preflight_check"]
             resume_control = preflight_check and self._can_resume_probe(old_probe, queue.account_id, queue.destination)
             small = queue.stats(storage_mode="unlimited")
-            remaining_small = small["pending"] + small["running"] + small["failed"] - small["permanent_failures"]
+            remaining_small = small["remaining"]
             preflight_check = preflight_check and (remaining_small > 0 or resume_control)
             if not remaining and not resume_control:
-                if stats["failed"]:
-                    return "error", "Есть файлы с ошибками. Исправьте причину и нажмите «Повторить ошибки»."
-                return "completed", "Все найденные файлы обработаны." if stats["skipped"] else "Все найденные фото и видео загружены."
+                return self._completion(stats)
             api = self._new_api()
             try:
                 self._phase("checking", "Проверяем аккаунт и доступность безлимита…")
@@ -788,32 +875,34 @@ class WebService:
                         valid = api.quota()["used_bytes"] == report["before"]["used_bytes"]
                 if preflight_check and not valid:
                     self._phase("probing", "Проверяем безлимит на одном файле перед загрузкой архива…")
-                    if self._can_resume_probe(report, account.email, queue.destination):
-                        report = self._resume_probe(queue, api, report)
-                    else:
-                        stats = queue.stats(storage_mode="unlimited")
-                        retry_at = stats.get("next_retry_at")
-                        if stats["ready"] == 0 and retry_at is not None:
-                            self._phase("probing", "Ожидаем повторной попытки после временного сбоя…")
-                            if api.stop.wait(max(0, retry_at - time.time())):
-                                raise Cancelled("Приостановлено.")
-                        report = probe(queue, api, count=1, settle_seconds=self._settle_seconds,
-                                       emit=self._emit, file_progress=True)
+                    try:
+                        if self._can_resume_probe(report, account.email, queue.destination):
+                            report = self._resume_probe(queue, api, report)
+                        else:
+                            stats = queue.stats(storage_mode="unlimited")
+                            retry_at = stats.get("next_retry_at")
+                            if stats["ready"] == 0 and retry_at is not None:
+                                self._phase("probing", "Ожидаем повторной попытки после временного сбоя…")
+                                if api.stop.wait(max(0, retry_at - time.time())):
+                                    raise Cancelled("Приостановлено.")
+                            report = probe(queue, api, count=1, settle_seconds=self._settle_seconds,
+                                           emit=self._emit, file_progress=True, task_scope=self._task_scope)
+                    except ProbeRequired:
+                        current_stats = queue.stats()
+                        if current_stats["remaining"] == 0:
+                            return self._completion(current_stats)
+                        raise
                     if report.get("result") != "provisional_pass":
                         raise ProbeRequired("Квота изменилась во время проверки. Загрузка приостановлена; повторите запуск при стабильной квоте.")
                 self._check_stop()
                 self._phase("uploading", "Загружаем фото и видео в безлимит…")
                 result = run(queue, api, workers=self._settings["workers"], emit=self._emit,
-                             file_progress=True, require_probe=preflight_check)
+                             file_progress=True, require_probe=preflight_check, task_scope=self._task_scope)
                 if self._pause_requested or self._shutting_down:
                     raise Cancelled("Приостановлено.")
                 if result.get("stopped"):
                     raise ProtocolError((result.get("errors") or ["Загрузка остановлена; очередь сохранена."])[0])
-                if result.get("outcome") == "finished_with_errors":
-                    return "error", "Загрузка завершилась с ошибками; подробности в списке заданий."
-                if result.get("outcome") == "finished_with_skips":
-                    return "completed", "Загрузка завершена; есть пропущенные файлы."
-                return "completed", "Все фото и видео загружены и проверены."
+                return self._completion(queue.stats())
             finally:
                 api.close_thread()
 

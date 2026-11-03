@@ -313,7 +313,7 @@ class WebApplication:
                 return self.service.snapshot()
             if path == "/api/jobs":
                 status = query.get("status", ["all"])[0]
-                if status not in {"all", "pending", "running", "uploaded", "failed", "skipped"}:
+                if status not in {"all", "pending", "running", "uploaded", "failed", "skipped", "paused"}:
                     raise WebError(400, "Неизвестный фильтр очереди.")
                 return self.service.jobs(status=None if status == "all" else status,
                                          limit=_integer(query.get("limit", ["50"])[0], 1, 100),
@@ -346,6 +346,13 @@ class WebApplication:
                                        alias=_text(data, "alias", limit=255) if "alias" in data else None)
         elif path == "/api/sources/remove":
             self.service.remove_source(_integer(data.get("id"), 1, 2**63 - 1))
+        elif path in {"/api/tasks/pause", "/api/tasks/resume", "/api/tasks/remove"}:
+            self.service.control_task(_integer(data.get("id"), 1, 2**63 - 1), path.rsplit("/", 1)[1])
+        elif path == "/api/tasks/clear":
+            scope = _text(data, "scope", limit=16)
+            if scope not in {"all", "finished"}:
+                raise WebError(400, "Выберите все задачи или обработанные задачи.")
+            self.service.clear_tasks(scope)
         elif path == "/api/scan":
             self.service.scan()
         elif path == "/api/start":

@@ -88,6 +88,25 @@ class Cancelled(RuntimeError):
     pass
 
 
+class TaskCancelled(Cancelled):
+    """Only the current claimed task was paused or removed."""
+
+
+class SourceReadError(RuntimeError):
+    """The local input could not be read; unrelated tasks may continue."""
+
+
+def check_cancelled(stop, *, force: bool = False) -> None:
+    """Keep task cancellation distinct while accepting ordinary Events."""
+    check = getattr(stop, "checkpoint", None) if force else None
+    if not callable(check):
+        check = getattr(stop, "check", None)
+    if callable(check):
+        check()
+    elif stop is not None and stop.is_set():
+        raise Cancelled("Загрузка остановлена.")
+
+
 @dataclass(frozen=True)
 class Response:
     status: int
@@ -172,8 +191,7 @@ class HTTP:
         parsed = urlsplit(url)
         host = parsed.hostname
         assert host is not None
-        if self.stop.is_set():
-            raise Cancelled("Загрузка остановлена.")
+        check_cancelled(self.stop)
         if stream is not None and (length is None or length < 0):
             raise ValueError("A stream requires an explicit non-negative length")
         if stream is not None and body:
@@ -206,11 +224,13 @@ class HTTP:
             else:
                 remaining = int(length)
                 while remaining:
-                    if self.stop.is_set():
-                        raise Cancelled("Загрузка остановлена.")
-                    block = stream.read(min(1024 * 1024, remaining))
+                    check_cancelled(self.stop)
+                    try:
+                        block = stream.read(min(1024 * 1024, remaining))
+                    except OSError:
+                        raise SourceReadError("Не удалось прочитать исходный файл во время передачи.") from None
                     if not block:
-                        raise TransportError("Исходный файл закончился во время передачи.")
+                        raise SourceReadError("Исходный файл закончился во время передачи.")
                     conn.send(block)
                     remaining -= len(block)
                     if progress is not None:

@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import struct
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -17,7 +18,7 @@ from mailru_photos.api import (
     RemoteConflict, RemoteError, SourceChanged, UnlimitedNotConfirmed, UnsupportedPhoto, cloud_hash, _retry_after,
 )
 from mailru_photos.auth import Tokens
-from mailru_photos.transport import HTTP, Response, TransportError, validate_url
+from mailru_photos.transport import Cancelled, HTTP, Response, SourceReadError, TransportError, validate_url
 
 
 # Generated 16x16, one-frame MPEG-4/MP4. ffprobe validated this fixture;
@@ -348,6 +349,41 @@ class UploadBehaviorTests(unittest.TestCase):
         self.assertEqual(upload["stream_body"], self.data[offset:])
         self.assertEqual(upload["headers"]["Content-Range"], f"bytes {offset}-{len(self.data)-1}/{len(self.data)}")
 
+    def test_resumed_blob_progress_includes_offset_without_double_counting_completion(self):
+        offset = 37
+        api, fake, _ = self.api([
+            response(404),
+            response(200, headers={'x-valid-for': '0', 'x-received': str(offset),
+                                  'x-location': UPLOAD_BASE + '/resumable/' + self.digest}),
+            response(202, headers={'x-wait-for': '1'}),
+            response(201, headers={'x-valid-for': '0'}),
+            response(data={'name': self.local.name, 'path': self.remote, 'is_unlim_upload': True}),
+            self.stat_response(),
+        ])
+        api._wait = lambda seconds: None
+        deltas = []
+        result = api.upload_photo(str(self.local), self.remote, expected=self.identity,
+                                  save_intent=self.saved.append, save_confirmation=self.confirmed.append,
+                                  progress=deltas.append)
+        self.assertTrue(result['stat_matched'])
+        self.assertEqual(deltas, [offset, self.identity.size - offset])
+        self.assertEqual(sum(deltas), self.identity.size)
+        self.assertEqual(next(item for item in fake.requests if item['stream_body'] is not None)['stream_body'],
+                         self.data[offset:])
+
+    def test_cached_complete_blob_reports_full_size_without_sending_body(self):
+        api, fake, _ = self.api([
+            response(404), response(201, headers={'x-valid-for': '0'}),
+            response(data={'name': self.local.name, 'path': self.remote, 'is_unlim_upload': True}),
+            self.stat_response(),
+        ])
+        deltas = []
+        api.upload_photo(str(self.local), self.remote, expected=self.identity,
+                         save_intent=self.saved.append, save_confirmation=self.confirmed.append,
+                         progress=deltas.append)
+        self.assertEqual(deltas, [self.identity.size])
+        self.assertFalse(any(item['stream_body'] is not None for item in fake.requests))
+
     def test_lost_commit_response_cannot_infer_unlimited_from_matching_hash(self):
         api, fake, _ = self.api([
             response(404), response(201, headers={"x-valid-for": "3600"}),
@@ -397,6 +433,54 @@ class UploadBehaviorTests(unittest.TestCase):
         self.assertIs(result["is_unlim_upload"], True)
         self.assertEqual(result["quota_status"], "server_confirmed_unlimited")
         self.assertFalse(fake.sequence)
+
+    def test_task_scope_resets_cached_transport_after_cancelled_task(self):
+        api, fake, _ = self.api([response(data={'ok': True})])
+        cached = api.transport
+        self.assertIs(cached.stop, api.stop)
+        paused = threading.Event()
+        paused.set()
+        with self.assertRaises(Cancelled):
+            with api.task_scope(paused):
+                self.assertIs(api.transport, cached)
+                self.assertIs(cached.stop, paused)
+                api._request('GET', API_BASE + '/api/v1/user/info')
+        self.assertIs(cached.stop, api.stop)
+        self.assertFalse(api.stop.is_set())
+        self.assertEqual(fake.requests, [])
+        with api.task_scope(threading.Event()):
+            self.assertEqual(api._request('GET', API_BASE + '/api/v1/user/info').status, 200)
+        self.assertIs(cached.stop, api.stop)
+        self.assertEqual(len(fake.requests), 1)
+
+    def test_accepted_commit_is_saved_when_pause_arrives_with_response(self):
+        paused = threading.Event()
+        def accepted_after_pause(_):
+            paused.set()
+            return response(data={'name': self.local.name, 'path': self.remote, 'is_unlim_upload': True})
+        api, fake, _ = self.api([
+            response(404), response(201, headers={'x-valid-for': '0'}),
+            accepted_after_pause, self.stat_response(),
+        ])
+        with self.assertRaises(Cancelled):
+            with api.task_scope(paused):
+                self.upload(api)
+        self.assertEqual(self.saved, [self.digest])
+        self.assertEqual(self.confirmed, [self.digest])
+        self.assertFalse(api.stop.is_set())
+        self.assertEqual(len(fake.requests), 3, 'Do not start stat after pause, but keep the accepted response')
+        with api.task_scope(threading.Event()):
+            result = self.upload(api, prior_intent={'cloud_hash': self.digest, 'remote_path': self.remote,
+                                                   'unlimited_confirmed': True})
+        self.assertTrue(result['recovered_commit'])
+        self.assertEqual(sum(request['method'] == 'POST' for request in fake.requests), 1)
+        self.assertFalse(fake.sequence)
+
+    def test_source_read_failure_has_safe_local_error(self):
+        with patch('builtins.open', side_effect=PermissionError('private-detail-do-not-copy')):
+            with self.assertRaises(SourceReadError) as caught:
+                cloud_hash(self.local, expected=self.identity)
+        self.assertNotIn('private-detail', str(caught.exception))
 
     def test_missing_or_nontrue_unlimited_flag_never_finishes_or_falls_back(self):
         missing = object()

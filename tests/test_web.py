@@ -32,6 +32,12 @@ class FakeService:
     def remove_source(self, source_id):
         self.calls.append(("remove_source", source_id))
 
+    def control_task(self, task_id, action):
+        self.calls.append(("control_task", task_id, action))
+
+    def clear_tasks(self, scope):
+        self.calls.append(("clear_tasks", scope))
+
     def jobs(self, **kwargs):
         self.calls.append(("jobs", kwargs))
         return {"jobs": [], "total": 0, **kwargs}
@@ -92,6 +98,34 @@ class WebTests(unittest.TestCase):
         response = self.request("/api/session/setup", method="POST", data={"password": "panel-test-only-password"})
         self.assertEqual(response["status"], 200)
         self.assertTrue(response["data"]["authenticated"])
+
+    def test_task_controls_require_session_csrf_and_validate_inputs(self):
+        self.request('/api/session')
+        self.assertEqual(self.request('/api/tasks/pause', method='POST', data={'id': 1})['status'], 401)
+        self.authenticate()
+        for action in ('pause', 'resume', 'remove'):
+            endpoint = '/api/tasks/' + action
+            self.assertEqual(self.request(endpoint, method='POST', data={'id': 1}, csrf='bad')['status'], 403)
+            self.assertEqual(self.request(endpoint, method='POST', data={'id': 1})['status'], 200)
+            self.assertEqual(self.service.calls[-1], ('control_task', 1, action))
+        before = list(self.service.calls)
+        for value in (None, True, 0, -1, 1.5, 'one', 2**63):
+            self.assertEqual(self.request('/api/tasks/remove', method='POST', data={'id': value})['status'], 400)
+        self.assertEqual(self.service.calls, before)
+        self.assertEqual(self.request('/api/tasks/pause')['status'], 404)
+        self.assertEqual(self.request('/api/jobs?status=paused')['status'], 200)
+        self.assertEqual(self.service.calls[-1][1]['status'], 'paused')
+
+    def test_clear_tasks_has_explicit_scope_and_same_request_protection(self):
+        self.authenticate()
+        for scope in ('all', 'finished'):
+            self.assertEqual(self.request('/api/tasks/clear', method='POST', data={'scope': scope}, csrf='bad')['status'], 403)
+            self.assertEqual(self.request('/api/tasks/clear', method='POST', data={'scope': scope})['status'], 200)
+            self.assertEqual(self.service.calls[-1], ('clear_tasks', scope))
+        before = list(self.service.calls)
+        for scope in (None, '', 'everything', True):
+            self.assertEqual(self.request('/api/tasks/clear', method='POST', data={'scope': scope})['status'], 400)
+        self.assertEqual(self.service.calls, before)
 
     def test_private_routes_require_panel_session(self):
         for route in ("/api/state", "/api/folders", "/api/jobs", "/api/report"):

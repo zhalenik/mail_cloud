@@ -115,7 +115,7 @@ volumes:
 | Значение `image` | Как выбирать обновления |
 | --- | --- |
 | `ghcr.io/zhalenik/mail_cloud:stable` | Получать новые выпуски без изменения тега в YAML. |
-| `ghcr.io/zhalenik/mail_cloud:v0.5.0` | Использовать выбранный выпуск. Для следующей версии изменить тег в YAML. |
+| `ghcr.io/zhalenik/mail_cloud:v0.5.1` | Использовать выбранный выпуск. Для следующей версии изменить тег в YAML. |
 | `ghcr.io/zhalenik/mail_cloud@sha256:…` | Закрепить конкретный digest опубликованного образа, если нужна точная фиксация содержимого. |
 
 Версионный тег удобен для выбора выпуска; технически владелец registry может перезаписать любой тег. Digest фиксирует конкретное содержимое; см. [Docker: получение образа по digest](https://docs.docker.com/reference/cli/docker/image/pull/#pull-an-image-by-digest-immutable-identifier). Наличие новой версии приложения в GitHub само по себе не меняет YAML с фиксированным тегом.
@@ -152,7 +152,7 @@ TrueNAS отдельно проверяет registry и показывает **�
 
 Поведение **Start**, применения YAML и проверки обновлений сверено с исходниками [TrueNAS 24.10.2.3: запуск](https://github.com/truenas/middleware/blob/TS-24.10.2.3/src/middlewared/middlewared/plugins/apps/app_scale.py), [вызов Compose](https://github.com/truenas/middleware/blob/TS-24.10.2.3/src/middlewared/middlewared/plugins/apps/compose_utils.py) и [обновление приложения](https://github.com/truenas/middleware/blob/TS-24.10.2.3/src/middlewared/middlewared/plugins/apps/upgrade.py).
 
-Начиная с 0.5.0 используется схема очереди 2. Вернуться на 0.4.x можно с восстановлением снимка состояния, сделанного до обновления; старую версию нельзя запускать на новой базе.
+В 0.5.0 очередь использует схему 2, начиная с 0.5.1 — схему 3. Переход происходит автоматически. Для отката на выпуск с предыдущей схемой восстановите снимок состояния, сделанный до обновления; старую версию нельзя запускать на новой базе.
 
 Приложению отведено `120s` на остановку. Не сокращайте это время для очереди с активными сетевыми запросами.
 

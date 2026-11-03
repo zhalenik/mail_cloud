@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,24 +40,28 @@ VIDEO_EXTENSIONS = frozenset({
 })
 MEDIA_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 STATES = ("pending", "running", "uploaded", "failed", "skipped")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCHEMA_OBJECTS = frozenset({
     ("table", "metadata"), ("table", "roots"), ("table", "scans"),
     ("table", "jobs"), ("table", "upload_results"), ("table", "commit_intents"),
+    ("table", "commit_evidence"),
     ("index", "jobs_ready"), ("index", "jobs_pending"),
     ("index", "jobs_pending_unlimited"), ("index", "jobs_pending_regular"),
     ("index", "jobs_retry_unlimited"), ("index", "jobs_retry_regular"),
+    ("index", "jobs_retry"), ("index", "jobs_paused"),
     ("index", "jobs_root_scan"), ("index", "jobs_status"),
     ("index", "jobs_current"), ("index", "jobs_current_status"),
     ("index", "jobs_source_identity"),
     ("index", "upload_results_job"),
+    ("index", "commit_evidence_job"),
+    ("index", "upload_results_origin"), ("index", "commit_evidence_origin"),
 })
 _JOB_SUMMARY_COLUMNS = (
     "id,root_id,relative_path,local_path,remote_path,status,size,attempts,present,"
-    "last_error,skip_reason,next_attempt,uploaded_at,storage_mode"
+    "last_error,skip_reason,next_attempt,uploaded_at,storage_mode,paused,remove_requested"
 )
 _UPLOAD_RESULT_COLUMNS = frozenset({
-    "id", "job_id", "account_id", "local_path", "local_key", "remote_path",
+    "id", "job_id", "origin_job_id", "account_id", "local_path", "local_key", "remote_path",
     "source_size", "source_mtime_ns", "source_device", "source_inode",
     "remote_hash", "remote_id", "verified_metadata", "uploaded_at",
 })
@@ -273,13 +278,13 @@ class Queue:
 
     def _initialize(self, account_id: str | None) -> None:
         schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        if schema_version not in (0, 1, SCHEMA_VERSION):
+        if schema_version not in (0, 1, 2, SCHEMA_VERSION):
             raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
         objects = {(row["type"], row["name"]) for row in self._db.execute(
             "SELECT type,name FROM sqlite_master WHERE type IN ('table','index')"
         )}
         job_columns = {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}
-        has_schema = (_SCHEMA_OBJECTS.issubset(objects) and "storage_mode" in job_columns
+        has_schema = (_SCHEMA_OBJECTS.issubset(objects) and {"storage_mode", "paused", "remove_requested"}.issubset(job_columns)
                       and self._has_detached_upload_results())
         if ("table", "metadata") in objects:
             existing = self._get_meta("_destination")
@@ -292,7 +297,7 @@ class Queue:
         with self._transaction():
             # A second first-opener may have migrated while this one waited.
             schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-            if schema_version not in (0, 1, SCHEMA_VERSION):
+            if schema_version not in (0, 1, 2, SCHEMA_VERSION):
                 raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
             self._create_core_schema()
             existing = self._get_meta("_destination")
@@ -305,8 +310,25 @@ class Queue:
             if "storage_mode" not in job_columns:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN storage_mode TEXT "
                                  "CHECK(storage_mode IN ('unlimited','regular'))")
+            for flag in ("paused", "remove_requested"):
+                if flag not in job_columns:
+                    self._db.execute(f"ALTER TABLE jobs ADD COLUMN {flag} INTEGER NOT NULL DEFAULT 0 CHECK({flag} IN (0,1))")
+            for table in ("upload_results", "commit_evidence"):
+                columns = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+                if "origin_job_id" not in columns:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN origin_job_id INTEGER")
+                    # Detached schema-2 records have lost their original task
+                    # ID. Never guess an origin for those historical rows.
+                    self._db.execute(f"UPDATE {table} SET origin_job_id=job_id WHERE job_id IS NOT NULL")
             if not self._has_detached_upload_results():
                 self._migrate_upload_results()
+            if schema_version < 3:
+                # Schema-2 claim indexes included paused rows. Rebuild once
+                # so a large paused prefix does not make each claim linear.
+                for name in ("jobs_pending", "jobs_pending_unlimited", "jobs_pending_regular",
+                             "jobs_retry_unlimited", "jobs_retry_regular"):
+                    self._db.execute(f"DROP INDEX IF EXISTS {name}")
+                self._preserve_job_ids()
             self._create_queue_indexes()
             if schema_version != SCHEMA_VERSION:
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -338,6 +360,8 @@ class Queue:
                 claim_token TEXT, last_error TEXT, skip_reason TEXT,
                 remote_hash TEXT, remote_id TEXT, verified_metadata TEXT,
                 storage_mode TEXT CHECK(storage_mode IN ('unlimited','regular')),
+                paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0,1)),
+                remove_requested INTEGER NOT NULL DEFAULT 0 CHECK(remove_requested IN (0,1)),
                 uploaded_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
                 seen_scan INTEGER, present INTEGER NOT NULL DEFAULT 1
             )""",
@@ -347,6 +371,16 @@ class Queue:
                 device INTEGER NOT NULL, inode TEXT NOT NULL,
                 remote_path TEXT NOT NULL, cloud_hash TEXT NOT NULL,
                 created_at REAL NOT NULL, intent_json TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS commit_evidence (
+                id INTEGER PRIMARY KEY, job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+                origin_job_id INTEGER,
+                intent_id TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('attempted','accepted')),
+                account_id TEXT, local_path TEXT, remote_path TEXT NOT NULL,
+                source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
+                source_device INTEGER NOT NULL, source_inode TEXT NOT NULL,
+                cloud_hash TEXT NOT NULL, created_at REAL NOT NULL, recorded_at REAL NOT NULL,
+                intent_json TEXT NOT NULL, UNIQUE(intent_id,stage)
             )""",
         )
         for statement in statements:
@@ -358,6 +392,7 @@ class Queue:
         # Both callers pass internal literal table names, never user input.
         self._db.execute(f"""CREATE TABLE {table} (
             id INTEGER PRIMARY KEY, job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+            origin_job_id INTEGER,
             account_id TEXT, local_path TEXT, local_key TEXT, remote_path TEXT,
             source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
             source_device INTEGER, source_inode TEXT,
@@ -410,7 +445,7 @@ class Queue:
                 if not remote_path:
                     remote_path = item["job_remote_path"]
                 records.append((
-                    item["id"], item["job_id"], item.get("account_id", account),
+                    item["id"], item["job_id"], item.get("origin_job_id", item["job_id"]), item.get("account_id", account),
                     item.get("local_path", item["job_local_path"]),
                     item.get("local_key", item["job_local_key"]), remote_path,
                     item["source_size"], item["source_mtime_ns"],
@@ -418,9 +453,9 @@ class Queue:
                     item["remote_hash"], item["remote_id"], item["verified_metadata"], item["uploaded_at"],
                 ))
             self._db.executemany(
-                "INSERT INTO upload_results_migration(id,job_id,account_id,local_path,local_key,remote_path,"
+                "INSERT INTO upload_results_migration(id,job_id,origin_job_id,account_id,local_path,local_key,remote_path,"
                 "source_size,source_mtime_ns,source_device,source_inode,remote_hash,remote_id,verified_metadata,uploaded_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records,
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records,
             )
         cursor.close()
         self._db.execute("DROP TABLE upload_results")
@@ -429,21 +464,27 @@ class Queue:
     def _create_queue_indexes(self) -> None:
         statements = (
             "CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,present,next_attempt,id)",
-            "CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status='pending' AND present=1",
+            "CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0",
             f"CREATE INDEX IF NOT EXISTS jobs_pending_unlimited ON jobs(id) "
-            f"WHERE status='pending' AND present=1 AND size<={UNLIMITED_MAX_BYTES}",
+            f"WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 AND size<={UNLIMITED_MAX_BYTES}",
             f"CREATE INDEX IF NOT EXISTS jobs_pending_regular ON jobs(id) "
-            f"WHERE status='pending' AND present=1 AND size>{UNLIMITED_MAX_BYTES}",
+            f"WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 AND size>{UNLIMITED_MAX_BYTES}",
+            "CREATE INDEX IF NOT EXISTS jobs_retry ON jobs(next_attempt,id) "
+            "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL",
             f"CREATE INDEX IF NOT EXISTS jobs_retry_unlimited ON jobs(next_attempt,id) "
-            f"WHERE status='failed' AND present=1 AND next_attempt IS NOT NULL AND size<={UNLIMITED_MAX_BYTES}",
+            f"WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND size<={UNLIMITED_MAX_BYTES}",
             f"CREATE INDEX IF NOT EXISTS jobs_retry_regular ON jobs(next_attempt,id) "
-            f"WHERE status='failed' AND present=1 AND next_attempt IS NOT NULL AND size>{UNLIMITED_MAX_BYTES}",
+            f"WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND size>{UNLIMITED_MAX_BYTES}",
             "CREATE INDEX IF NOT EXISTS jobs_root_scan ON jobs(root_id,seen_scan)",
             "CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,id)",
             "CREATE INDEX IF NOT EXISTS jobs_current ON jobs(id) WHERE present=1",
             "CREATE INDEX IF NOT EXISTS jobs_current_status ON jobs(status,id) WHERE present=1",
             "CREATE INDEX IF NOT EXISTS jobs_source_identity ON jobs(root_id,device,inode,size,mtime_ns)",
+            "CREATE INDEX IF NOT EXISTS jobs_paused ON jobs(id) WHERE present=1 AND paused=1",
             "CREATE INDEX IF NOT EXISTS upload_results_job ON upload_results(job_id)",
+            "CREATE INDEX IF NOT EXISTS commit_evidence_job ON commit_evidence(job_id)",
+            "CREATE INDEX IF NOT EXISTS upload_results_origin ON upload_results(origin_job_id)",
+            "CREATE INDEX IF NOT EXISTS commit_evidence_origin ON commit_evidence(origin_job_id)",
         )
         for statement in statements:
             self._db.execute(statement)
@@ -635,6 +676,135 @@ class Queue:
         existing = self._db.execute("SELECT COALESCE(MAX(id),0) FROM roots").fetchone()[0]
         return max(stored, existing)
 
+    def _job_id_high_water(self) -> int:
+        stored = self._get_meta("_job_id_high_water", 0)
+        if type(stored) is not int or stored < 0:
+            raise QueueConfigurationError("Invalid saved task identifier sequence.")
+        existing = self._db.execute("SELECT COALESCE(MAX(id),0) FROM jobs").fetchone()[0]
+        return max(stored, existing)
+
+    def _preserve_job_ids(self) -> int:
+        highest = self._job_id_high_water()
+        if self._get_meta("_job_id_high_water") != highest:
+            self._put_meta("_job_id_high_water", highest)
+        return highest
+
+    def _archive_intent(self, job_id: int) -> None:
+        """Preserve attempted/accepted receipts separately from verified files."""
+        row = self._db.execute(
+            "SELECT c.*,j.local_path FROM commit_intents c JOIN jobs j ON j.id=c.job_id WHERE c.job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            intent = json.loads(row["intent_json"])
+        except (ValueError, TypeError):
+            intent = {}
+        if not isinstance(intent, dict):
+            intent = {}
+        intent_id = intent.get("intent_id")
+        if not isinstance(intent_id, str) or not intent_id:
+            # Legacy attempts have no UUID. This fingerprint uses only fields
+            # immutable within one attempt, never its later confirmation.
+            identity = [self._get_meta("_account_id"), row["job_id"], row["created_at"], row["remote_path"],
+                        row["cloud_hash"], row["source_size"], row["source_mtime_ns"], row["device"], row["inode"]]
+            intent_id = "legacy-" + hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+        mode = intent.get("storage_mode", "unlimited")
+        stage = "accepted" if mode in _STORAGE_MODES and intent.get(mode + "_confirmed") is True else "attempted"
+        self._db.execute(
+            "INSERT INTO commit_evidence(job_id,origin_job_id,intent_id,stage,account_id,local_path,remote_path,"
+            "source_size,source_mtime_ns,source_device,source_inode,cloud_hash,created_at,recorded_at,intent_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(intent_id,stage) DO NOTHING",
+            (job_id, job_id, intent_id, stage, intent.get("account_id", self._get_meta("_account_id")), row["local_path"],
+             row["remote_path"], row["source_size"], row["source_mtime_ns"], row["device"], row["inode"],
+             row["cloud_hash"], row["created_at"], time.time(), row["intent_json"]),
+        )
+
+    def _drop_intent(self, job_id: int) -> None:
+        self._archive_intent(job_id)
+        self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job_id,))
+
+    def _delete_tasks(self, where: str, parameters: tuple = ()) -> int:
+        """Internal transaction-only deletion, with immutable evidence kept."""
+        self._preserve_job_ids()
+        cursor = self._db.execute(
+            f"SELECT c.job_id FROM commit_intents c JOIN jobs ON jobs.id=c.job_id WHERE {where}", parameters,
+        )
+        while rows := cursor.fetchmany(500):
+            for row in rows:
+                self._archive_intent(row["job_id"])
+        cursor.close()
+        return self._db.execute(f"DELETE FROM jobs WHERE {where}", parameters).rowcount
+
+    def _finalize_control(self, job_id: int, *, uploaded: bool = False) -> bool:
+        """Resolve a durable request only after the owning worker has drained."""
+        row = self._db.execute("SELECT paused,remove_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is not None and row["remove_requested"]:
+            self._delete_tasks("jobs.id=?", (job_id,))
+            return True
+        if row is not None and uploaded and row["paused"]:
+            # The remote commit already finished; a late pause cannot undo it.
+            self._db.execute("UPDATE jobs SET paused=0 WHERE id=?", (job_id,))
+        return False
+
+    @staticmethod
+    def _task_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["paused"] = bool(item["paused"])
+        item["remove_requested"] = bool(item["remove_requested"])
+        return item
+
+    def request_control(self, job_id: int, action: str) -> dict[str, Any] | None:
+        """Request a task action without revoking a live worker's claim.
+
+        The controller owns the run lock when idle, or its running pipeline.
+        This short transaction can run from another thread/connection while
+        the worker owns the run lock. Task removal never invalidates last_scan.
+        """
+        if action not in ("pause", "resume", "remove"):
+            raise ValueError("Task action must be pause, resume, or remove")
+        with self._transaction():
+            if self._get_meta("_scan_token"):
+                raise QueueBusyError("Wait for scanning to finish before changing tasks.")
+            row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or (not row["present"] and action != "remove"):
+                raise QueueConfigurationError(f"Unknown current task: {job_id}")
+            if action == "remove":
+                if row["status"] != "running":
+                    self._delete_tasks("jobs.id=?", (job_id,))
+                    return None
+                self._db.execute("UPDATE jobs SET remove_requested=1,updated_at=? WHERE id=?", (time.time(), job_id))
+            elif row["remove_requested"]:
+                raise QueueBusyError("This task is already being removed.")
+            elif row["status"] == "uploaded":
+                return self._task_dict(row)
+            elif action == "pause":
+                self._db.execute("UPDATE jobs SET paused=1,updated_at=? WHERE id=?", (time.time(), job_id))
+            elif row["status"] == "running":
+                self._db.execute("UPDATE jobs SET paused=0,updated_at=? WHERE id=?", (time.time(), job_id))
+            else:
+                self._db.execute(
+                    "UPDATE jobs SET paused=0,status='pending',attempts=0,next_attempt=0,claim_token=NULL,"
+                    "last_error=NULL,skip_reason=NULL,updated_at=? WHERE id=?", (time.time(), job_id),
+                )
+            return self._task_dict(self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+
+    def task_control(self, job: Job) -> str | None:
+        """Read one live claim's cancellation request, without database writes."""
+        with self._mutex:
+            row = self._require_claim(job)
+            return "remove" if row["remove_requested"] else "pause" if row["paused"] else None
+
+    def clear_tasks(self, scope: str = "all") -> int:
+        """Clear idle queue tasks; source registrations and physical files stay."""
+        if scope not in ("all", "finished"):
+            raise ValueError("Task clear scope must be all or finished")
+        where = "1" if scope == "all" else "(status IN ('uploaded','skipped') OR (status='failed' AND next_attempt IS NULL))"
+        with self.exclusive_run(), self._transaction():
+            self._require_idle_sources()
+            return self._delete_tasks(where)
+
     def add_root(self, path: str | os.PathLike[str], alias: str, remote_prefix: str | None = None) -> Root:
         """Register a source with an exact optional cloud destination.
 
@@ -733,7 +903,7 @@ class Queue:
             highest = self._root_id_high_water()
             if self._get_meta("_root_id_high_water", 0) < highest:
                 self._put_meta("_root_id_high_water", highest)
-            count = self._db.execute("DELETE FROM jobs WHERE root_id=?", (root_id,)).rowcount
+            count = self._delete_tasks("root_id=?", (root_id,))
             self._db.execute("DELETE FROM roots WHERE id=?", (root_id,))
             self._put_meta("last_scan", {"complete": False, "reason": "source_removed"})
             return count
@@ -908,16 +1078,19 @@ class Queue:
         self._db.execute(
             "UPDATE jobs SET relative_path=?,local_path=?,local_key=?,remote_path=?,remote_key=?,"
             "seen_scan=?,present=1,updated_at=?,"
-            "status=CASE WHEN status='skipped' AND skip_reason='missing' THEN 'pending' ELSE status END,"
-            "next_attempt=CASE WHEN status='skipped' AND skip_reason='missing' THEN 0 ELSE next_attempt END,"
-            "last_error=CASE WHEN status='skipped' AND skip_reason='missing' THEN NULL ELSE last_error END,"
-            "skip_reason=CASE WHEN skip_reason='missing' THEN NULL ELSE skip_reason END WHERE id=?",
+            "status=CASE WHEN (status='skipped' AND skip_reason='missing') OR "
+            "(status='failed' AND skip_reason='source_changed') THEN 'pending' ELSE status END,"
+            "next_attempt=CASE WHEN skip_reason IN ('missing','source_changed') THEN 0 ELSE next_attempt END,"
+            "last_error=CASE WHEN skip_reason IN ('missing','source_changed') THEN NULL ELSE last_error END,"
+            "skip_reason=CASE WHEN skip_reason IN ('missing','source_changed') THEN NULL ELSE skip_reason END WHERE id=?",
             values[1:4] + (remote_path, remote_key, scan_id, now, row["id"]),
         )
 
     def _ingest(self, batch: list[tuple], result: ScanResult) -> None:
         now = time.time()
         with self._transaction():
+            highest_id = self._job_id_high_water()
+            next_id = highest_id + 1
             for values in batch:
                 result.seen += 1
                 # A name collision must not leave half an update behind, such
@@ -932,18 +1105,19 @@ class Queue:
                             result.moved += 1
                         else:
                             self._db.execute(
-                                "INSERT INTO jobs(root_id,relative_path,local_path,local_key,remote_path,remote_key,"
+                                "INSERT INTO jobs(id,root_id,relative_path,local_path,local_key,remote_path,remote_key,"
                                 "size,mtime_ns,device,inode,created_at,updated_at,seen_scan,next_attempt) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                                values + (now, now, result.scan_id),
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                                (next_id,) + values + (now, now, result.scan_id),
                             )
+                            next_id += 1
                             result.added += 1
                     else:
                         if row["root_id"] != values[0]:
                             raise ScanCollisionError(f"Source mapping changed for {values[2]}")
                         old_fingerprint = (row["size"], row["mtime_ns"], row["device"], str(row["inode"]))
                         if old_fingerprint != values[6:10]:
-                            self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (row["id"],))
+                            self._drop_intent(row["id"])
                             self._db.execute(
                                 "UPDATE jobs SET relative_path=?,local_path=?,local_key=?,remote_path=?,remote_key=?,"
                                 "size=?,mtime_ns=?,device=?,inode=?,status='pending',attempts=0,"
@@ -961,6 +1135,8 @@ class Queue:
                     result.error(f"Cannot map {values[2]} to {values[4]} (name collision or invalid name): {exc}")
                 finally:
                     self._db.execute("RELEASE SAVEPOINT ingest_task")
+            if next_id > highest_id + 1:
+                self._put_meta("_job_id_high_water", next_id - 1)
 
     @staticmethod
     def _job(row: sqlite3.Row, token: str, attempts: int) -> Job:
@@ -981,7 +1157,8 @@ class Queue:
             raise ValueError("max_attempts must be positive")
         partition = _size_partition(storage_mode)
         pending_index = "jobs_pending" if storage_mode is None else f"jobs_pending_{storage_mode}"
-        retry_index = "" if storage_mode is None else f" INDEXED BY jobs_retry_{storage_mode}"
+        retry_index = " INDEXED BY jobs_retry" if storage_mode is None else f" INDEXED BY jobs_retry_{storage_mode}"
+        refreshed: set[int] = set()
         while True:
             current = time.time() if now is None else now
             with self._transaction():
@@ -992,6 +1169,7 @@ class Queue:
                 # queue on *every* claim (quadratic at 300,000 photographs).
                 row = self._db.execute(
                     f"SELECT * FROM jobs{retry_index} WHERE status='failed' AND present=1 "
+                    "AND paused=0 AND remove_requested=0 "
                     "AND next_attempt IS NOT NULL AND next_attempt<=? "
                     f"AND {partition} AND (? IS NULL OR attempts<?) ORDER BY next_attempt,id LIMIT 1",
                     (current, max_attempts, max_attempts),
@@ -999,6 +1177,7 @@ class Queue:
                 if row is None:
                     row = self._db.execute(
                         f"SELECT * FROM jobs INDEXED BY {pending_index} WHERE status='pending' AND present=1 "
+                        "AND paused=0 AND remove_requested=0 "
                         f"AND {partition} AND (? IS NULL OR attempts<?) ORDER BY id LIMIT 1",
                         (max_attempts, max_attempts),
                     ).fetchone()
@@ -1017,7 +1196,8 @@ class Queue:
                 self._invalidate_claim(job, None)
                 continue
             if snapshot != _job_snapshot(job):
-                self._invalidate_claim(job, snapshot)
+                self._invalidate_claim(job, snapshot, retry=job.id not in refreshed)
+                refreshed.add(job.id)
                 continue
             return job
 
@@ -1033,11 +1213,11 @@ class Queue:
             raise StaleClaimError(f"Claim for job {job.id} is no longer current.")
         return row
 
-    def _invalidate_claim(self, job: Job, snapshot: tuple[int, int, int, int] | None) -> None:
+    def _invalidate_claim(self, job: Job, snapshot: tuple[int, int, int, int] | None, *, retry: bool = False) -> None:
         with self._transaction():
             self._require_claim(job)
             if snapshot is None:
-                self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
+                self._drop_intent(job.id)
                 self._db.execute(
                     "UPDATE jobs SET status='skipped',skip_reason='missing',present=0,claim_token=NULL,"
                     "storage_mode=NULL,last_error='Source is missing, inaccessible, or no longer a regular file',updated_at=? WHERE id=?",
@@ -1056,16 +1236,19 @@ class Queue:
                         "last_error='Source changed, but the current cloud destination conflicts with another task' "
                         "WHERE id=?", (time.time(), job.id),
                     )
+                    self._finalize_control(job.id)
                     return
-                self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
+                self._drop_intent(job.id)
                 self._db.execute(
-                    "UPDATE jobs SET size=?,mtime_ns=?,device=?,inode=?,status='pending',attempts=0,next_attempt=0,"
+                    "UPDATE jobs SET size=?,mtime_ns=?,device=?,inode=?,status=?,attempts=0,next_attempt=?,"
                     "claim_token=NULL,last_error='Source changed; any remote partial result must be reconciled',"
-                    "remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,skip_reason=NULL,updated_at=?,"
+                    "remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,skip_reason=?,updated_at=?,"
                     "remote_path=?,remote_key=? "
                     "WHERE id=?",
-                    snapshot[:3] + (str(snapshot[3]), time.time(), remote, _remote_key(remote), job.id),
+                    snapshot[:3] + (str(snapshot[3]), "pending" if retry else "failed", 0 if retry else None,
+                                    None if retry else "source_changed", time.time(), remote, _remote_key(remote), job.id),
                 )
+            self._finalize_control(job.id)
 
     def save_commit_intent(self, job: Job, cloud_hash: str, *, storage_mode: str = "unlimited") -> None:
         """Durably record intent BEFORE the server-side add/commit request.
@@ -1103,12 +1286,14 @@ class Queue:
                         raise QueueError("A different commit hash already exists for the unchanged source; investigate before retrying.")
                     # Do not retain confirmation of either storage mode.
                     # A fresh add needs a fresh affirmative server response.
+                self._archive_intent(job.id)
             intent = {
                 "cloud_hash": cloud_hash, "remote_path": job.remote_path,
                 "source_size": job.size, "source_mtime_ns": job.mtime_ns,
                 "device": job.device, "inode": job.inode,
                 "account_id": account, "destination": self.destination, "created_at": time.time(),
                 "storage_mode": storage_mode,
+                "intent_id": uuid.uuid4().hex,
             }
             self._db.execute(
                 "INSERT INTO commit_intents(job_id,source_size,source_mtime_ns,device,inode,remote_path,cloud_hash,created_at,intent_json) "
@@ -1139,7 +1324,7 @@ class Queue:
             if (fingerprint != _job_snapshot(job) or row["remote_path"] != job.remote_path
                     or intent.get("account_id") != self._get_meta("_account_id")
                     or intent.get("destination") != self.destination):
-                self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
+                self._drop_intent(job.id)
                 return None
             # Schema-1 clients before regular uploads only wrote unlimited
             # intents. Normalize them in memory without making every read write.
@@ -1166,13 +1351,6 @@ class Queue:
     def _confirm_commit(self, job: Job, cloud_hash: str, *, storage_mode: str) -> None:
         if not isinstance(cloud_hash, str) or not cloud_hash or any(c in cloud_hash for c in ("\x00", "\n", "\r")):
             raise ValueError("cloud_hash must be a nonempty hash string")
-        try:
-            snapshot = _snapshot(job.local_path)
-        except OSError:
-            snapshot = None
-        if snapshot != _job_snapshot(job):
-            self._invalidate_claim(job, snapshot)
-            raise FileChangedError(f"Source changed before saving {storage_mode} confirmation: {job.local_path}")
         with self._transaction():
             claimed = self._require_claim(job)
             row = self._db.execute("SELECT * FROM commit_intents WHERE job_id=?", (job.id,)).fetchone()
@@ -1203,6 +1381,17 @@ class Queue:
                              (json.dumps(intent, ensure_ascii=False, allow_nan=False), job.id))
             self._db.execute("UPDATE jobs SET storage_mode=? WHERE id=?", (storage_mode, job.id))
 
+            self._archive_intent(job.id)
+        # The accepted remote receipt is already durable before inspecting a
+        # local file that may have been replaced, moved, or removed meanwhile.
+        try:
+            snapshot = _snapshot(job.local_path)
+        except OSError:
+            snapshot = None
+        if snapshot != _job_snapshot(job):
+            self._invalidate_claim(job, snapshot)
+            raise FileChangedError(f"Source changed after saving {storage_mode} confirmation: {job.local_path}")
+
     def mark_uploaded(
         self,
         job: Job,
@@ -1211,18 +1400,12 @@ class Queue:
         remote_id: str | None = None,
         verified_metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        """Record a transport-confirmed commit, retaining its evidence separately.
+        """Persist verified remote proof before checking the local source.
 
-        Never call merely because bytes reached an upload endpoint.  The
-        transport must verify the committed remote object and its storage mode.
+        The transport may call this only after verifying the committed object,
+        its hash, size and storage mode. A subsequent local change does not
+        revoke that proof; it prevents marking the newer local file uploaded.
         """
-        try:
-            snapshot = _snapshot(job.local_path)
-        except OSError:
-            snapshot = None
-        if snapshot != _job_snapshot(job):
-            self._invalidate_claim(job, snapshot)
-            raise FileChangedError(f"Source changed during upload: {job.local_path}")
         metadata = dict(verified_metadata or {})
         storage_mode = metadata.setdefault("storage_mode", "unlimited")
         if storage_mode not in _STORAGE_MODES:
@@ -1236,18 +1419,29 @@ class Queue:
             if claimed["storage_mode"] not in (None, storage_mode):
                 raise QueueError("Verified storage mode does not match the saved commit intent.")
             self._db.execute(
-                "INSERT INTO upload_results(job_id,account_id,local_path,local_key,remote_path,"
+                "INSERT INTO upload_results(job_id,origin_job_id,account_id,local_path,local_key,remote_path,"
                 "source_size,source_mtime_ns,source_device,source_inode,remote_hash,remote_id,verified_metadata,uploaded_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (job.id, self._get_meta("_account_id"), job.local_path, claimed["local_key"], job.remote_path,
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job.id, job.id, self._get_meta("_account_id"), job.local_path, claimed["local_key"], job.remote_path,
                  job.size, job.mtime_ns, job.device, str(job.inode), remote_hash, remote_id, evidence, now),
             )
+            self._archive_intent(job.id)
+        try:
+            snapshot = _snapshot(job.local_path)
+        except OSError:
+            snapshot = None
+        if snapshot != _job_snapshot(job):
+            self._invalidate_claim(job, snapshot)
+            raise FileChangedError(f"Source changed during upload: {job.local_path}")
+        with self._transaction():
+            self._require_claim(job)
             self._db.execute(
                 "UPDATE jobs SET status='uploaded',claim_token=NULL,last_error=NULL,skip_reason=NULL,"
                 "remote_hash=?,remote_id=?,verified_metadata=?,storage_mode=?,uploaded_at=?,updated_at=?,next_attempt=NULL WHERE id=?",
                 (remote_hash, remote_id, evidence, storage_mode, now, now, job.id),
             )
-            self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
+            self._drop_intent(job.id)
+            self._finalize_control(job.id, uploaded=True)
 
     def mark_failed(self, job: Job, error: str, *, retry_delay: float | None = 60, now: float | None = None) -> None:
         """retry_delay=None makes a failure permanent until explicit retry."""
@@ -1260,6 +1454,7 @@ class Queue:
                 "UPDATE jobs SET status='failed',claim_token=NULL,last_error=?,next_attempt=?,updated_at=? WHERE id=?",
                 (str(error)[:16384], None if retry_delay is None else current + retry_delay, current, job.id),
             )
+            self._finalize_control(job.id)
 
     def mark_skipped(self, job: Job, reason: str, *, code: str = "manual") -> None:
         if not isinstance(code, str) or not code or "\x00" in code:
@@ -1267,11 +1462,12 @@ class Queue:
         with self._transaction():
             self._require_claim(job)
             if code != "large_files_disabled":
-                self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
+                self._drop_intent(job.id)
             self._db.execute(
                 "UPDATE jobs SET status='skipped',skip_reason=?,claim_token=NULL,last_error=?,"
                 "next_attempt=NULL,updated_at=? WHERE id=?", (code, str(reason)[:16384], time.time(), job.id),
             )
+            self._finalize_control(job.id)
 
     def skip_large_disabled(self) -> int:
         """Park oversized ready/retryable files without losing commit evidence.
@@ -1283,7 +1479,7 @@ class Queue:
             return self._db.execute(
                 "UPDATE jobs SET status='skipped',skip_reason='large_files_disabled',claim_token=NULL,"
                 "last_error=?,next_attempt=NULL,updated_at=? "
-                f"WHERE present=1 AND {_SIZE_PARTITIONS['regular']} AND "
+                f"WHERE present=1 AND paused=0 AND remove_requested=0 AND {_SIZE_PARTITIONS['regular']} AND "
                 "(status='pending' OR (status='failed' AND next_attempt IS NOT NULL))",
                 (_LARGE_FILES_DISABLED_REASON, time.time()),
             ).rowcount
@@ -1298,7 +1494,7 @@ class Queue:
             return self._db.execute(
                 "UPDATE jobs SET status='pending',attempts=0,next_attempt=0,claim_token=NULL,"
                 "last_error=NULL,skip_reason=NULL,updated_at=? "
-                f"WHERE present=1 AND {_SIZE_PARTITIONS['regular']} AND status='skipped' AND "
+                f"WHERE present=1 AND paused=0 AND remove_requested=0 AND {_SIZE_PARTITIONS['regular']} AND status='skipped' AND "
                 "(skip_reason='large_files_disabled' OR (skip_reason='manual' AND last_error=?))",
                 (time.time(), _LEGACY_LARGE_FILE_ERROR),
             ).rowcount
@@ -1316,6 +1512,7 @@ class Queue:
                 "next_attempt=0,last_error=?,updated_at=? WHERE id=?",
                 (str(reason)[:16384], time.time(), job.id),
             )
+            self._finalize_control(job.id)
 
     def recover_running(self) -> int:
         """Recover interrupted claims without spending unfinished attempts.
@@ -1327,18 +1524,20 @@ class Queue:
         lock = contextlib.nullcontext() if owns_lock else self.exclusive_run()
         with lock, _file_lock(self.path + ".scan.lock"), self._transaction():
             self._db.execute("DELETE FROM metadata WHERE key='_scan_token'")
-            cursor = self._db.execute(
+            count = self._db.execute("SELECT COUNT(*) FROM jobs WHERE status='running'").fetchone()[0]
+            self._delete_tasks("remove_requested=1")
+            self._db.execute(
                 "UPDATE jobs SET status='pending',attempts=MAX(0,attempts-1),claim_token=NULL,next_attempt=0,updated_at=?,"
                 "last_error='Interrupted upload; reconcile remote state before retry' WHERE status='running'",
                 (time.time(),),
             )
-            return cursor.rowcount
+            return count
 
     def retry_failed(self, *, include_permanent: bool = False) -> int:
         with self._transaction():
             return self._db.execute(
                 "UPDATE jobs SET status='pending',attempts=0,next_attempt=0,last_error=NULL,updated_at=? "
-                "WHERE status='failed' AND present=1 AND (? OR next_attempt IS NOT NULL)",
+                "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND (? OR next_attempt IS NOT NULL)",
                 (time.time(), int(include_permanent)),
             ).rowcount
 
@@ -1356,27 +1555,38 @@ class Queue:
                 counts[row["status"]] = row["n"]
                 sizes[row["status"]] = row["bytes"]
             ready = self._db.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE {partition} AND present=1 AND (status='pending' OR "
+                f"SELECT COUNT(*) FROM jobs WHERE {partition} AND present=1 AND paused=0 AND remove_requested=0 AND (status='pending' OR "
                 "(status='failed' AND next_attempt IS NOT NULL AND next_attempt<=?))", (current,),
             ).fetchone()[0]
             next_retry = self._db.execute(
-                f"SELECT MIN(next_attempt) FROM jobs WHERE {partition} AND status='failed' AND present=1 AND next_attempt>?",
+                f"SELECT MIN(next_attempt) FROM jobs WHERE {partition} AND status='failed' AND present=1 "
+                "AND paused=0 AND remove_requested=0 AND next_attempt>?",
                 (current,),
             ).fetchone()[0]
             permanent = self._db.execute(
                 f"SELECT COUNT(*) FROM jobs WHERE {selected} AND status='failed' AND next_attempt IS NULL"
             ).fetchone()[0]
+            controls = self._db.execute(
+                f"SELECT COALESCE(SUM(paused),0) AS paused,COALESCE(SUM(remove_requested),0) AS removing,"
+                "COALESCE(SUM(CASE WHEN present=1 AND paused=0 AND remove_requested=0 AND (status IN ('pending','running') "
+                "OR (status='failed' AND next_attempt IS NOT NULL)) THEN 1 ELSE 0 END),0) AS remaining,"
+                "COALESCE(SUM(CASE WHEN status IN ('uploaded','skipped') OR "
+                "(status='failed' AND next_attempt IS NULL) THEN 1 ELSE 0 END),0) AS processed,"
+                "COALESCE(SUM(CASE WHEN status IN ('uploaded','skipped') OR "
+                f"(status='failed' AND next_attempt IS NULL) THEN size ELSE 0 END),0) AS processed_bytes FROM jobs WHERE {selected}"
+            ).fetchone()
             return {
                 **counts, "total": sum(counts.values()), "total_bytes": sum(sizes.values()),
                 "uploaded_bytes": sizes["uploaded"], "bytes_by_status": sizes,
                 "ready": ready, "permanent_failures": permanent, "next_retry_at": next_retry,
                 "scan_active": bool(self._get_meta("_scan_token")),
                 "roots": self._db.execute("SELECT COUNT(*) FROM roots").fetchone()[0],
+                **dict(controls),
             }
 
     def list_jobs(self, status: str | None = None, *, limit: int = 100, offset: int = 0,
                   summary: bool = False, include_missing: bool = False) -> list[dict[str, Any]]:
-        if status is not None and status not in STATES:
+        if status is not None and status not in (*STATES, "paused"):
             raise ValueError(f"Unknown status: {status}")
         if not 1 <= limit <= 10000 or offset < 0:
             raise ValueError("limit must be in 1..10000 and offset nonnegative")
@@ -1386,12 +1596,15 @@ class Queue:
         conditions = [] if include_missing else ["present=1"]
         parameters = []
         if status is not None:
-            conditions.append("status=?")
-            parameters.append(status)
+            if status == "paused":
+                conditions.append("paused=1")
+            else:
+                conditions.append("status=?")
+                parameters.append(status)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         parameters.extend((limit, offset))
         with self._mutex:
-            return [dict(row) for row in self._db.execute(
+            return [self._task_dict(row) for row in self._db.execute(
                 f"SELECT {columns} FROM jobs{where} ORDER BY id LIMIT ? OFFSET ?",
                 parameters,
             )]
@@ -1401,12 +1614,23 @@ class Queue:
         where = "id=?" if include_missing else "id=? AND present=1"
         with self._mutex:
             row = self._db.execute(f"SELECT * FROM jobs WHERE {where}", (job_id,)).fetchone()
-            return dict(row) if row is not None else None
+            return self._task_dict(row) if row is not None else None
 
-    def upload_history(self, job_id: int) -> list[dict[str, Any]]:
+    def commit_history(self, job_id: int | None, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Receipts are attempted/accepted commits, never upload success flags."""
+        if not 1 <= limit <= 10000:
+            raise ValueError("limit must be in 1..10000")
+        with self._mutex:
+            column = "job_id" if job_id is None else "origin_job_id"
+            return [dict(row) for row in self._db.execute(
+                f"SELECT * FROM commit_evidence WHERE {column} IS ? ORDER BY id DESC LIMIT ?", (job_id, limit),
+            )]
+
+    def upload_history(self, job_id: int | None) -> list[dict[str, Any]]:
         with self._mutex:
             result = []
-            for row in self._db.execute("SELECT * FROM upload_results WHERE job_id=? ORDER BY id", (job_id,)):
+            column = "job_id" if job_id is None else "origin_job_id"
+            for row in self._db.execute(f"SELECT * FROM upload_results WHERE {column} IS ? ORDER BY id", (job_id,)):
                 item = dict(row)
                 item["verified_metadata"] = json.loads(item["verified_metadata"] or "{}")
                 result.append(item)
