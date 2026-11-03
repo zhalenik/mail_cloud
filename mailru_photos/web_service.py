@@ -55,7 +55,7 @@ class WebService:
         self._closed = False
         self._files: dict[int, dict] = {}
         self._uploaded_in_run = 0
-        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True, "upload_large_files": False}
+        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True}
         stored = self._read_json("web_settings.json", {})
         if isinstance(stored, dict):
             if type(stored.get("workers")) is int and 1 <= stored["workers"] <= 16:
@@ -64,8 +64,6 @@ class WebService:
                 self._settings["auto_resume"] = stored["auto_resume"]
             if type(stored.get("preflight_check")) is bool:
                 self._settings["preflight_check"] = stored["preflight_check"]
-            if type(stored.get("upload_large_files")) is bool:
-                self._settings["upload_large_files"] = stored["upload_large_files"]
         previous = self._read_json("web_activity.json", {})
         self._logout_requested = isinstance(previous, dict) and previous.get("logout_requested") is True
         self._resume_upload = (isinstance(previous, dict) and previous.get("resume_upload") is True
@@ -88,8 +86,6 @@ class WebService:
                 with self._queue() as queue, queue.exclusive_run():
                     recovered = queue.recover_running()
                     queue.upgrade_media_discovery()
-                    if self._settings["upload_large_files"]:
-                        queue.retry_large_skipped()
                     if recovered:
                         self._activity["message"] = f"Восстановлено незавершённых заданий: {recovered}."
             self._authenticated = False
@@ -224,7 +220,7 @@ class WebService:
         return {"ok": True, "source": dataclasses.asdict(root)}
 
     def settings(self, workers: int | None = None, auto_resume: bool | None = None,
-                 preflight_check: bool | None = None, upload_large_files: bool | None = None) -> dict:
+                 preflight_check: bool | None = None) -> dict:
         with self._lock:
             self._ensure_idle()
             updated = dict(self._settings)
@@ -240,21 +236,8 @@ class WebService:
                 if type(preflight_check) is not bool:
                     raise ValueError("Предварительная проверка должна быть включена или выключена.")
                 updated["preflight_check"] = preflight_check
-            if upload_large_files is not None:
-                if type(upload_large_files) is not bool:
-                    raise ValueError("Загрузка больших файлов должна быть включена или выключена.")
-                updated["upload_large_files"] = upload_large_files
-            restored = 0
-            if upload_large_files is True and self._configuration is not None:
-                with self._queue() as queue, queue.exclusive_run():
-                    restored = queue.retry_large_skipped()
-                    write_json(self.state_dir / "web_settings.json", updated)
-            else:
-                write_json(self.state_dir / "web_settings.json", updated)
+            write_json(self.state_dir / "web_settings.json", updated)
             self._settings = updated
-            if restored:
-                self._invalidate_stats()
-                self._event(f"Большие файлы возвращены в очередь для обычного хранения: {restored:,}.")
             return {"ok": True, "settings": dict(self._settings)}
 
     def folders(self, path: str | None = None) -> dict:
@@ -527,10 +510,8 @@ class WebService:
             elif event == "file_started":
                 self._files[data["job_id"]] = {"id": data["job_id"], "path": data["path"], "size": data["size"],
                                                "sent": 0, "stage": "preparing", "storage_mode": data.get("storage_mode")}
-            elif event == "regular_uploads":
-                self._phase("uploading", "Загружаем файлы больше 2 ГБ в обычное Облако. Они занимают место по тарифу.")
             elif event == "large_files_skipped":
-                self._event(f"Пропущено файлов больше 2 ГБ: {data['count']:,}. Обычное хранение выключено.")
+                self._event(f"Пропущено файлов больше 2 ГБ: {data['count']:,}. Этот размер не поддерживается автозагрузкой.")
             elif event == "upload_progress":
                 item = self._files.get(data["job_id"])
                 if item:
@@ -698,11 +679,10 @@ class WebService:
             if not isinstance(last_scan, dict) or last_scan.get("complete") is not True:
                 self._scan_queue(queue)
             self._check_stop()
-            if not self._settings["upload_large_files"]:
-                skipped = queue.skip_large_disabled()
-                if skipped:
-                    self._emit("large_files_skipped", {"count": skipped})
-                    self._invalidate_stats()
+            skipped = queue.skip_large_disabled()
+            if skipped:
+                self._emit("large_files_skipped", {"count": skipped})
+                self._invalidate_stats()
             stats = queue.stats()
             remaining = stats["pending"] + stats["running"] + stats["failed"] - stats["permanent_failures"]
             old_probe = queue.get_metadata("probe", {})
@@ -743,8 +723,7 @@ class WebService:
                 self._check_stop()
                 self._phase("uploading", "Загружаем фото и видео в безлимит…")
                 result = run(queue, api, workers=self._settings["workers"], emit=self._emit,
-                             file_progress=True, require_probe=preflight_check,
-                             upload_large_files=self._settings["upload_large_files"])
+                             file_progress=True, require_probe=preflight_check)
                 if self._pause_requested or self._shutting_down:
                     raise Cancelled("Приостановлено.")
                 if result.get("stopped"):

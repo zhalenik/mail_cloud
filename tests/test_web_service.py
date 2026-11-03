@@ -39,7 +39,7 @@ class UICloud(FakeCloud):
         self.upload_started = threading.Event()
     def account_info(self):
         return self.require_account()
-    def _upload_blob(self, path, digest, identity, *, progress=None, is_retried=False, upload_type="AUTO"):
+    def _upload_blob(self, path, digest, identity, *, progress=None, is_retried=False):
         self.upload_started.set()
         while self.block_upload:
             if self.stop.is_set() and self.stop_error is not None:
@@ -48,7 +48,7 @@ class UICloud(FakeCloud):
             time.sleep(0.002)
         if progress:
             progress(identity.size)
-        return super()._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried, upload_type=upload_type)
+        return super()._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried)
 
 
 class WebServiceTests(unittest.TestCase):
@@ -93,18 +93,7 @@ class WebServiceTests(unittest.TestCase):
             stream.truncate(UNLIMITED_MAX_BYTES + 1024)
         return path
 
-    @staticmethod
-    def bounded_hash(path, *, expected, stop):
-        if expected.size > UNLIMITED_MAX_BYTES:
-            return hashlib.sha1(Path(path).name.encode('utf-8')).hexdigest().upper(), expected
-        return cloud_hash(path, expected=expected, stop=stop)
 
-    def allow_regular_capacity(self):
-        self.cloud.upload_limit = self.cloud.total_bytes = 100_000_000_000
-        # Quota changes even between reads before the first commit. A stale
-        # empty unlimited phase must not stop an ordinary-only queue.
-        self.cloud.quota_rule = lambda client: (
-            100 + client.quota_calls + sum(item['size'] for item in client.regular_commits))
 
     def done(self, service=None):
         service = service or self.service
@@ -161,7 +150,7 @@ class WebServiceTests(unittest.TestCase):
 
     def test_large_media_default_is_visible_as_skipped_without_hashing_or_probe(self):
         path = self.large_video()
-        self.assertIs(self.service.snapshot()['settings']['upload_large_files'], False)
+        self.assertNotIn('upload_large_files', self.service.snapshot()['settings'])
         with patch('mailru_photos.api.cloud_hash', side_effect=AssertionError('Large source must not be read')), \
                 patch('mailru_photos.web_service.probe', side_effect=AssertionError('No eligible probe sample')):
             self.service.start()
@@ -180,161 +169,30 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(self.cloud.commits, [])
         self.service.close()
         replacement = self.make_service()
-        self.assertIs(replacement.snapshot()['settings']['upload_large_files'], False)
+        self.assertNotIn('upload_large_files', replacement.snapshot()['settings'])
         self.assertEqual(replacement.jobs(status='skipped')['jobs'][0]['id'], job['id'])
         self.assertFalse(replacement.resume_if_requested())
 
-    def test_large_opt_in_restores_only_size_skips_and_persists_on_restart(self):
-        for name in ('disabled.mp4', 'legacy.mov', 'unsupported.mkv'):
-            self.large_video(name)
-        self.service.scan()
-        self.done()
-        with Queue(self.state / 'queue.sqlite3', destination='/Archive') as queue, queue.exclusive_run():
-            while job := queue.claim():
-                if Path(job.local_path).name == 'disabled.mp4':
-                    queue.mark_skipped(job, 'Disabled by setting', code='large_files_disabled')
-                elif Path(job.local_path).name == 'legacy.mov':
-                    queue.mark_skipped(job, 'Файл больше 2 ГБ; он не отправлен обычной загрузкой.')
-                else:
-                    queue.mark_skipped(job, 'Unsupported media reported by the server')
-        self.service._invalidate_stats()
-        before = {Path(item['remote_path']).name: item['id'] for item in self.service.jobs()['jobs']}
-        self.assertEqual(self.service.snapshot()['stats']['skipped'], 3)
-        self.service.settings(upload_large_files=True)
-        state = self.service.snapshot()
-        self.assertIs(state['settings']['upload_large_files'], True)
-        self.assertIs(state['settings']['preflight_check'], True)
-        self.assertEqual(state['stats']['pending'], 2)
-        self.assertEqual(state['stats']['skipped'], 1)
-        self.assertEqual(self.cloud.commits, [], 'Changing a setting must not start uploading')
-        self.assertIs(json.loads((self.state / 'web_settings.json').read_text())['upload_large_files'], True)
-        self.service.close()
-        replacement = self.make_service()
-        self.assertIs(replacement.snapshot()['settings']['upload_large_files'], True)
-        self.assertEqual(replacement.snapshot()['stats']['pending'], 2)
-        jobs = {Path(item['remote_path']).name: item for item in replacement.jobs()['jobs']}
-        self.assertEqual({name: item['id'] for name, item in jobs.items()}, before)
-        self.assertEqual(jobs['disabled.mp4']['status'], 'pending')
-        self.assertEqual(jobs['legacy.mov']['status'], 'pending')
-        self.assertEqual(jobs['unsupported.mkv']['status'], 'skipped')
-        self.assertEqual(jobs['unsupported.mkv']['last_error'], 'Unsupported media reported by the server')
-        self.assertFalse(replacement.resume_if_requested())
 
-    def test_large_only_start_with_preflight_enabled_accepts_quota_growth_and_restarts(self):
+
+
+
+
+    def test_legacy_large_upload_setting_cannot_enable_ordinary_storage(self):
         self.large_video()
-        self.allow_regular_capacity()
-        # First run parks the file. The GUI toggle must make that same job
-        # runnable without another scan or an explicit retry command.
-        self.service.start()
-        self.assertEqual(self.done()['stats']['skipped'], 1)
-        job_id = self.service.jobs()['jobs'][0]['id']
-        self.service.settings(upload_large_files=True)
-        self.assertIs(self.service.snapshot()['settings']['preflight_check'], True)
-        with patch('mailru_photos.api.cloud_hash', side_effect=self.bounded_hash), \
-                patch('mailru_photos.web_service.probe', side_effect=AssertionError('Ordinary file is not a probe')):
-            self.service.start()
-            state = self.done()
-        self.assertEqual(state['activity']['phase'], 'completed', state)
-        self.assertEqual(state['stats']['uploaded'], 1)
-        self.assertEqual(state['stats']['skipped'], 0)
-        self.assertEqual(state['stats']['failed'], 0)
-        self.assertIsNone(state['probe'])
-        self.assertEqual(self.cloud.stop.waits, [])
-        self.assertEqual(self.cloud.upload_types, ['MANUAL'])
-        self.assertEqual(len(self.cloud.regular_commits), 1)
+        self.photos_count(1)
+        self.service.close()
+        write_json(self.state / 'web_settings.json', {
+            'workers': 2, 'auto_resume': True, 'preflight_check': False,
+            'upload_large_files': True})
+        replacement = self.make_service()
+        self.assertNotIn('upload_large_files', replacement.snapshot()['settings'])
+        replacement.start()
+        state = self.done(replacement)
+        self.assertEqual(state['stats']['uploaded'], 1, state)
+        self.assertEqual(state['stats']['skipped'], 1, state)
+        self.assertTrue(all(item['unlimited_upload'] is True for item in self.cloud.commits))
         self.assertEqual(len(self.cloud.commits), 1)
-        self.assertEqual(self.service.jobs()['jobs'][0]['storage_mode'], 'regular')
-        with Queue(self.state / 'queue.sqlite3', destination='/Archive') as queue:
-            report = queue.get_metadata('last_run')
-            self.assertEqual([phase['storage_mode'] for phase in report['phases']], ['regular'])
-            self.assertFalse(report['stopped'])
-            proof = queue.upload_history(job_id)[0]['verified_metadata']
-            self.assertEqual(proof['regular_evidence'], 'commit_response')
-            self.assertNotIn('is_unlim_upload', proof)
-        self.service.close()
-        replacement = self.make_service()
-        self.assertIs(replacement.snapshot()['settings']['upload_large_files'], True)
-        self.assertIs(replacement.snapshot()['settings']['preflight_check'], True)
-        with patch('mailru_photos.api.cloud_hash', side_effect=AssertionError('Completed file must not be rehashed')), \
-                patch('mailru_photos.web_service.probe', side_effect=AssertionError('Completed queue needs no probe')):
-            replacement.start()
-            self.assertEqual(self.done(replacement)['stats']['uploaded'], 1)
-        self.assertEqual(replacement.jobs()['jobs'][0]['id'], job_id)
-        self.assertEqual(len(self.cloud.commits), 1)
-
-    def test_large_opt_in_and_pending_job_survive_shutdown_for_automatic_resume(self):
-        self.large_video()
-        self.allow_regular_capacity()
-        self.service.settings(workers=1, upload_large_files=True)
-        self.cloud.block_upload = True
-        with patch('mailru_photos.api.cloud_hash', side_effect=self.bounded_hash), \
-                patch('mailru_photos.web_service.probe', side_effect=AssertionError('Ordinary-only resume needs no probe')):
-            self.service.start()
-            self.assertTrue(self.cloud.upload_started.wait(2))
-            job_id = self.service.jobs()['jobs'][0]['id']
-            self.service.close(timeout=2)
-            self.assertTrue(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
-            self.assertEqual(self.service.snapshot()['stats']['pending'], 1)
-            self.assertEqual(self.cloud.commits, [])
-            self.cloud.block_upload = False
-            replacement = self.make_service()
-            self.assertIs(replacement.snapshot()['settings']['upload_large_files'], True)
-            self.assertIs(replacement.snapshot()['settings']['preflight_check'], True)
-            self.assertTrue(replacement.resume_if_requested())
-            state = self.done(replacement)
-        self.assertEqual(state['activity']['phase'], 'completed', state)
-        self.assertEqual(state['stats']['uploaded'], 1)
-        self.assertEqual(state['stats']['running'], 0)
-        self.assertEqual(state['stats']['failed'], 0)
-        self.assertEqual(replacement.jobs()['jobs'][0]['id'], job_id)
-        self.assertEqual(self.cloud.upload_types, ['MANUAL'])
-        self.assertEqual(len(self.cloud.regular_commits), 1)
-        self.assertIsNone(state['probe'])
-        self.assertFalse(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
-
-    def test_external_queue_owner_blocks_large_opt_in_without_partial_setting_or_requeue(self):
-        self.large_video()
-        self.service.start()
-        self.assertEqual(self.done()['stats']['skipped'], 1)
-        self.service.settings(workers=3)
-        before = self.service.snapshot()['settings']
-        settings_file = self.state / 'web_settings.json'
-        saved_before = settings_file.read_bytes()
-        job_id = self.service.jobs()['jobs'][0]['id']
-        with Queue(self.state / 'queue.sqlite3', destination='/Archive') as other, other.exclusive_run():
-            with self.assertRaises(QueueBusyError):
-                self.service.settings(workers=4, auto_resume=False, preflight_check=False, upload_large_files=True)
-            self.assertEqual(self.service.snapshot()['settings'], before)
-            self.assertEqual(settings_file.read_bytes(), saved_before)
-            self.assertEqual(other.stats()['skipped'], 1)
-            self.assertEqual(other.stats()['pending'], 0)
-        self.service.close()
-        replacement = self.make_service()
-        self.assertEqual(replacement.snapshot()['settings'], before)
-        self.assertIs(replacement.snapshot()['settings']['upload_large_files'], False)
-        job = replacement.jobs()['jobs'][0]
-        self.assertEqual(job['id'], job_id)
-        self.assertEqual(job['skip_reason'], 'large_files_disabled')
-
-    def test_invalid_large_setting_is_atomic_and_omitted_setting_preserves_opt_in(self):
-        self.service.settings(workers=3)
-        before = self.service.snapshot()['settings']
-        settings_file = self.state / 'web_settings.json'
-        saved_before = settings_file.read_bytes()
-        for invalid in (0, 1, 'true', 'false', [], {}, 1.0):
-            with self.subTest(value=invalid), self.assertRaises(ValueError):
-                self.service.settings(workers=4, auto_resume=False, preflight_check=False, upload_large_files=invalid)
-            self.assertEqual(self.service.snapshot()['settings'], before)
-            self.assertEqual(settings_file.read_bytes(), saved_before)
-        self.service.settings(upload_large_files=True)
-        self.service.settings(workers=4, auto_resume=False)
-        state = self.service.snapshot()['settings']
-        self.assertIs(state['upload_large_files'], True)
-        self.assertIs(state['preflight_check'], True)
-        self.assertEqual(state['workers'], 4)
-        self.assertIs(state['auto_resume'], False)
-        self.service.close()
-        self.assertEqual(self.make_service().snapshot()['settings'], state)
 
     def test_upgrade_rescans_old_photo_filter_once_and_retains_completed_photos(self):
         from mailru_photos.queue import PHOTO_EXTENSIONS
@@ -480,7 +338,7 @@ class WebServiceTests(unittest.TestCase):
         write_json(self.state / 'web_settings.json', {'workers': 3, 'auto_resume': False})
         replacement = self.make_service()
         self.assertEqual(replacement.snapshot()['settings'],
-                         {'workers': 3, 'auto_resume': False, 'preflight_check': True, 'upload_large_files': False})
+                         {'workers': 3, 'auto_resume': False, 'preflight_check': True})
 
     def test_container_lifecycle_logs_do_not_echo_private_messages(self):
         private_message = "test-only-sensitive-value"
@@ -712,7 +570,7 @@ class WebServiceTests(unittest.TestCase):
         replacement = self.make_service()
         self.assertFalse(replacement.resume_if_requested())
         state = replacement.snapshot()
-        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'preflight_check': True, 'upload_large_files': False})
+        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'preflight_check': True})
         self.assertEqual(state['activity']['phase'], 'paused')
 
     def test_dashboard_and_jobs_share_stats_until_expiry_without_sharing_mutable_data(self):

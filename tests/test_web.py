@@ -134,30 +134,14 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response['status'], 400)
         self.assertEqual(len(self.service.calls), calls)
 
-    def test_large_upload_setting_accepts_only_explicit_boolean_and_preserves_omission(self):
+    def test_removed_large_upload_setting_is_rejected_without_partial_change(self):
         self.authenticate()
-        for enabled in (True, False):
-            result = self.request('/api/settings', method='POST', data={
-                'workers': 2, 'auto_resume': True, 'preflight_check': True,
-                'upload_large_files': enabled,
-            })
-            self.assertEqual(result['status'], 200)
-            self.assertEqual(self.service.calls[-1][0], 'settings')
-            self.assertIs(self.service.calls[-1][1]['upload_large_files'], enabled)
-        # Old clients that omit the new field must not disable a persisted
-        # user choice. None is the controller's preserve-existing sentinel.
-        result = self.request('/api/settings', method='POST', data={'workers': 3, 'auto_resume': False})
-        self.assertEqual(result['status'], 200)
-        self.assertIsNone(self.service.calls[-1][1]['upload_large_files'])
         before = list(self.service.calls)
-        for value in (None, 0, 1, 'true', 'false', [], {}, 1.0):
-            with self.subTest(value=value):
-                result = self.request('/api/settings', method='POST', data={
-                    'workers': 4, 'auto_resume': True, 'preflight_check': False,
-                    'upload_large_files': value,
-                })
-                self.assertEqual(result['status'], 400)
-                self.assertEqual(self.service.calls, before, 'Invalid input must not partially change settings')
+        for value in (True, False, None, 'true'):
+            result = self.request('/api/settings', method='POST', data={
+                'workers': 2, 'auto_resume': True, 'upload_large_files': value})
+            self.assertEqual(result['status'], 400)
+            self.assertEqual(self.service.calls, before)
 
     def test_dns_rebinding_host_is_rejected_even_for_session(self):
         for host in ("attacker.invalid:8787", "localhost@attacker.invalid", "localhost/evil", "localhost:bad"):

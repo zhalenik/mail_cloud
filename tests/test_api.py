@@ -4,20 +4,43 @@ import io
 import json
 import os
 import tempfile
+import struct
 import unittest
 import uuid
-from dataclasses import replace
 from pathlib import Path
+from dataclasses import replace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from mailru_photos.api import (
-    API_BASE, UPLOAD_BASE, MAX_MEDIA_BYTES, AccountInfo, CloudAPI, FileIdentity, ProtocolError,
+    API_BASE, UPLOAD_BASE, MAX_MEDIA_BYTES, CloudAPI, FileIdentity, ProtocolError,
     RemoteConflict, RemoteError, SourceChanged, UnlimitedNotConfirmed, UnsupportedPhoto, cloud_hash, _retry_after,
 )
 from mailru_photos.auth import Tokens
-from mailru_photos.metadata import read_varint
 from mailru_photos.transport import HTTP, Response, TransportError, validate_url
+
+
+# Generated 16x16, one-frame MPEG-4/MP4. ffprobe validated this fixture;
+# appending a top-level free box below changes size without changing the video.
+# It tests wire routing, not the live service's eligibility decision.
+_MP4_ONE_FRAME = bytes.fromhex(
+    "0000001c6674797069736f6d0000020069736f6d69736f326d703431000003416d6f6f760000006c6d766864000000000000000000000000"
+    "000003e8000003e8000100000100000000000000000000000001000000000000000000000000000000010000000000000000000000000000"
+    "40000000000000000000000000000000000000000000000000000000000000020000026b7472616b0000005c746b68640000000300000000"
+    "000000000000000100000000000003e800000000000000000000000000000000000100000000000000000000000000000001000000000000"
+    "000000000000000040000000001000000010000000000024656474730000001c656c73740000000000000001000003e80000000000010000"
+    "000001e36d646961000000206d646864000000000000000000000000000040000000400055c400000000002d68646c720000000000000000"
+    "76696465000000000000000000000000566964656f48616e646c6572000000018e6d696e6600000014766d68640000000100000000000000"
+    "000000002464696e660000001c6472656600000000000000010000000c75726c20000000010000014e7374626c000000ea73747364000000"
+    "0000000001000000da6d70347600000000000000010000000000000000000000000000000000100010004800000048000000000000000113"
+    "4c61766336302e33312e313032206d706567340000000000000000000000000018ffff000000606573647300000000038080804f00010004"
+    "80808041201100000000030d4000000088058080802f000001b001000001b58913000001000000012000c48d88000d0084021463000001b2"
+    "4c61766336302e33312e3130320680808001020000001070617370000000010000000100000014627472740000000000030d400000008800"
+    "00001873747473000000000000000100000001000040000000001c7374736300000000000000010000000100000001000000010000001473"
+    "74737a000000000000001100000001000000147374636f00000000000000010000036d00000062756474610000005a6d6574610000000000"
+    "00002168646c7200000000000000006d6469726170706c0000000000000000000000002d696c737400000025a9746f6f0000001d64617461"
+    "00000001000000004c61766636302e31362e3130300000000866726565000000196d646174000001b3001007000001b616051823db7e"
+)
 
 
 def response(status=200, data=None, headers=None):
@@ -111,28 +134,9 @@ class UploadBehaviorTests(unittest.TestCase):
         self.saved.clear()
         self.confirmed.clear()
 
-    def regular_api(self, sequence, *, parent_known=True):
-        api, fake, tokens = self.api(sequence, parent_known=parent_known)
-        api._metadata_url = 'https://cloclo1.datacloudmail.ru'
-        api._metadata_until = float('inf')
-        return api, fake, tokens
-
-    def regular_upload(self, api, **kwargs):
-        # Exercise the entire transaction with small bytes, without allocating
-        # or transferring a multi-gigabyte fixture. Production uses 2**31.
-        kwargs.setdefault('account', AccountInfo('owner@example.ru', True, 10_000_000))
-        kwargs.setdefault('expected', self.identity)
-        kwargs.setdefault('save_intent', self.saved.append)
-        kwargs.setdefault('save_confirmation', self.confirmed.append)
-        with patch('mailru_photos.api.MAX_MEDIA_BYTES', 100):
-            return api.upload_regular(str(self.local), self.remote, **kwargs)
-
-    @staticmethod
-    def quota_response(*, total=100_000_000, cloud=0, mail=0):
-        return response(data={'quota': total, 'used': {'cloud': cloud, 'mail': mail, 'total': cloud + mail}})
 
     def test_video_upload_preserves_original_bytes_and_strict_confirmation(self):
-        for suffix in ('.MP4', '.MOV', '.mkv', '.webm', '.avi', '.3gp'):
+        for suffix in ('.MP4', '.MOV', '.m4v', '.mkv', '.webm', '.avi', '.3gp'):
             with self.subTest(suffix=suffix):
                 self.video_fixture(suffix)
                 api, fake, _ = self.api([
@@ -157,6 +161,7 @@ class UploadBehaviorTests(unittest.TestCase):
                 self.assertEqual(payload['hash'], self.digest)
                 self.assertFalse(fake.sequence)
 
+
     def test_video_resume_sends_only_remaining_original_bytes(self):
         self.video_fixture('.mov')
         offset = 256
@@ -173,6 +178,7 @@ class UploadBehaviorTests(unittest.TestCase):
         self.assertEqual(body['stream_body'], self.data[offset:])
         self.assertEqual(body['headers']['Content-Range'], f'bytes {offset}-{len(self.data)-1}/{len(self.data)}')
 
+
     def test_video_without_unlimited_confirmation_does_not_fall_back(self):
         self.video_fixture()
         api, fake, _ = self.api([
@@ -186,6 +192,7 @@ class UploadBehaviorTests(unittest.TestCase):
         self.assertEqual(len(commits), 1)
         self.assertIs(json.loads(commits[0]['body'])['unlimited_upload'], True)
 
+
     def test_oversize_video_is_rejected_before_hashing_or_network(self):
         self.video_fixture()
         self.identity = replace(self.identity, size=MAX_MEDIA_BYTES + 1)
@@ -195,6 +202,49 @@ class UploadBehaviorTests(unittest.TestCase):
                 self.upload(api)
         self.assertEqual(fake.requests, [])
         self.assertEqual(self.saved, [])
+
+
+    def test_five_and_ten_mib_video_use_the_same_auto_wire_flow_as_photo(self):
+        def transfer():
+            api, fake, _ = self.api([
+                response(404), response(404, headers={'x-upload-limit': str(MAX_MEDIA_BYTES)}),
+                response(201, headers={'x-valid-for': '0'}),
+                response(data={'name': self.local.name, 'path': self.remote, 'is_unlim_upload': True}),
+                self.stat_response(),
+            ])
+            result = self.upload(api)
+            commit = next(request for request in fake.requests if request['method'] == 'POST')
+            body = next(request for request in fake.requests if request['stream_body'] is not None)
+            self.assertEqual(body['stream_body'], self.data)
+            for request in fake.requests:
+                if request['method'] == 'PUT':
+                    self.assertEqual(parse_qs(urlsplit(request['url']).query)['upload_type'], ['AUTO'])
+            self.assertEqual(commit['url'], API_BASE + '/api/v1/private/add')
+            payload = json.loads(commit['body'])
+            self.assertIs(result['is_unlim_upload'], True)
+            return {key: value for key, value in payload.items()
+                    if key not in {'hash', 'last_modified', 'path', 'size'}}
+
+        photo_parameters = transfer()
+        for suffix, size in (('.m4v', 5 * 1024 * 1024), ('.mp4', 10 * 1024 * 1024)):
+            with self.subTest(suffix=suffix, size=size):
+                self.local = Path(self.folder.name) / ('small-video' + suffix)
+                padding = size - len(_MP4_ONE_FRAME)
+                self.data = _MP4_ONE_FRAME + struct.pack('>I', padding) + b'free' + b'\0' * (padding - 8)
+                self.local.write_bytes(self.data)
+                self.identity = FileIdentity.from_stat(self.local.stat())
+                self.digest, _ = cloud_hash(self.local)
+                self.remote = '/Import/' + self.local.name
+                self.saved.clear()
+                self.confirmed.clear()
+                self.assertEqual(transfer(), photo_parameters)
+                self.assertEqual(self.confirmed, [self.digest])
+
+    def test_ordinary_upload_operations_are_absent(self):
+        from mailru_photos import metadata
+        self.assertFalse(hasattr(CloudAPI, 'upload_regular'))
+        self.assertFalse(hasattr(metadata, 'encode_add_file'))
+        self.assertFalse(hasattr(metadata, 'parse_add_file_response'))
 
     def test_binary_two_gib_limit_keeps_eligible_files_in_unlimited_mode(self):
         self.assertEqual(MAX_MEDIA_BYTES, 2 ** 31)
@@ -208,218 +258,7 @@ class UploadBehaviorTests(unittest.TestCase):
                                               prior_intent=intent, save_intent=self.saved.append)
                 self.assertEqual(result['storage_mode'], 'unlimited')
                 self.assertTrue(result['recovered_commit'])
-                api2, fake, _ = self.api([])
-                with self.assertRaises(UnsupportedPhoto):
-                    api2.upload_regular(str(self.local), self.remote, expected=expected,
-                                        save_intent=self.saved.append)
-                self.assertEqual(fake.requests, [])
 
-    def test_regular_native_commit_is_create_only_and_saves_proof_before_stat(self):
-        self.video_fixture()
-        progress = []
-
-        def commit(request):
-            self.assertEqual(self.saved, [self.digest])
-            self.assertEqual(self.confirmed, [])
-            self.assertEqual(request['headers']['Content-Type'], 'application/octet-stream')
-            self.assertEqual(urlsplit(request['url']).hostname, 'cloclo1.datacloudmail.ru')
-            query = parse_qs(urlsplit(request['url']).query)
-            self.assertIn('token', query)
-            self.assertIn('client_id', query)
-            raw = request['body']
-            self.assertEqual(raw[:2], b'\x67\x00')
-            length, offset = read_varint(raw, 2)
-            self.assertEqual(raw[offset:offset + length], self.remote.encode('utf-8') + b'\x00')
-            size, offset = read_varint(raw, offset + length)
-            timestamp, offset = read_varint(raw, offset)
-            self.assertEqual(size, len(self.data))
-            self.assertEqual(timestamp, self.identity.mtime_ns // 1_000_000_000)
-            self.assertEqual(raw[offset:], b'\x00' + bytes.fromhex(self.digest) + b'\x03')
-            return response(data=b'\x00\x01' + bytes(range(12)) + b'\xac\x02')
-
-        def verification(_):
-            self.assertEqual(self.confirmed, [self.digest])
-            return self.stat_response()
-
-        api, fake, _ = self.regular_api([
-            response(404), self.quota_response(),
-            response(404, headers={'x-upload-limit': '10000000', 'x-max-upload-limit': '10000000'}),
-            response(201, headers={'x-valid-for': '0'}), commit, verification,
-        ])
-        result = self.regular_upload(api, progress=progress.append)
-        self.assertEqual(result['storage_mode'], 'regular')
-        self.assertEqual(result['regular_evidence'], 'commit_response')
-        self.assertEqual(result['quota_status'], 'uses_cloud_quota')
-        self.assertTrue(result['commit_accepted'])
-        self.assertTrue(result['stat_matched'])
-        self.assertFalse(result['recovered_commit'])
-        self.assertNotIn('is_unlim_upload', result)
-        self.assertNotIn('unlimited_evidence', result)
-        self.assertEqual(progress, [len(self.data)])
-        self.assertEqual(next(r['stream_body'] for r in fake.requests if r['stream_body'] is not None), self.data)
-        for request in fake.requests:
-            self.assertNotIn('/private/add', request['url'])
-            if request['method'] == 'PUT':
-                self.assertEqual(parse_qs(urlsplit(request['url']).query)['upload_type'], ['MANUAL'])
-        self.assertFalse(fake.sequence)
-
-    def test_regular_resume_sends_only_remaining_original_bytes(self):
-        self.video_fixture('.mov')
-        offset = 400
-        target = UPLOAD_BASE + '/resumable/' + self.digest
-        api, fake, _ = self.regular_api([
-            response(404), self.quota_response(),
-            response(200, headers={'x-valid-for': '0', 'x-received': str(offset), 'x-location': target,
-                                  'x-upload-limit': '10000000', 'x-max-upload-limit': '10000000'}),
-            response(201, headers={'x-valid-for': '0'}), response(data=b'\x00\x00'), self.stat_response(),
-        ])
-        self.assertTrue(self.regular_upload(api, is_retried=True)['stat_matched'])
-        body = next(r for r in fake.requests if r['stream_body'] is not None)
-        self.assertEqual(body['stream_body'], self.data[offset:])
-        self.assertEqual(body['headers']['Content-Range'], f'bytes {offset}-{len(self.data) - 1}/{len(self.data)}')
-        query = parse_qs(urlsplit(body['url']).query)
-        self.assertEqual(query['upload_type'], ['MANUAL'])
-        self.assertEqual(query['is_retried'], ['true'])
-
-    def test_regular_account_limit_is_explicit_and_checked_before_hash_or_body(self):
-        for limit in (None, 0, True, self.identity.size - 1):
-            with self.subTest(limit=limit):
-                api, fake, _ = self.regular_api([response(404)])
-                info = AccountInfo('owner@example.ru', True, limit)
-                with patch('mailru_photos.api.cloud_hash', side_effect=AssertionError('Must reject before hashing')):
-                    with self.assertRaises(ProtocolError):
-                        self.regular_upload(api, account=info)
-                self.assertEqual([r['method'] for r in fake.requests], ['GET'])
-                self.assertEqual(self.saved, [])
-
-    def test_regular_reads_account_limit_when_caller_does_not_supply_it(self):
-        api, fake, _ = self.regular_api([
-            response(404), response(data={'email': 'owner@example.ru', 'unlimited_upload_enabled': True,
-                                         'upload_limit': 10_000_000}), self.quota_response(),
-            response(201, headers={'x-valid-for': '0'}), response(data=b'\x00\x00'), self.stat_response(),
-        ])
-        self.assertTrue(self.regular_upload(api, account=None)['stat_matched'])
-        self.assertTrue(fake.requests[1]['url'].endswith('/api/v1/user/info'))
-
-    def test_account_limit_uses_smallest_reported_cap_without_a_universal_default(self):
-        for values, expected in (({}, None), ({'upload_limit': 12345}, 12345),
-                                 ({'max_file_size': '56789'}, 56789),
-                                 ({'upload_limit': 12345, 'max_file_size': 10000}, 10000)):
-            with self.subTest(values=values):
-                api, _, _ = self.api([response(data={
-                    'email': 'owner@example.ru', 'unlimited_upload_enabled': True, **values,
-                })])
-                self.assertEqual(api.account_info().upload_limit, expected)
-
-    def test_regular_free_space_includes_shared_mail_usage_before_hash_or_body(self):
-        api, fake, _ = self.regular_api([response(404), self.quota_response(total=10000, cloud=0, mail=9999)])
-        with patch('mailru_photos.api.cloud_hash', side_effect=AssertionError('Must reject before hashing')):
-            with self.assertRaises(RemoteError) as caught:
-                self.regular_upload(api)
-        self.assertEqual(caught.exception.code, 'CONDITION/OVERQUOTA')
-        self.assertTrue(caught.exception.fatal)
-        self.assertEqual([r['method'] for r in fake.requests], ['GET', 'GET'])
-
-    def test_regular_current_server_caps_apply_before_new_resumed_or_cached_blob_commit(self):
-        for status in (200, 201, 404):
-            for maximum, limit, error in (
-                (self.identity.size - 1, 10000000, UnsupportedPhoto),
-                (self.identity.size - 1, self.identity.size - 1, UnsupportedPhoto),
-                (10000000, self.identity.size - 1, RemoteError),
-                (None, self.identity.size - 1, RemoteError),
-            ):
-                with self.subTest(status=status, maximum=maximum, limit=limit):
-                    headers = {'x-valid-for': '0', 'x-received': '10',
-                               'x-location': UPLOAD_BASE + '/resumable/' + self.digest,
-                               'x-upload-limit': str(limit)}
-                    if maximum is not None:
-                        headers['x-max-upload-limit'] = str(maximum)
-                    api, fake, _ = self.regular_api([response(404), self.quota_response(), response(status, headers=headers)])
-                    with self.assertRaises(error):
-                        self.regular_upload(api)
-                    self.assertFalse(any(r['stream_body'] is not None or r['method'] == 'POST' for r in fake.requests))
-                    self.assertEqual(self.saved, [])
-
-    def test_regular_no_missing_or_malformed_native_ack_becomes_success(self):
-        for raw in (b'', b'\x00', b'\x00\x06', b'\x00\x01short', b'\x00\x00extra',
-                    b'\x01', b'\x04', b'\x05', b'\x09', b'\x0c', b'\xfe'):
-            with self.subTest(raw=raw):
-                self.saved.clear()
-                self.confirmed.clear()
-                api, fake, _ = self.regular_api([
-                    response(404), self.quota_response(), response(201, headers={'x-valid-for': '0'}), response(data=raw),
-                ])
-                with self.assertRaises(ProtocolError):
-                    self.regular_upload(api)
-                self.assertEqual(self.saved, [self.digest])
-                self.assertEqual(self.confirmed, [])
-                self.assertEqual(fake.requests[-1]['method'], 'POST')
-
-    def test_regular_native_no_space_is_fatal_and_bad_blob_is_retryable(self):
-        for status, code, retryable, fatal in ((7, 'CONDITION/OVERQUOTA', False, True),
-                                             (253, 'CONDITION/BADBLOB', True, False)):
-            with self.subTest(status=status):
-                api, _, _ = self.regular_api([
-                    response(404), self.quota_response(), response(201, headers={'x-valid-for': '0'}),
-                    response(data=bytes([status])),
-                ])
-                with self.assertRaises(RemoteError) as caught:
-                    self.regular_upload(api)
-                self.assertEqual(caught.exception.code, code)
-                self.assertIs(caught.exception.retryable, retryable)
-                self.assertIs(caught.exception.fatal, fatal)
-                self.assertEqual(self.confirmed, [])
-
-    def test_regular_lost_commit_response_cannot_adopt_matching_existing_file(self):
-        api, _, _ = self.regular_api([
-            response(404), self.quota_response(), response(201, headers={'x-valid-for': '0'}),
-            TransportError('Simulated lost ordinary commit response'),
-        ])
-        with self.assertRaises(TransportError):
-            self.regular_upload(api)
-        self.assertEqual(self.saved, [self.digest])
-        self.assertEqual(self.confirmed, [])
-        intent = {'cloud_hash': self.digest, 'remote_path': self.remote, 'storage_mode': 'regular'}
-        second, fake, _ = self.regular_api([self.stat_response()])
-        with self.assertRaises(RemoteConflict):
-            self.regular_upload(second, prior_intent=intent)
-        self.assertEqual([r['method'] for r in fake.requests], ['GET'])
-
-    def test_regular_saved_confirmation_recovers_without_requiring_space_again(self):
-        def fail_stat(_):
-            self.assertEqual(self.confirmed, [self.digest])
-            return TransportError('Simulated disconnect after positive ordinary commit')
-
-        api, _, _ = self.regular_api([
-            response(404), self.quota_response(), response(201, headers={'x-valid-for': '0'}),
-            response(data=b'\x00\x00'), fail_stat, fail_stat, fail_stat,
-        ])
-        with patch.object(api, '_wait'), self.assertRaises(TransportError):
-            self.regular_upload(api)
-        intent = {'cloud_hash': self.digest, 'remote_path': self.remote,
-                  'storage_mode': 'regular', 'regular_confirmed': True}
-        second, fake, _ = self.regular_api([self.stat_response()])
-        result = self.regular_upload(second, prior_intent=intent, account=None)
-        self.assertEqual(result['regular_evidence'], 'saved_commit_response')
-        self.assertEqual(result['storage_mode'], 'regular')
-        self.assertTrue(result['recovered_commit'])
-        self.assertFalse(result['commit_accepted'])
-        self.assertNotIn('is_unlim_upload', result)
-        self.assertEqual([r['method'] for r in fake.requests], ['GET'])
-
-    def test_regular_existing_path_needs_its_own_positive_mode_specific_proof(self):
-        base = {'cloud_hash': self.digest, 'remote_path': self.remote,
-                'regular_confirmed': True, 'storage_mode': 'regular'}
-        for intent in (None, {**base, 'storage_mode': 'unlimited'},
-                       {**base, 'storage_mode': None}, {**base, 'regular_confirmed': 1},
-                       {**base, 'regular_confirmed': False}, {**base, 'cloud_hash': '0' * 40},
-                       {'cloud_hash': self.digest, 'remote_path': self.remote, 'unlimited_confirmed': True}):
-            with self.subTest(intent=intent):
-                api, fake, _ = self.regular_api([self.stat_response()])
-                with self.assertRaises(RemoteConflict):
-                    self.regular_upload(api, prior_intent=intent)
-                self.assertEqual([r['method'] for r in fake.requests], ['GET'])
-                self.assertEqual(self.saved, [])
 
     def test_unlimited_recovery_rejects_regular_mode_even_with_unlimited_flag(self):
         intent = {'cloud_hash': self.digest, 'remote_path': self.remote, 'storage_mode': 'regular',
@@ -429,28 +268,6 @@ class UploadBehaviorTests(unittest.TestCase):
             self.upload(api, prior_intent=intent)
         self.assertEqual([r['method'] for r in fake.requests], ['GET'])
 
-    def test_regular_wrong_final_hash_does_not_finish_but_keeps_positive_commit_proof(self):
-        api, _, _ = self.regular_api([
-            response(404), self.quota_response(), response(201, headers={'x-valid-for': '0'}),
-            response(data=b'\x00\x00'), self.stat_response(digest='0' * 40),
-        ])
-        with self.assertRaises(ProtocolError):
-            self.regular_upload(api)
-        self.assertEqual(self.confirmed, [self.digest])
-
-    def test_regular_changed_source_after_body_is_not_committed(self):
-        def change_source(_):
-            with self.local.open('ab') as stream:
-                stream.write(b'changed')
-            return response(201, headers={'x-valid-for': '0'})
-
-        api, fake, _ = self.regular_api([
-            response(404), self.quota_response(), response(404, headers={'x-upload-limit': '10000000'}), change_source,
-        ])
-        with self.assertRaises(SourceChanged):
-            self.regular_upload(api)
-        self.assertEqual(self.saved, [])
-        self.assertFalse(any(r['method'] == 'POST' for r in fake.requests))
 
     def test_quota_uses_cloud_component_from_canonical_host(self):
         api, fake, _ = self.api([response(data={"quota": 1000,

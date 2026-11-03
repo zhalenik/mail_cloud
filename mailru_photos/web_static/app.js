@@ -270,7 +270,6 @@
     $("workers").disabled = busy || transient;
     $("auto-resume").disabled = busy || transient;
     $("preflight-check").disabled = busy || transient;
-    $("upload-large-files").disabled = busy || transient;
   }
 
   function renderState() {
@@ -441,7 +440,6 @@
       $("workers").value = String(finite(state.settings && state.settings.workers, 2));
       $("auto-resume").checked = !state.settings || state.settings.auto_resume !== false;
       $("preflight-check").checked = !state.settings || state.settings.preflight_check !== false;
-      $("upload-large-files").checked = Boolean(state.settings && state.settings.upload_large_files === true);
     }
   }
 
@@ -721,12 +719,12 @@
     try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задания возвращены в очередь." }); }
     finally { $("retry-submit").disabled = false; }
   });
-  ["workers", "auto-resume", "preflight-check", "upload-large-files"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
+  ["workers", "auto-resume", "preflight-check"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
   $("settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const workers = Number($("workers").value);
     if (!Number.isInteger(workers) || workers < 1 || workers > 16) { setError("settings-error", "Укажите целое число потоков от 1 до 16."); return; }
-    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked, upload_large_files: $("upload-large-files").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
+    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
     if (success) { settingsDirty = false; if (snapshot) renderSettings(snapshot); }
   });
 

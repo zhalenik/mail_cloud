@@ -3,11 +3,9 @@ import unittest
 from mailru_photos.metadata import (
     MAX_U64,
     MetadataProtocolError,
-    encode_add_file,
     encode_mkdir,
     encode_quota,
     encode_varint,
-    parse_add_file_response,
     parse_mkdir_response,
     parse_quota_response,
     read_varint,
@@ -73,56 +71,6 @@ class MetadataWireFormatTests(unittest.TestCase):
             self.assertEqual(parse_mkdir_response(bytes([status]) + b"revision"), status)
         with self.assertRaises(MetadataProtocolError):
             parse_mkdir_response(b"")
-
-    def test_regular_add_independent_wire_fixture_has_create_only_flags(self):
-        # APK AddBlobRequest: 103, MPR_NONE, UTF-8 path+NUL, size, epoch
-        # seconds, zero, raw hash, flags3. Neither flags1 (replace) nor55
-        # (rename/autoupload) may be substituted by this operation.
-        digest = bytes(range(20))
-        expected = b"\x67\x00\x07/a.mp4\x00\xac\x02\x80\x80\x01\x00" + digest + b"\x03"
-        self.assertEqual(encode_add_file("/a.mp4", 300, 16384, digest.hex()), expected)
-
-    def test_regular_add_uses_nfc_bytes_and_64bit_file_size(self):
-        digest = "AB" * 20
-        wire = encode_add_file("/e\u0301.mov", 1 << 40, 0, digest)
-        self.assertTrue(wire.startswith(b"\x67\x00\x08/\xc3\xa9.mov\x00"))
-        self.assertEqual(wire[11:], b"\x80\x80\x80\x80\x80\x20\x00\x00" + b"\xab" * 20 + b"\x03")
-
-    def test_regular_add_rejects_invalid_paths_hashes_and_unsigned_fields(self):
-        for path in ("", "/", "relative", "/a//b", "/a/../b", "/a/./b", "/ok\x00bad"):
-            with self.subTest(path=path), self.assertRaises(ValueError):
-                encode_add_file(path, 1, 1, "00" * 20)
-        for digest in (None, "", "00" * 19, "00" * 21, "XY" * 20, "00 " * 20):
-            with self.subTest(digest=digest), self.assertRaises(ValueError):
-                encode_add_file("/ok", 1, 1, digest)
-        for size, timestamp in ((-1, 0), (0, -1), (MAX_U64 + 1, 0), (0, MAX_U64 + 1)):
-            with self.subTest(size=size, timestamp=timestamp), self.assertRaises(ValueError):
-                encode_add_file("/ok", size, timestamp, "00" * 20)
-
-    def test_regular_add_success_requires_a_complete_known_revision(self):
-        first, second = bytes(range(12)), bytes(range(12, 24))
-        revisions = (
-            b"\x00",
-            b"\x01" + first + b"\xac\x02",
-            b"\x02" + first + b"\x01",
-            b"\x03" + first + b"\x00" + second + b"\xff\x01",
-            b"\x04" + first + b"\x01" + second + b"\x00",
-            b"\x05" + first + b"\xac\x02" + second,
-        )
-        for revision in revisions:
-            with self.subTest(revision_type=revision[0]):
-                self.assertEqual(parse_add_file_response(b"\x00" + revision), 0)
-                for cut in range(1, len(revision) + 1):
-                    with self.assertRaises(MetadataProtocolError):
-                        parse_add_file_response((b"\x00" + revision)[:-cut])
-        for wire in (b"", b"\x00\x06", b"\x00\x00unexpected", b"\x00\x01" + first + b"\xff" * 10):
-            with self.subTest(wire=wire), self.assertRaises(MetadataProtocolError):
-                parse_add_file_response(wire)
-
-    def test_regular_add_nonzero_status_is_one_raw_byte_not_varint(self):
-        for status in (1, 4, 5, 7, 9, 12, 253, 254, 255):
-            with self.subTest(status=status):
-                self.assertEqual(parse_add_file_response(bytes([status])), status)
 
     def test_quota_wire_order_and_account_over_quota(self):
         self.assertEqual(encode_quota(), b"\x17")

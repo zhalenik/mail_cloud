@@ -116,7 +116,7 @@ volumes:
 | Значение `image` | Как выбирать обновления |
 | --- | --- |
 | `ghcr.io/zhalenik/mail_cloud:stable` | Получать новые выпуски без изменения тега в YAML. |
-| `ghcr.io/zhalenik/mail_cloud:v0.4.3` | Использовать выбранный выпуск. Для следующей версии изменить тег в YAML. |
+| `ghcr.io/zhalenik/mail_cloud:v0.4.4` | Использовать выбранный выпуск. Для следующей версии изменить тег в YAML. |
 | `ghcr.io/zhalenik/mail_cloud@sha256:…` | Закрепить конкретный digest опубликованного образа, если нужна точная фиксация содержимого. |
 
 Версионный тег удобен для выбора выпуска; технически владелец registry может перезаписать любой тег. Digest фиксирует конкретное содержимое; см. [Docker: получение образа по digest](https://docs.docker.com/reference/cli/docker/image/pull/#pull-an-image-by-digest-immutable-identifier). Наличие новой версии приложения в GitHub само по себе не меняет YAML с фиксированным тегом.

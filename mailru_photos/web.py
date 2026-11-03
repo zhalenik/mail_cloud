@@ -350,10 +350,10 @@ class WebApplication:
                 raise WebError(400, "Укажите настройку продолжения после перезапуска.")
             if "preflight_check" in data and type(data["preflight_check"]) is not bool:
                 raise WebError(400, "Предварительная проверка должна быть включена или выключена.")
-            if "upload_large_files" in data and type(data["upload_large_files"]) is not bool:
-                raise WebError(400, "Загрузка больших файлов должна быть включена или выключена.")
+            if "upload_large_files" in data:
+                raise WebError(400, "Настройка обычной загрузки больших файлов удалена. Обновите страницу панели.")
             self.service.settings(workers=workers, auto_resume=data["auto_resume"],
-                                  preflight_check=data.get("preflight_check"), upload_large_files=data.get("upload_large_files"))
+                                  preflight_check=data.get("preflight_check"))
         else:
             raise WebError(404, "Неизвестная команда.")
         return self.service.snapshot()

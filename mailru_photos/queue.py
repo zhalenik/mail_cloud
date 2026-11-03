@@ -59,7 +59,7 @@ _SIZE_PARTITIONS = {
     "regular": f"size>{UNLIMITED_MAX_BYTES}",
 }
 _LEGACY_LARGE_FILE_ERROR = "Файл больше 2 ГБ; он не отправлен обычной загрузкой."
-_LARGE_FILES_DISABLED_REASON = "Файл больше 2 ГБ: обычная загрузка с расходованием места выключена."
+_LARGE_FILES_DISABLED_REASON = "Файл больше 2 ГБ: этот размер не поддерживается автозагрузкой."
 
 
 def _size_partition(storage_mode: str | None) -> str:

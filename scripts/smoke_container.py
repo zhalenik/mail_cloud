@@ -167,13 +167,11 @@ def smoke(image: str, *, version: str | None = None) -> None:
                 initial, _ = request("/api/state")
                 require(initial["authenticated"] is False, "A fresh image must not claim Mail account authorization")
                 require(initial["settings"]["preflight_check"] is True, "Preflight must default to enabled")
-                require(initial["settings"]["upload_large_files"] is False,
-                        "Quota-consuming large uploads must default to disabled")
+                require("upload_large_files" not in initial["settings"],
+                        "Ordinary large uploads must not be exposed")
                 changed, _ = request("/api/settings", {"workers": 2, "auto_resume": True,
-                                                        "preflight_check": False,
-                                                        "upload_large_files": True}, session["csrf"])
+                                                        "preflight_check": False}, session["csrf"])
                 require(changed["settings"]["preflight_check"] is False, "The preflight setting was not saved")
-                require(changed["settings"]["upload_large_files"] is True, "The large-file setting was not saved")
                 if mounted:
                     saved = docker("exec", name, "python", "-c",
                                    "from pathlib import Path; import json, stat; "
@@ -202,8 +200,8 @@ def smoke(image: str, *, version: str | None = None) -> None:
                     restored, _ = request("/api/state")
                     require(restored["settings"]["preflight_check"] is False,
                             "The preflight setting did not survive a container restart")
-                    require(restored["settings"]["upload_large_files"] is True,
-                            "The large-file setting did not survive a container restart")
+                    require("upload_large_files" not in restored["settings"],
+                            "Restart must not restore the removed ordinary upload setting")
                 # Execute the Dockerfile's health command as the configured user,
                 # rather than waiting for the scheduled interval.
                 check = config["Config"]["Healthcheck"]["Test"]

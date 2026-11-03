@@ -22,7 +22,6 @@ from mailru_photos.api import (
 )
 from mailru_photos.queue import Queue
 from mailru_photos.media import UNLIMITED_MAX_BYTES
-from mailru_photos.metadata import read_varint
 from mailru_photos.runner import ProbeRequired, QuotaGuard, probe, run
 from mailru_photos.transport import Cancelled, Response, TransportError
 
@@ -51,7 +50,7 @@ class FakeCloud(CloudAPI):
         self._fake_lock = threading.RLock()
         self.remote = {}
         self.commits = []
-        self.regular_commits = []
+        self.regular_commits = []  # Compatibility for existing service fixtures; never populated.
         self.upload_calls = []
         self.upload_types = []
         self.upload_limit = 2_000_000_000
@@ -111,10 +110,12 @@ class FakeCloud(CloudAPI):
             return dict(value) if value else None
 
     def _upload_blob(self, path, digest, identity, *, progress=None, is_retried=False, upload_type="AUTO"):
+        if upload_type != "AUTO":
+            raise AssertionError("Only the original AUTO flow exists")
         self._check_stopped()
         with self._fake_lock:
             self.upload_calls.append(str(path))
-            self.upload_types.append(upload_type)
+            self.upload_types.append("AUTO")
             failures = self.failures.get(Path(path).name, [])
             failure = failures.pop(0) if failures else None
             self._active_uploads += 1
@@ -130,37 +131,8 @@ class FakeCloud(CloudAPI):
             with self._fake_lock:
                 self._active_uploads -= 1
 
-    def _metadata_endpoint(self):
-        return 'https://offline.invalid/metadata'
-
     def _request(self, method, url, *, body=b"", **kwargs):
         self._check_stopped()
-        if method == 'POST' and url == self._metadata_endpoint():
-            opcode, offset = read_varint(body)
-            if opcode != 103 or body[offset] != 0:
-                raise AssertionError('Unexpected ordinary metadata operation')
-            length, offset = read_varint(body, offset + 1)
-            path = body[offset:offset + length - 1].decode('utf-8')
-            if body[offset + length - 1] != 0:
-                raise AssertionError('Missing path terminator')
-            offset += length
-            size, offset = read_varint(body, offset)
-            _, offset = read_varint(body, offset)  # mtime
-            _, offset = read_varint(body, offset)  # reserved
-            digest = body[offset:offset + 20].hex().upper()
-            flags, offset = read_varint(body, offset + 20)
-            if flags != 3 or offset != len(body):
-                raise AssertionError('Ordinary adds must retain create-only flags')
-            payload = {'path': path, 'hash': digest, 'size': size,
-                       'storage_mode': 'regular', 'unlimited_upload': False}
-            with self._fake_lock:
-                self.remote[path] = {'hash': digest, 'size': size}
-                self.regular_commits.append(payload)
-                self.commits.append(payload)
-                failure = self.after_commit_failures.pop(path, None)
-            if failure is not None:
-                raise failure
-            return Response(200, {}, b'\x00\x00')  # success, MPR_NONE revision
         if method != "POST" or not url.endswith("/api/v1/private/add"):
             raise AssertionError(f"Unexpected simulated request: {method} {url}")
         payload = json.loads(body)
@@ -229,82 +201,6 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result['stats']['skipped'], 1)
         self.assertEqual(api.commits, [])
         self.assertEqual(self.queue.list_jobs()[0]['skip_reason'], 'large_files_disabled')
-
-    def test_explicit_large_upload_uses_regular_after_unlimited_without_quota_false_alarm(self):
-        self.make_photos(1)
-        self.make_large_video()
-        self.seed_pass()
-        api = FakeCloud()
-        api.upload_limit = api.total_bytes = 100_000_000_000
-        api.quota_rule = lambda client: 100 + sum(item['size'] for item in client.regular_commits)
-        real_hash = __import__('mailru_photos.api', fromlist=['cloud_hash']).cloud_hash
-        def bounded_hash(path, *, expected, stop):
-            return ('A' * 40, expected) if expected.size > UNLIMITED_MAX_BYTES else real_hash(path, expected=expected, stop=stop)
-        with patch('mailru_photos.api.cloud_hash', side_effect=bounded_hash):
-            result = run(self.queue, api, workers=2, upload_large_files=True)
-        self.assertEqual(result['outcome'], 'complete', result)
-        self.assertEqual(result['stats']['uploaded'], 2)
-        self.assertEqual([item['unlimited_upload'] for item in api.commits], [True, False])
-        self.assertEqual(api.upload_types, ['AUTO', 'MANUAL'])
-        large = next(job for job in self.queue.list_jobs() if job['size'] > UNLIMITED_MAX_BYTES)
-        self.assertEqual(large['storage_mode'], 'regular')
-        proof = self.queue.upload_history(large['id'])[-1]['verified_metadata']
-        self.assertEqual(proof['regular_evidence'], 'commit_response')
-        self.assertNotIn('is_unlim_upload', proof)
-        self.assertEqual(self.queue.get_metadata('probe')['result'], 'invalidated')
-
-    def test_regular_lost_add_response_is_not_adopted_as_a_confirmed_upload(self):
-        self.make_large_video()
-        path = self.queue.list_jobs()[0]['remote_path']
-        api = FakeCloud()
-        api.upload_limit = api.total_bytes = 100_000_000_000
-        api.after_commit_failures[path] = Cancelled('Lost ordinary add response')
-        with patch('mailru_photos.api.cloud_hash', side_effect=lambda path, *, expected, stop: ('B' * 40, expected)):
-            first = run(self.queue, api, workers=1, upload_large_files=True)
-            self.assertTrue(first['stopped'])
-            api.stop = threading.Event()
-            second = run(self.queue, api, workers=1, upload_large_files=True)
-        self.assertEqual(second['stats']['uploaded'], 0)
-        self.assertEqual(second['stats']['failed'], 1)
-        self.assertEqual(len(api.regular_commits), 1)
-
-    def test_confirmed_regular_commit_survives_pause_disable_and_reenable(self):
-        self.make_large_video()
-        path = self.queue.list_jobs()[0]['remote_path']
-        api = FakeCloud()
-        api.upload_limit = api.total_bytes = 100_000_000_000
-        api.after_confirmation_stat_failures[path] = Cancelled('Pause before ordinary stat')
-        with patch('mailru_photos.api.cloud_hash', side_effect=lambda path, *, expected, stop: ('C' * 40, expected)):
-            first = run(self.queue, api, workers=1, upload_large_files=True)
-            self.assertTrue(first['stopped'])
-            api.stop = threading.Event()
-            disabled = run(self.queue, api, workers=1, upload_large_files=False)
-            self.assertEqual(disabled['stats']['skipped'], 1)
-            self.assertEqual(self.queue.retry_large_skipped(), 1)
-            api.total_bytes = 100  # Recovery must not require free space again.
-            restored = run(self.queue, api, workers=1, upload_large_files=True)
-        self.assertEqual(restored['stats']['uploaded'], 1, restored)
-        self.assertEqual(len(api.regular_commits), 1)
-        self.assertEqual(len(api.upload_calls), 1)
-
-    def test_regular_upload_is_not_started_after_unlimited_confirmation_failure(self):
-        self.make_photos(1)
-        self.make_large_video()
-        self.seed_pass()
-        api = FakeCloud()
-        api.upload_limit = api.total_bytes = 100_000_000_000
-        request = api._request
-        def denied(method, url, **kwargs):
-            response = request(method, url, **kwargs)
-            if url.endswith('/api/v1/private/add'):
-                payload = json.loads(response.body)
-                payload['is_unlim_upload'] = False
-                return Response(200, {}, json.dumps(payload).encode())
-            return response
-        api._request = denied
-        result = run(self.queue, api, workers=1, upload_large_files=True)
-        self.assertTrue(result['stopped'])
-        self.assertEqual(api.regular_commits, [])
 
     def test_probe_ignores_large_files_even_if_they_were_discovered_first(self):
         self.make_large_video()

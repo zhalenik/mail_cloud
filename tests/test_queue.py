@@ -365,6 +365,9 @@ class QueueTests(unittest.TestCase):
         job = self.queue.claim()
         self.assertEqual(job.local_path, str(second))
         self.queue.mark_uploaded(job)
+        # Directory enumeration order is not guaranteed. Drain any remaining
+        # missing entry before checking the final queue outcome.
+        self.assertIsNone(self.queue.claim())
         self.assertEqual(self.queue.stats()["skipped"], 1)
         self.assertEqual(self.queue.stats()["uploaded"], 1)
 
