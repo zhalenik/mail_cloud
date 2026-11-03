@@ -118,8 +118,47 @@ class WebService:
 
     def _queue(self) -> Queue:
         if self._configuration is None:
-            raise ValueError("Сначала выберите папку назначения в Облаке.")
+            raise ValueError("Сначала добавьте исходную папку или войдите в аккаунт Mail.")
         return Queue(self.state_dir / "queue.sqlite3", destination=self._configuration["destination"])
+
+    def _ensure_configuration(self) -> None:
+        """Initialize new panels without asking for a global cloud folder.
+
+        Existing queue destinations remain the compatibility default for CLI
+        and older clients. New source forms supply their complete destination.
+        Call with the controller lock held and after checking it is idle.
+        """
+        if self._configuration is not None:
+            return
+        with Queue(self.state_dir / "queue.sqlite3", destination="/") as queue, queue.exclusive_run():
+            configuration = {"version": 1, "destination": queue.destination}
+            write_json(self.state_dir / "project.json", configuration)
+            self._configuration = configuration
+        self._invalidate_stats()
+
+    @staticmethod
+    def _source_id(value: int) -> int:
+        if type(value) is not int or not 1 <= value <= 2**63 - 1:
+            raise ValueError("Укажите корректный номер исходной папки.")
+        return value
+
+    @staticmethod
+    def _source_alias(value: str) -> str:
+        if not isinstance(value, str) or not value.strip() or len(value) > 255 or "\x00" in value:
+            raise ValueError("Укажите короткое имя источника.")
+        return value
+
+    @staticmethod
+    def _source_destination(value: str) -> str:
+        if not isinstance(value, str) or not value.strip() or len(value) > 2048 or "\x00" in value:
+            raise ValueError("Укажите корректную папку назначения для источника.")
+        return value
+
+    @staticmethod
+    def _invalidate_source_probe(queue: Queue) -> None:
+        previous = queue.get_metadata("probe")
+        if isinstance(previous, dict) and previous:
+            queue.set_metadata("probe", {**previous, "result": "invalidated", "reason": "sources_changed"})
 
     def _has_auth(self) -> bool:
         try:
@@ -206,18 +245,59 @@ class WebService:
             self._event("Папка назначения сохранена.")
         return {"ok": True}
 
-    def add_folder(self, path: str, alias: str) -> dict:
-        if not isinstance(alias, str) or len(alias) > 255:
-            raise ValueError("Укажите короткое имя источника.")
+    def add_folder(self, path: str, alias: str, remote_prefix: str | None = None) -> dict:
+        alias = self._source_alias(alias)
+        if remote_prefix is not None:
+            remote_prefix = self._source_destination(remote_prefix)
         with self._lock:
             self._ensure_idle()
             source = self._allowed_path(path)
+            self._ensure_configuration()
             with self._queue() as queue, queue.exclusive_run():
-                root = queue.add_root(source, alias)
-                queue.set_metadata("last_scan", {"complete": False, "reason": "source_added"})
+                previous = queue.roots()
+                root = queue.add_root(source, alias, remote_prefix=remote_prefix)
+                changed = root not in previous
+                if changed:
+                    self._invalidate_source_probe(queue)
             self._invalidate_stats()
-            self._event(f"Добавлена папка: {root.alias}.")
+            if changed:
+                self._event(f"Добавлена папка: {root.alias}.")
         return {"ok": True, "source": dataclasses.asdict(root)}
+
+    def update_source(self, source_id: int, *, remote_prefix: str, alias: str | None = None) -> dict:
+        source_id = self._source_id(source_id)
+        remote_prefix = self._source_destination(remote_prefix)
+        if alias is not None:
+            alias = self._source_alias(alias)
+        with self._lock:
+            self._ensure_idle()
+            with self._queue() as queue, queue.exclusive_run():
+                previous = next((root for root in queue.roots() if root.id == source_id), None)
+                if previous is None:
+                    raise ValueError("Исходная папка не найдена. Обновите страницу.")
+                self._allowed_path(previous.path, exists=False)
+                root = queue.update_root(source_id, remote_prefix=remote_prefix, alias=alias)
+                changed = root != previous
+                if changed:
+                    self._invalidate_source_probe(queue)
+            self._invalidate_stats()
+            if changed:
+                self._event(f"Изменён источник: {root.alias}. Уже загруженные файлы остаются на прежнем месте.")
+        return {"ok": True, "source": dataclasses.asdict(root)}
+
+    def remove_source(self, source_id: int) -> dict:
+        source_id = self._source_id(source_id)
+        with self._lock:
+            self._ensure_idle()
+            with self._queue() as queue, queue.exclusive_run():
+                root = next((root for root in queue.roots() if root.id == source_id), None)
+                if root is None:
+                    raise ValueError("Исходная папка не найдена. Обновите страницу.")
+                removed = queue.remove_root(source_id)
+                self._invalidate_source_probe(queue)
+            self._invalidate_stats()
+            self._event(f"Убран источник: {root.alias}. Удалено задач: {removed:,}. Файлы на диске и в Облаке сохранены.")
+        return {"ok": True, "removed_tasks": removed}
 
     def settings(self, workers: int | None = None, auto_resume: bool | None = None,
                  preflight_check: bool | None = None) -> dict:
@@ -431,8 +511,6 @@ class WebService:
             raise ValueError("Укажите адрес аккаунта Mail.")
         if not isinstance(password, str) or not password or len(password) > 1024:
             raise ValueError("Введите пароль внешнего приложения.")
-        if self._configuration is None:
-            raise ValueError("Сначала выберите папку назначения в Облаке.")
         email = email.strip().casefold()
         def perform():
             nonlocal password
@@ -468,7 +546,10 @@ class WebService:
                     if api is not None:
                         api.close_thread()
             return "idle", "Вход сохранён. Повторно вводить пароль при обычном запуске не потребуется."
-        return self._launch("login", perform)
+        with self._lock:
+            self._ensure_idle()
+            self._ensure_configuration()
+            return self._launch("login", perform)
 
     def _scan_queue(self, queue: Queue) -> None:
         self._phase("scanning", "Сканируем папки с фото и видео…")
@@ -493,7 +574,7 @@ class WebService:
 
     def scan(self) -> dict:
         if self._configuration is None:
-            raise ValueError("Сначала выберите папку назначения.")
+            raise ValueError("Добавьте хотя бы одну исходную папку с фото и видео.")
         def perform():
             with self._queue() as queue:
                 self._scan_queue(queue)
@@ -738,7 +819,7 @@ class WebService:
 
     def start(self) -> dict:
         if self._configuration is None:
-            raise ValueError("Сначала выберите папку назначения в Облаке.")
+            raise ValueError("Добавьте хотя бы одну исходную папку с фото и видео.")
         if not self._authenticated:
             raise ValueError("Сначала войдите в аккаунт Mail.")
         return self._launch("upload", self._pipeline, upload_intent=True)

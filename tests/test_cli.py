@@ -207,6 +207,41 @@ class CLITests(unittest.TestCase):
         self.assertIn("--state", err)
         self.assertEqual(json.loads(self.success("status"))["destination"], "/Archive")
 
+    def test_source_mapping_edit_and_removal_are_local_and_keep_originals(self):
+        source = self.photo("nested/photo.jpg")
+        with mock.patch.object(cli, "TokenManager", side_effect=AssertionError("local command read credentials")), \
+             mock.patch.object(cli, "CloudAPI", side_effect=AssertionError("local command used network")):
+            self.init()
+            root = json.loads(self.success("add-folder", self.source, "--alias", "camera",
+                                           "--destination", "/ExactFolder"))
+            self.assertEqual(root["remote_prefix"], "/ExactFolder")
+            self.success("scan")
+            changed = json.loads(self.success("update-folder", root["id"], "--destination", "/NewFolder",
+                                              "--alias", "Family"))
+            self.assertEqual(changed["alias"], "Family")
+            with Queue(self.db, destination="/Archive") as queue:
+                self.assertEqual(queue.list_jobs()[0]["remote_path"], "/NewFolder/nested/photo.jpg")
+                self.assertEqual(queue.get_metadata("last_scan")["reason"], "source_updated")
+            removed = json.loads(self.success("remove-folder", root["id"]))
+            self.assertEqual(removed, {"removed_tasks": 1})
+            status = json.loads(self.success("status"))
+            self.assertEqual(status["sources"], [])
+            self.assertEqual(status["stats"]["total"], 0)
+            self.assertEqual(status["last_scan"]["reason"], "source_removed")
+        self.assertEqual(source.read_bytes(), b"offline-fixture")
+
+    def test_source_edit_and_remove_refuse_an_active_owner_before_mutation(self):
+        self.init()
+        source = self.photo()
+        root = json.loads(self.success("add-folder", self.source, "--alias", "camera"))
+        self.success("scan")
+        with Queue(self.db, destination="/Archive") as queue, queue.exclusive_run():
+            self.assertEqual(self.invoke("update-folder", root["id"], "--destination", "/Other")[0], 2)
+            self.assertEqual(self.invoke("remove-folder", root["id"])[0], 2)
+            self.assertEqual(queue.roots()[0].remote_prefix, "/Archive/camera")
+            self.assertEqual(queue.stats()["total"], 1)
+        self.assertTrue(source.exists())
+
     def test_local_errors_and_retry_preserve_permanent_failure_until_requested(self):
         self.init()
         self.photo()

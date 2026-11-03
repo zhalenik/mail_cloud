@@ -136,7 +136,7 @@ class QueueTests(unittest.TestCase):
             self.assertFalse(self.queue.upgrade_media_discovery())
         self.assertEqual(self.queue._db.total_changes, before)
         self.assertEqual(self.queue.discovery_extensions(), MEDIA_EXTENSIONS)
-        self.assertIsNone(self.queue.get_metadata('last_scan'))
+        self.assertEqual(self.queue.get_metadata('last_scan'), {'complete': False, 'reason': 'source_added'})
 
     def test_media_upgrade_preserves_custom_filters_including_explicit_old_default(self):
         for extensions, custom in [([' JPG ', 'MP4'], None), (sorted(PHOTO_EXTENSIONS), True)]:
@@ -219,9 +219,10 @@ class QueueTests(unittest.TestCase):
         self.queue.scan()
         self.queue._db.execute("DROP INDEX jobs_status")
         self.queue._db.execute("DROP TABLE commit_intents")
+        self.queue._db.execute("PRAGMA user_version=1")
         with Queue(self.db, destination="/Archive", account_id="test-account") as upgraded:
             self.assertEqual(upgraded.stats()["pending"], 1)
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 2)
             names = {row[0] for row in upgraded._db.execute("SELECT name FROM sqlite_master")}
             self.assertIn("jobs_status", names)
             self.assertIn("commit_intents", names)
@@ -280,6 +281,416 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(QueueConfigurationError):
             self.queue.add_root(self.source, "new_alias")
         self.assertEqual(self.queue.add_root(self.source, "camera").id, 1)
+
+    def legacy_ledger(self, version=1):
+        """Restore the pre-source-removal table shape without changing proof."""
+        self.queue._db.execute("""CREATE TABLE legacy_upload_results (
+            id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
+            remote_hash TEXT, remote_id TEXT, verified_metadata TEXT, uploaded_at REAL NOT NULL
+        )""")
+        self.queue._db.execute("""INSERT INTO legacy_upload_results
+            SELECT id,job_id,source_size,source_mtime_ns,remote_hash,remote_id,verified_metadata,uploaded_at
+            FROM upload_results""")
+        self.queue._db.execute("DROP TABLE upload_results")
+        self.queue._db.execute("ALTER TABLE legacy_upload_results RENAME TO upload_results")
+        self.queue._db.execute(f"PRAGMA user_version={version}")
+
+    def test_legacy_ledger_migration_retains_actual_path_and_survives_source_removal(self):
+        source = self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash="verified-hash", remote_id="remote-object",
+                                 verified_metadata={"path": "/ActualCloud/photo.jpg", "is_unlim_upload": True})
+        self.legacy_ledger()
+        before = dict(self.queue._db.execute("SELECT * FROM upload_results").fetchone())
+        with Queue(self.db, destination="/Archive", account_id="test-account") as upgraded:
+            history = upgraded.upload_history(job.id)[0]
+            self.assertEqual(history["remote_path"], "/ActualCloud/photo.jpg")
+            self.assertEqual(history["account_id"], "test-account")
+            self.assertEqual(history["local_path"], str(source))
+            self.assertIsNone(history["source_device"])
+            self.assertIsNone(history["source_inode"])
+            row = dict(upgraded._db.execute("SELECT * FROM upload_results").fetchone())
+            self.assertEqual({key: row[key] for key in before}, before)
+            self.assertEqual(upgraded.remove_root(job.root_id), 1)
+            detached = dict(upgraded._db.execute("SELECT * FROM upload_results").fetchone())
+            self.assertIsNone(detached.pop("job_id"))
+            row.pop("job_id")
+            self.assertEqual(detached, row)
+            self.assertEqual(upgraded._db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(upgraded.stats()["total"], 0)
+            self.assertTrue(source.exists())
+            upgraded.add_root(self.source, "camera")
+            upgraded.scan()
+            replacement = upgraded.claim()
+            self.assertEqual(replacement.id, job.id)  # SQLite may reuse an empty task ID.
+            self.assertEqual(upgraded.upload_history(replacement.id), [])
+
+    def test_schema_migration_rolls_back_tables_indexes_metadata_and_version_together(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash="preserve-this-proof")
+        self.legacy_ledger()
+        before = [dict(row) for row in self.queue._db.execute("SELECT * FROM upload_results")]
+        version = self.queue._db.execute("PRAGMA data_version").fetchone()[0]
+        with patch.object(Queue, "_create_queue_indexes", side_effect=OSError("migration interrupted")):
+            with self.assertRaisesRegex(OSError, "migration interrupted"):
+                Queue(self.db, destination="/Archive", account_id="test-account")
+        self.assertEqual(self.queue._db.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertEqual(self.queue._db.execute("PRAGMA data_version").fetchone()[0], version)
+        columns = {row["name"]: row for row in self.queue._db.execute("PRAGMA table_info(upload_results)")}
+        self.assertEqual(columns["job_id"]["notnull"], 1)
+        self.assertNotIn("remote_path", columns)
+        self.assertIsNone(self.queue._db.execute("SELECT 1 FROM sqlite_master WHERE name='upload_results_migration'").fetchone())
+        self.assertEqual([dict(row) for row in self.queue._db.execute("SELECT * FROM upload_results")], before)
+        with Queue(self.db, destination="/Archive") as recovered:
+            self.assertEqual(recovered._db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(recovered.upload_history(job.id)[0]["remote_hash"], "preserve-this-proof")
+
+    def test_schema_zero_can_migrate_legacy_ledger_with_malformed_optional_evidence(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash="still-preserved")
+        self.legacy_ledger(version=0)
+        self.queue._db.execute("UPDATE upload_results SET verified_metadata='invalid legacy JSON'")
+        with Queue(self.db, destination="/Archive") as upgraded:
+            row = upgraded._db.execute("SELECT * FROM upload_results").fetchone()
+            self.assertEqual(row["verified_metadata"], "invalid legacy JSON")
+            self.assertEqual(row["remote_path"], job.remote_path)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_explicit_source_destination_is_exact_and_idempotent(self):
+        other = self.base / "other"
+        other.mkdir()
+        self.photo("nested/photo.jpg", root=other)
+        root = self.queue.add_root(other, "label", remote_prefix="//CloudRoot//")
+        self.assertEqual(root.remote_prefix, "/CloudRoot")
+        self.assertTrue(self.queue.scan().complete)
+        self.assertEqual(self.queue.list_jobs()[0]["remote_path"], "/CloudRoot/nested/photo.jpg")
+        self.queue.set_metadata("last_scan", {"complete": True})
+        before = self.queue._db.total_changes
+        self.assertEqual(self.queue.add_root(other, "label"), root)
+        self.assertEqual(self.queue.add_root(other, "label", "/CloudRoot"), root)
+        self.assertEqual(self.queue.update_root(root.id, "/CloudRoot"), root)
+        self.assertEqual(self.queue._db.total_changes, before)
+        self.assertTrue(self.queue.get_metadata("last_scan")["complete"])
+        with self.assertRaises(QueueConfigurationError):
+            self.queue.add_root(other, "label", "/OtherDestination")
+        updated = self.queue.update_root(root.id, "/", alias="new label")
+        self.assertEqual(updated.alias, "new label")
+        self.assertEqual(self.queue.list_jobs()[0]["remote_path"], "/nested/photo.jpg")
+        self.assertTrue(self.queue.scan().complete)
+
+    def test_source_destination_changes_only_unsent_tasks_and_preserves_commit_evidence(self):
+        names = ("uploaded.jpg", "intent.jpg", "pending.jpg", "failed.jpg", "skipped.jpg")
+        for name in names:
+            self.photo(name)
+        self.queue.scan()
+        claimed = [self.queue.claim() for _ in names]
+        by_name = {job.relative_path: job for job in claimed}
+        for job in claimed:
+            if job.relative_path == "uploaded.jpg":
+                self.queue.mark_uploaded(job, remote_hash="verified", verified_metadata={"path": job.remote_path})
+            elif job.relative_path == "intent.jpg":
+                self.queue.save_commit_intent(job, "accepted")
+                self.queue.confirm_unlimited_commit(job, "accepted")
+                self.queue.mark_failed(job, "interrupted after add", retry_delay=None)
+            elif job.relative_path == "failed.jpg":
+                self.queue.mark_failed(job, "file error", retry_delay=None)
+            elif job.relative_path == "skipped.jpg":
+                self.queue.mark_skipped(job, "manual fixture")
+            else:
+                self.queue.release(job)
+        before_history = self.queue.upload_history(by_name["uploaded.jpg"].id)
+        before_intent = dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone())
+        updated = self.queue.update_root(1, "/SelectedCloudFolder", alias="renamed label")
+        self.assertEqual(updated.remote_prefix, "/SelectedCloudFolder")
+        self.assertFalse(self.queue.get_metadata("last_scan")["complete"])
+        for name, job in by_name.items():
+            prefix = "/Archive/camera" if name in ("uploaded.jpg", "intent.jpg") else "/SelectedCloudFolder"
+            self.assertEqual(self.queue.get_job(job.id)["remote_path"], prefix + "/" + name)
+        self.assertEqual(self.queue.upload_history(by_name["uploaded.jpg"].id), before_history)
+        self.assertEqual(dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone()), before_intent)
+        self.assertTrue(self.queue.scan().complete)
+        self.photo("new.jpg")
+        self.assertTrue(self.queue.scan().complete)
+        self.assertEqual(next(row for row in self.queue.list_jobs() if row["relative_path"] == "new.jpg")["remote_path"],
+                         "/SelectedCloudFolder/new.jpg")
+        self.assertEqual(self.queue.upload_history(by_name["uploaded.jpg"].id), before_history)
+
+    def test_destination_rewrite_handles_intermediate_self_collision_but_rolls_back_real_collision(self):
+        self.photo("x.jpg")
+        self.photo("nested/x.jpg")
+        self.queue.scan()
+        self.queue.update_root(1, "/Archive/camera/nested")
+        self.assertEqual({row["remote_path"] for row in self.queue.list_jobs()}, {
+            "/Archive/camera/nested/x.jpg", "/Archive/camera/nested/nested/x.jpg",
+        })
+        claims = [self.queue.claim(), self.queue.claim()]
+        for job in claims:
+            if job.relative_path == "nested/x.jpg":
+                self.queue.mark_uploaded(job, remote_hash="frozen")
+            else:
+                self.queue.release(job)
+        before_rows = self.queue.list_jobs()
+        before_root = self.queue.roots()
+        before_scan = self.queue.get_metadata("last_scan")
+        with self.assertRaises(ScanCollisionError):
+            self.queue.update_root(1, "/Archive/camera/nested/nested")
+        self.assertEqual(self.queue.list_jobs(), before_rows)
+        self.assertEqual(self.queue.roots(), before_root)
+        self.assertEqual(self.queue.get_metadata("last_scan"), before_scan)
+
+    def test_source_removal_preserves_detached_evidence_originals_and_other_sources(self):
+        original = self.photo("uploaded.jpg")
+        pending = self.photo("pending.jpg")
+        other = self.base / "other"
+        other.mkdir()
+        other_photo = self.photo(root=other)
+        keep = self.queue.add_root(other, "keep", remote_prefix="/Keep")
+        self.queue.scan()
+        claimed = [self.queue.claim() for _ in range(3)]
+        for job in claimed:
+            if job.relative_path == "uploaded.jpg":
+                self.queue.mark_uploaded(job, remote_hash="original-proof", verified_metadata={"path": job.remote_path})
+                completed = job
+            else:
+                self.queue.release(job)
+        snapshot = dict(self.queue._db.execute("SELECT * FROM upload_results").fetchone())
+        self.assertEqual(snapshot["source_inode"], str(completed.inode))
+        self.assertEqual(snapshot["account_id"], "test-account")
+        self.assertEqual(self.queue.remove_root(1), 2)
+        detached = dict(self.queue._db.execute("SELECT * FROM upload_results").fetchone())
+        self.assertIsNone(detached.pop("job_id"))
+        snapshot.pop("job_id")
+        self.assertEqual(detached, snapshot)
+        self.assertEqual(self.queue.roots(), [keep])
+        self.assertEqual(self.queue.stats()["total"], 1)
+        self.assertTrue(all(path.exists() for path in (original, pending, other_photo)))
+        self.assertEqual(self.queue.get_metadata("last_scan")["reason"], "source_removed")
+        with self.assertRaises(QueueConfigurationError):
+            self.queue.remove_root(1)
+
+    def test_all_source_mutations_refuse_active_runner_claim_and_scan(self):
+        extra = self.base / "extra"
+        extra.mkdir()
+        self.photo()
+        self.queue.scan()
+        def mutations(queue):
+            return (lambda: queue.add_root(extra, "extra"),
+                    lambda: queue.update_root(1, "/New"),
+                    lambda: queue.remove_root(1))
+        with self.queue.exclusive_run(), Queue(self.db, destination="/Archive") as other:
+            for change in mutations(other):
+                with self.assertRaises(QueueBusyError):
+                    change()
+        job = self.queue.claim()
+        for change in mutations(self.queue):
+            with self.assertRaises(QueueBusyError):
+                change()
+        self.queue.release(job)
+        self.queue._db.execute("INSERT INTO metadata(key,value) VALUES('_scan_token','\"fixture\"')")
+        for change in mutations(self.queue):
+            with self.assertRaises(QueueBusyError):
+                change()
+        self.queue._db.execute("DELETE FROM metadata WHERE key='_scan_token'")
+        self.assertEqual(len(self.queue.roots()), 1)
+        self.assertEqual(self.queue.stats()["total"], 1)
+
+    def test_deleted_source_id_is_never_reused_after_restart_or_in_legacy_queue(self):
+        self.photo()
+        self.queue.scan()
+        old = self.queue.roots()[0]
+        # Model an existing database created before the source sequence was
+        # introduced. Removal must preserve the high-water value lazily.
+        self.queue._db.execute("DELETE FROM metadata WHERE key='_root_id_high_water'")
+        self.queue.remove_root(old.id)
+        with Queue(self.db, destination="/Archive") as reopened:
+            current = reopened.add_root(self.source, "camera", remote_prefix="/New")
+            self.assertGreater(current.id, old.id)
+            reopened.scan()
+            before_tasks = reopened.list_jobs()
+            before_root = reopened.roots()
+            for action in (lambda: reopened.update_root(old.id, "/StaleBrowser"),
+                           lambda: reopened.remove_root(old.id)):
+                with self.assertRaises(QueueConfigurationError):
+                    action()
+            self.assertEqual(reopened.list_jobs(), before_tasks)
+            self.assertEqual(reopened.roots(), before_root)
+            reopened.remove_root(current.id)
+            newest = reopened.add_root(self.source, "camera")
+            self.assertGreater(newest.id, current.id)
+
+    def test_moved_pending_tasks_keep_ids_and_progress_reaches_one_hundred_percent(self):
+        paths = [self.photo(f"{number}.jpg") for number in range(5)]
+        self.queue.scan()
+        before = {row["local_path"]: row["id"] for row in self.queue.list_jobs()}
+        subfolder = self.source / "moved"
+        subfolder.mkdir()
+        for path in paths[:2]:
+            path.rename(subfolder / path.name)
+        result = self.queue.scan(batch_size=1)
+        self.assertTrue(result.complete)
+        self.assertEqual((result.added, result.moved, result.missing, result.unchanged), (0, 2, 0, 3))
+        self.assertEqual(self.queue.stats()["total"], 5)
+        for row in self.queue.list_jobs():
+            self.assertEqual(row["id"], before[str(self.source / Path(row["local_path"]).name)])
+            self.assertEqual(row["remote_path"], "/Archive/camera/" + row["relative_path"])
+        while job := self.queue.claim():
+            self.queue.mark_uploaded(job, remote_hash="offline-confirmed")
+        current = self.queue.stats()
+        self.assertEqual((current["uploaded"], current["total"], current["pending"]), (5, 5, 0))
+        self.assertEqual(len(self.queue.list_jobs(include_missing=True)), 5)
+
+    def test_moved_uploaded_task_keeps_actual_cloud_path_and_proof_until_source_changes(self):
+        original = self.photo("before.jpg")
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash="original-hash", verified_metadata={"path": job.remote_path})
+        history = self.queue.upload_history(job.id)
+        relocated = self.source / "new.jpg"
+        original.rename(relocated)
+        result = self.queue.scan()
+        self.assertEqual((result.moved, result.added, result.missing), (1, 0, 0))
+        row = self.queue.get_job(job.id)
+        self.assertEqual(row["relative_path"], "new.jpg")
+        self.assertEqual(row["remote_path"], job.remote_path)
+        self.assertEqual(row["status"], "uploaded")
+        self.assertEqual(self.queue.upload_history(job.id), history)
+        self.assertTrue(self.queue.scan().complete)
+        self.assertIsNone(self.queue.claim())
+        self.queue.update_root(1, "/AfterDestinationEdit")
+        relocated.write_bytes(b"different file bytes")
+        self.assertEqual(self.queue.scan().changed, 1)
+        changed = self.queue.get_job(job.id)
+        self.assertEqual(changed["status"], "pending")
+        self.assertEqual(changed["remote_path"], "/AfterDestinationEdit/new.jpg")
+        self.assertEqual(self.queue.upload_history(job.id), history)
+
+    def test_move_never_transfers_a_commit_intent_to_a_new_remote_path(self):
+        original = self.photo("before.jpg")
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "uncertain-commit")
+        self.queue.confirm_unlimited_commit(job, "uncertain-commit")
+        self.queue.release(job)
+        intent = dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone())
+        original.rename(self.source / "after.jpg")
+        result = self.queue.scan()
+        self.assertEqual((result.added, result.moved, result.missing), (1, 0, 1))
+        self.assertEqual(self.queue.stats()["total"], 1)
+        self.assertEqual(self.queue.stats(include_missing=True)["total"], 2)
+        self.assertIsNone(self.queue.get_job(job.id))
+        self.assertEqual(self.queue.get_job(job.id, include_missing=True)["present"], 0)
+        self.assertEqual(dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone()), intent)
+        replacement = self.queue.claim()
+        self.assertNotEqual(replacement.id, job.id)
+        self.assertIsNone(self.queue.get_commit_intent(replacement))
+        self.assertEqual(self.queue.upload_history(replacement.id), [])
+
+    def test_source_change_after_destination_edit_cannot_erase_intent_on_collision(self):
+        original = self.photo("photo.jpg")
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "accepted-original")
+        self.queue.confirm_unlimited_commit(job, "accepted-original")
+        self.queue.release(job)
+        self.queue.update_root(1, "/Conflict")
+        other = self.base / "other"
+        other.mkdir()
+        self.photo("photo.jpg", root=other)
+        self.queue.add_root(other, "other", remote_prefix="/Conflict")
+        self.assertTrue(self.queue.scan().complete)
+        intent = dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone())
+        before = self.queue.get_job(job.id)
+        original.write_bytes(b"source changed after its old upload was accepted")
+        result = self.queue.scan()
+        self.assertFalse(result.complete)
+        self.assertEqual(result.error_count, 1)
+        self.assertEqual(self.queue.get_job(job.id), before)
+        self.assertEqual(dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone()), intent)
+        # Claim-time detection records a local failure and moves on. It does
+        # not delete the intent or strand a running claim on a UNIQUE error.
+        remaining = self.queue.claim()
+        self.assertEqual(remaining.local_path, str(other / "photo.jpg"))
+        failed = self.queue.get_job(job.id)
+        self.assertEqual(failed["status"], "failed")
+        self.assertIsNone(failed["next_attempt"])
+        self.assertEqual(failed["size"], before["size"])
+        self.assertEqual(dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone()), intent)
+
+    def test_source_change_during_claim_uses_current_destination_after_frozen_intent(self):
+        source = self.photo()
+        self.queue.scan()
+        old = self.queue.claim()
+        self.queue.save_commit_intent(old, "old-source-intent")
+        self.queue.release(old)
+        self.queue.update_root(1, "/Retargeted")
+        source.write_bytes(b"this is a newer local source")
+        current = self.queue.claim()
+        self.assertEqual(current.id, old.id)
+        self.assertEqual(current.remote_path, "/Retargeted/photo.jpg")
+        self.assertEqual(current.size, source.stat().st_size)
+        self.assertIsNone(self.queue.get_commit_intent(current))
+
+    def test_hardlinks_are_independent_tasks_even_if_original_name_disappears(self):
+        original = self.photo("original.jpg")
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash="original-hash")
+        elsewhere = self.base / "hardlink.jpg"
+        try:
+            os.link(original, elsewhere)
+        except OSError:
+            self.skipTest("Hard links are unavailable")
+        original.rename(self.source / "moved.jpg")
+        result = self.queue.scan()
+        self.assertEqual((result.added, result.moved, result.missing), (1, 0, 1))
+        self.assertEqual(self.queue.stats()["uploaded"], 0)
+        self.assertEqual(self.queue.stats()["pending"], 1)
+        self.assertEqual(self.queue.stats(include_missing=True)["uploaded"], 1)
+        self.assertTrue(elsewhere.exists())
+
+    def test_ambiguous_prior_inodes_do_not_adopt_an_uploaded_tasks_proof(self):
+        first = self.photo("first.jpg")
+        second = self.source / "second.jpg"
+        try:
+            os.link(first, second)
+        except OSError:
+            self.skipTest("Hard links are unavailable")
+        self.queue.scan()
+        done = self.queue.claim()
+        self.queue.mark_uploaded(done, remote_hash="keep-with-old-task")
+        first.rename(self.source / "third.jpg")
+        second.unlink()
+        result = self.queue.scan()
+        self.assertEqual((result.added, result.moved, result.missing), (1, 0, 2))
+        self.assertEqual(self.queue.stats()["total"], 1)
+        self.assertEqual(self.queue.stats(include_missing=True)["total"], 3)
+        self.assertEqual(self.queue.list_jobs()[0]["status"], "pending")
+        self.assertEqual(self.queue.upload_history(done.id)[0]["remote_hash"], "keep-with-old-task")
+
+    def test_current_views_exclude_missing_uploads_and_failed_history(self):
+        keep = self.photo("keep.jpg")
+        missing = self.photo("remove.jpg")
+        self.queue.scan()
+        claims = [self.queue.claim(), self.queue.claim()]
+        for job in claims:
+            self.queue.mark_uploaded(job, remote_hash="confirmed")
+        removed_id = next(job.id for job in claims if job.local_path == str(missing))
+        missing.unlink()
+        self.queue.scan()
+        self.assertEqual(self.queue.stats()["total"], 1)
+        self.assertEqual(self.queue.stats()["uploaded_bytes"], keep.stat().st_size)
+        self.assertEqual(self.queue.stats(include_missing=True)["total"], 2)
+        self.assertIsNone(self.queue.get_job(removed_id))
+        self.assertEqual(self.queue.get_job(removed_id, include_missing=True)["status"], "uploaded")
+        self.assertEqual(len(self.queue.list_jobs("uploaded", summary=True)), 1)
+        self.assertEqual(len(self.queue.list_jobs("uploaded", summary=True, include_missing=True)), 2)
+        self.assertIsNone(self.queue.get_job(999999))
 
     def test_concurrent_connections_never_claim_same_job(self):
         for n in range(80):
@@ -365,10 +776,9 @@ class QueueTests(unittest.TestCase):
         job = self.queue.claim()
         self.assertEqual(job.local_path, str(second))
         self.queue.mark_uploaded(job)
-        # Directory enumeration order is not guaranteed. Drain any remaining
-        # missing entry before checking the final queue outcome.
         self.assertIsNone(self.queue.claim())
-        self.assertEqual(self.queue.stats()["skipped"], 1)
+        self.assertEqual(self.queue.stats()["skipped"], 0)
+        self.assertEqual(self.queue.stats(include_missing=True)["skipped"], 1)
         self.assertEqual(self.queue.stats()["uploaded"], 1)
 
     def test_complete_rescan_marks_missing_and_restored_file_returns_to_queue(self):
@@ -378,7 +788,8 @@ class QueueTests(unittest.TestCase):
         path.unlink()
         result = self.queue.scan()
         self.assertEqual(result.missing, 1)
-        self.assertEqual(self.queue.stats()["skipped"], 1)
+        self.assertEqual(self.queue.stats()["skipped"], 0)
+        self.assertEqual(self.queue.stats(include_missing=True)["skipped"], 1)
         path.write_bytes(saved)
         self.queue.scan()
         self.assertEqual(self.queue.stats()["pending"], 1)
@@ -633,8 +1044,9 @@ class QueueTests(unittest.TestCase):
         for name in ("jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry_unlimited", "jobs_retry_regular"):
             self.queue._db.execute(f"DROP INDEX {name}")
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN storage_mode")
+        self.queue._db.execute("PRAGMA user_version=1")
         with Queue(self.db, destination="/Archive", account_id="test-account") as upgraded:
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertIsNone(upgraded.list_jobs(summary=True)[0]["storage_mode"])
             resumed = upgraded.claim(storage_mode="unlimited")
             self.assertIsNone(resumed.storage_mode)

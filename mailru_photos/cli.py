@@ -96,7 +96,14 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor", help="проверить авторизацию, признак безлимита и квоту; файлы не загружает")
     folder = commands.add_parser("add-folder", help="добавить исходную папку рекурсивно")
     folder.add_argument("path", type=Path)
-    folder.add_argument("--alias", required=True, help="уникальное имя источника в папке назначения")
+    folder.add_argument("--alias", required=True, help="уникальное имя источника")
+    folder.add_argument("--destination", help="точная папка в Облаке для этого источника")
+    update_folder = commands.add_parser("update-folder", help="изменить облачную папку источника для незавершённых задач")
+    update_folder.add_argument("id", type=int, help="идентификатор источника из status")
+    update_folder.add_argument("--destination", required=True, help="новая точная папка в Облаке")
+    update_folder.add_argument("--alias", help="новое уникальное имя источника")
+    remove_folder = commands.add_parser("remove-folder", help="убрать источник и его задачи, сохранив файлы")
+    remove_folder.add_argument("id", type=int, help="идентификатор источника из status")
     scan = commands.add_parser("scan", help="обойти все источники и обновить очередь")
     scan.add_argument("--extensions", help="расширения через запятую; по умолчанию фото и видео, например jpg,png,heic,mp4,mov")
     commands.add_parser("status", help="показать состояние очереди без сети")
@@ -191,10 +198,15 @@ def dispatch(args) -> int:
     configuration = _configuration(directory)
     with Queue(directory / "queue.sqlite3", destination=configuration["destination"]) as queue:
         if args.command == "add-folder":
-            with queue.exclusive_run():
-                root = queue.add_root(args.path, args.alias)
-                queue.set_metadata("last_scan", {"complete": False, "reason": "source_added"})
+            root = queue.add_root(args.path, args.alias, remote_prefix=args.destination)
             pretty(dataclasses.asdict(root))
+            return 0
+        if args.command == "update-folder":
+            root = queue.update_root(args.id, remote_prefix=args.destination, alias=args.alias)
+            pretty(dataclasses.asdict(root))
+            return 0
+        if args.command == "remove-folder":
+            pretty({"removed_tasks": queue.remove_root(args.id)})
             return 0
         if args.command == "scan":
             with queue.exclusive_run():

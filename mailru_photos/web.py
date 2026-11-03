@@ -331,8 +331,21 @@ class WebApplication:
             self.service.login(_text(data, "email", limit=320), _text(data, "password", limit=1024))
         elif path == "/api/logout":
             self.service.logout()
-        elif path == "/api/sources":
-            self.service.add_folder(_text(data, "path"), _text(data, "alias", limit=255))
+        elif path == "/api/sources/add":
+            self.service.add_folder(_text(data, "path"), _text(data, "alias", limit=255),
+                                    remote_prefix=_text(data, "remote_prefix", limit=2048))
+        elif path in {"/api/sources", "/api/add-folder"}:
+            # Older panels and scripted clients derive their default from the
+            # existing queue configuration; new forms always send a full path.
+            self.service.add_folder(_text(data, "path"), _text(data, "alias", limit=255),
+                                    remote_prefix=_text(data, "remote_prefix", limit=2048)
+                                    if "remote_prefix" in data else None)
+        elif path == "/api/sources/update":
+            self.service.update_source(_integer(data.get("id"), 1, 2**63 - 1),
+                                       remote_prefix=_text(data, "remote_prefix", limit=2048),
+                                       alias=_text(data, "alias", limit=255) if "alias" in data else None)
+        elif path == "/api/sources/remove":
+            self.service.remove_source(_integer(data.get("id"), 1, 2**63 - 1))
         elif path == "/api/scan":
             self.service.scan()
         elif path == "/api/start":

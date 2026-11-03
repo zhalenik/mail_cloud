@@ -3,7 +3,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const numberFormat = new Intl.NumberFormat("ru-RU");
-  const pageNames = { overview: "Обзор", queue: "Очередь файлов", sources: "Исходные папки", settings: "Настройки" };
+  const pageNames = { overview: "Обзор", queue: "Очередь задач", sources: "Исходные папки", settings: "Настройки" };
   const busyPhases = new Set(["login", "logout", "scanning", "checking", "probing", "uploading", "pausing"]);
   const phaseInfo = {
     idle: ["Готов к работе", "Ожидание", "neutral", "cloud"],
@@ -19,8 +19,8 @@
     error: ["Нужно ваше внимание", "Приостановлено", "red", "alert"]
   };
   const jobStates = {
-    pending: ["Ожидает", "neutral"], running: ["В работе", "blue"], uploaded: ["Загружен", "green"],
-    failed: ["Ошибка", "red"], skipped: ["Пропущен", "orange"]
+    pending: ["Ожидает", "neutral"], running: ["В работе", "blue"], uploaded: ["Выполнена", "green"],
+    failed: ["Ошибка", "red"], skipped: ["Пропущена", "orange"]
   };
   let session = { authenticated: false, setup_required: false, csrf: "" };
   let snapshot = null;
@@ -35,6 +35,9 @@
   let jobsRequest = 0;
   let folderState = { path: null, parent: null };
   let folderRequest = 0;
+  let editingSourceId = null;
+  let removingSourceId = null;
+  let sourcesSignature = null;
   let settingsDirty = false;
   let connected = true;
   let accessBusy = false;
@@ -46,6 +49,12 @@
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
   }
   function count(value) { return numberFormat.format(Math.max(0, Math.floor(finite(value)))); }
+  function taskCount(value) {
+    const amount = Math.max(0, Math.floor(finite(value)));
+    const lastTwo = amount % 100, last = amount % 10;
+    const noun = lastTwo >= 11 && lastTwo <= 14 ? "задач" : last === 1 ? "задача" : last >= 2 && last <= 4 ? "задачи" : "задач";
+    return count(amount) + " " + noun;
+  }
   function bytes(value) {
     const amount = Math.max(0, finite(value));
     if (amount < 1024) return count(amount) + " Б";
@@ -244,12 +253,11 @@
   function updateControls() {
     if (!snapshot) return;
     const hasSources = Array.isArray(snapshot.sources) && snapshot.sources.length > 0;
-    const configured = snapshot.configured === true;
     const busy = isBusy();
     const transient = anyAction();
     const current = phase();
-    $("start-upload").disabled = busy || transient || !configured || !snapshot.authenticated || !hasSources || !connected;
-    $("scan-folders").disabled = busy || transient || !configured || !hasSources || !connected;
+    $("start-upload").disabled = busy || transient || !snapshot.authenticated || !hasSources || !connected;
+    $("scan-folders").disabled = busy || transient || !hasSources || !connected;
     const pausable = ["scanning", "checking", "probing", "uploading", "pausing"].includes(current);
     setHidden("pause-upload", !pausable);
     setHidden("start-upload", pausable);
@@ -257,15 +265,17 @@
     $("pause-upload").querySelector("span").textContent = current === "scanning" ? "Остановить сканирование" : current === "pausing" ? "Сохраняем прогресс…" : "Приостановить";
     const resumed = ["paused", "error"].includes(current) || finite(snapshot.stats && snapshot.stats.uploaded) > 0;
     $("start-upload").querySelector("span").textContent = resumed ? "Продолжить загрузку" : "Начать загрузку";
-    ["add-source", "empty-add-source", "onboarding-source"].forEach((id) => { $(id).disabled = busy || transient || !configured || !connected; });
-    ["onboarding-login", "settings-login", "account-menu-login"].forEach((id) => { $(id).disabled = busy || transient || !configured || !connected; });
-    $("account-button").disabled = ["login", "logout"].includes(current) || transient || !configured || !connected;
+    const sourcesDisabled = busy || transient || !connected;
+    ["add-source", "empty-add-source", "onboarding-source", "source-submit", "source-remove-submit", "browse-folders", "source-path", "source-alias", "source-remote-prefix"].forEach((id) => { $(id).disabled = sourcesDisabled; });
+    document.querySelectorAll("[data-source-action]").forEach((button) => { button.disabled = sourcesDisabled; });
+    setHidden("sources-busy-note", !busy);
+    setHidden("source-form-busy", !busy);
+    setHidden("source-remove-busy", !busy);
+    ["onboarding-login", "settings-login", "account-menu-login"].forEach((id) => { $(id).disabled = busy || transient || !connected; });
+    $("account-button").disabled = ["login", "logout"].includes(current) || transient || !connected;
     $("account-menu-logout").disabled = !snapshot.authenticated || current === "logout" || transient || !connected;
-    setText("account-menu-note", busy ? "Выход остановит текущую работу и сохранит очередь." : "Очередь и завершённые задания сохранятся. Для продолжения войдите в этот же аккаунт.");
-    $("open-setup").disabled = configured || busy || transient || !connected;
-    $("settings-setup").disabled = configured || busy || transient || !connected;
-    setHidden("settings-setup", configured);
-    $("retry-errors").disabled = busy || transient || !configured || finite(snapshot.stats && snapshot.stats.failed) === 0 || !connected;
+    setText("account-menu-note", busy ? "Выход остановит текущую работу и сохранит очередь." : "Очередь и завершённые задачи сохранятся. Для продолжения войдите в этот же аккаунт.");
+    $("retry-errors").disabled = busy || transient || finite(snapshot.stats && snapshot.stats.failed) === 0 || !connected;
     $("save-settings").disabled = busy || transient || !connected;
     $("workers").disabled = busy || transient;
     $("auto-resume").disabled = busy || transient;
@@ -282,7 +292,10 @@
     const info = phaseInfo[current] || phaseInfo.idle;
     const total = Math.max(0, finite(stats.total));
     const uploaded = Math.max(0, finite(stats.uploaded));
-    const percentage = total > 0 ? Math.min(100, uploaded / total * 100) : 0;
+    const failed = Math.max(0, finite(stats.failed)), skipped = Math.max(0, finite(stats.skipped));
+    const finishedErrors = Math.max(0, finite(stats.permanent_failures ?? failed));
+    const processed = Math.min(total, uploaded + finishedErrors + skipped);
+    const percentage = total > 0 ? processed / total * 100 : 0;
     setText("version-label", "Версия " + plain(state.version, "0.4"));
     setText("account-label", state.authenticated ? plain(state.account, "Вход сохранён") : "Подключить Mail.ru");
     $("account-button").title = state.authenticated ? "Вход в Mail.ru сохранён: " + plain(state.account) : "Подключить аккаунт Mail.ru";
@@ -294,25 +307,24 @@
     setText("phase-badge", info[1]);
     $("phase-badge").className = "badge " + info[2];
     $("phase-icon").replaceChildren(icon(info[3]));
-    let fallbackMessage = !state.configured ? "Выберите папку назначения в Облаке." : !state.authenticated ? "Подключите аккаунт Mail.ru." : sources.length === 0 ? "Добавьте исходную папку с фото и видео." : total === 0 ? "Нажмите «Начать загрузку»: клиент сам найдёт фото и видео." : "История сохранена. Можно продолжить работу.";
+    let fallbackMessage = !state.authenticated ? "Подключите аккаунт Mail.ru." : sources.length === 0 ? "Добавьте исходную папку с фото и видео." : total === 0 ? "Нажмите «Начать загрузку»: клиент сам найдёт фото и видео." : "Прогресс задач сохранён. Можно продолжить работу.";
     setText("activity-message", plain(activity.message, fallbackMessage) || fallbackMessage);
-    setText("uploaded-count", count(uploaded));
+    setText("processed-count", count(processed));
     setText("total-count", count(total));
     setText("progress-percent", percentage.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%");
     $("overall-progress-fill").style.width = percentage + "%";
     $("overall-progress").setAttribute("aria-valuenow", percentage.toFixed(1));
-    $("overall-progress").setAttribute("aria-valuetext", count(uploaded) + " из " + count(total) + " файлов загружено");
-    setText("transfer-bytes", bytes(stats.uploaded_bytes) + " из " + bytes(stats.total_bytes));
-    setText("destination-label", state.destination ? "В Облаке: " + state.destination : "Назначение ещё не выбрано");
-    $("destination-label").title = plain(state.destination);
+    $("overall-progress").setAttribute("aria-valuetext", "Обработано задач: " + count(processed) + " из " + count(total));
+    setText("transfer-bytes", "Загружено: " + bytes(stats.uploaded_bytes) + " · Объём задач: " + bytes(stats.total_bytes));
+    setText("transfer-outcomes", "Успешно: " + count(uploaded) + " · Ошибок: " + count(failed) + " · Пропущено: " + count(skipped));
     setText("stat-pending", count(finite(stats.pending) + finite(stats.running)));
     const byStatus = stats.bytes_by_status || {};
     setText("stat-pending-bytes", bytes(finite(byStatus.pending) + finite(byStatus.running)));
     setText("stat-uploaded", count(uploaded));
     setText("stat-uploaded-bytes", bytes(stats.uploaded_bytes));
-    setText("stat-failed", count(stats.failed));
+    setText("stat-failed", count(failed));
     setText("stat-sources", count(sources.length));
-    setText("stat-skipped", "Пропущено: " + count(stats.skipped));
+    setText("stat-skipped", "Пропущено: " + count(skipped));
     const scan = activity.scan || {};
     setHidden("scan-live", current !== "scanning");
     setText("scan-seen", count(scan.seen));
@@ -335,10 +347,10 @@
   }
 
   function renderOnboarding(state, sources) {
-    const completed = [state.configured === true, state.authenticated === true, sources.length > 0];
+    const completed = [state.authenticated === true, sources.length > 0];
     setHidden("onboarding", completed.every(Boolean));
-    setText("setup-count", completed.filter(Boolean).length + " из 3");
-    ["destination", "account", "sources"].forEach((name, index) => {
+    setText("setup-count", completed.filter(Boolean).length + " из 2");
+    ["account", "sources"].forEach((name, index) => {
       const node = $("step-" + name);
       node.classList.toggle("done", completed[index]);
       const number = node.querySelector(".step-number");
@@ -346,9 +358,8 @@
       else number.textContent = String(index + 1);
       node.querySelector("button").hidden = completed[index];
     });
-    setText("step-destination-text", completed[0] ? state.destination : "Где хранить ваш архив");
-    setText("step-account-text", completed[1] ? plain(state.account, "Вход сохранён") : "Войдите с паролем приложения");
-    setText("step-sources-text", completed[2] ? "Подключено папок: " + count(sources.length) : "Папки на вашем сервере");
+    setText("step-account-text", completed[0] ? plain(state.account, "Вход сохранён") : "Войдите с паролем приложения");
+    setText("step-sources-text", completed[1] ? "Подключено папок: " + count(sources.length) : "Откуда читать и куда загружать файлы");
   }
 
   function renderProbeCountdown() {
@@ -367,11 +378,11 @@
   function renderActiveFiles(files) {
     const list = $("active-files");
     list.replaceChildren();
-    setText("active-count", count(files.length) + " файлов");
+    setText("active-count", taskCount(files.length));
     if (!files.length) {
-      let title = "Активных загрузок пока нет", message = "Здесь появятся файлы, которые обрабатываются прямо сейчас.";
+      let title = "Активных задач пока нет", message = "Здесь появятся задачи, которые выполняются прямо сейчас.";
       if (phase() === "paused") { title = "Очередь на паузе"; message = "Нажмите «Продолжить загрузку», когда будете готовы."; }
-      if (phase() === "completed") { title = "Все текущие задания обработаны"; message = "Добавьте новые фото или видео и нажмите «Найти новые файлы»."; }
+      if (phase() === "completed") { title = "Все текущие задачи обработаны"; message = "После изменения файлов на сервере нажмите «Пересканировать папки»."; }
       if (phase() === "scanning") { title = "Собираем список файлов"; message = "Сканирование не копирует файлы и не создаёт миниатюры."; }
       list.appendChild(emptyBlock("image", title, message, true));
       return;
@@ -417,17 +428,34 @@
 
   function renderSources(sources) {
     setHidden("sources-empty", sources.length > 0);
+    const signature = JSON.stringify(sources.map((source) => [source.id, source.path, source.alias, source.remote_prefix]));
+    if (signature === sourcesSignature) return;
+    sourcesSignature = signature;
     const list = $("sources-list"); list.replaceChildren();
     sources.forEach((source) => {
       const card = element("article", "card source-card");
       const symbol = element("span", "stat-icon blue"); symbol.appendChild(icon("folder"));
       const info = element("div", "source-info");
-      info.appendChild(element("h2", "", plain(source.alias, "Папка")));
+      const heading = element("div", "source-title-line");
+      heading.append(element("h2", "", plain(source.alias, "Папка")), element("span", "badge neutral", "Все подпапки"));
+      info.appendChild(heading);
       const local = element("div", "source-path-line"), remote = element("div", "source-path-line");
       local.append(element("span", "", "На сервере"), element("span", "", plain(source.path)));
       remote.append(element("span", "", "В Облаке"), element("span", "", plain(source.remote_prefix)));
       info.append(local, remote);
-      card.append(symbol, info, element("span", "badge neutral", "Все подпапки"));
+      const actions = element("div", "source-actions");
+      const edit = element("button", "button compact"); edit.type = "button";
+      edit.dataset.sourceAction = "edit"; edit.dataset.sourceId = String(source.id);
+      edit.setAttribute("aria-label", "Изменить источник «" + plain(source.alias, "Папка") + "»");
+      edit.append(icon("edit", "small"), document.createTextNode("Изменить"));
+      edit.addEventListener("click", () => openSource(source.id));
+      const remove = element("button", "button compact danger subtle"); remove.type = "button";
+      remove.dataset.sourceAction = "remove"; remove.dataset.sourceId = String(source.id);
+      remove.setAttribute("aria-label", "Убрать источник «" + plain(source.alias, "Папка") + "»");
+      remove.append(icon("remove", "small"), document.createTextNode("Убрать"));
+      remove.addEventListener("click", () => openSourceRemoval(source.id));
+      actions.append(edit, remove);
+      card.append(symbol, info, actions);
       list.appendChild(card);
     });
   }
@@ -435,7 +463,6 @@
   function renderSettings(state) {
     setText("settings-account", state.authenticated ? plain(state.account, "Вход сохранён") : "Аккаунт не подключён");
     setText("settings-login", state.authenticated ? "Войти заново" : "Войти");
-    setText("settings-destination", plain(state.destination, "Ещё не выбрана"));
     if (!settingsDirty && !pendingActions.has("settings")) {
       $("workers").value = String(finite(state.settings && state.settings.workers, 2));
       $("auto-resume").checked = !state.settings || state.settings.auto_resume !== false;
@@ -480,8 +507,8 @@
   function renderJobs(jobs) {
     const body = $("jobs-body"); body.replaceChildren();
     setHidden("jobs-empty", jobs.length > 0);
-    setText("jobs-empty-title", jobsFilter === "all" ? "В очереди пока нет файлов" : "Таких заданий сейчас нет");
-    setText("jobs-empty-description", jobsFilter === "all" ? "Добавьте исходную папку и запустите сканирование." : "Выберите другой фильтр, чтобы посмотреть остальные файлы.");
+    setText("jobs-empty-title", jobsFilter === "all" ? "В очереди пока нет задач" : "Таких задач сейчас нет");
+    setText("jobs-empty-description", jobsFilter === "all" ? "Добавьте исходную папку и запустите сканирование." : "Выберите другой фильтр, чтобы посмотреть остальные задачи.");
     jobs.forEach((job) => {
       const row = document.createElement("tr");
       const nameCell = document.createElement("td");
@@ -497,14 +524,14 @@
       statusCell.appendChild(element("span", "badge " + state[1], state[0]));
       const detailCell = element("td", "job-detail" + (job.status === "failed" ? " failed" : ""));
       let detail = plain(job.last_error);
-      if (!detail && job.status === "uploaded") detail = dateTime(job.uploaded_at) || "Сохранён в Облаке";
+      if (!detail && job.status === "uploaded") detail = dateTime(job.uploaded_at) || "Файл сохранён в Облаке";
       if (!detail && job.next_attempt) detail = "Повтор: " + dateTime(job.next_attempt);
       if (!detail && job.status === "skipped") detail = "Смотрите журнал работы";
       detailCell.textContent = detail || "—";
       row.append(nameCell, statusCell, element("td", "", bytes(job.size)), element("td", "", count(job.attempts)), detailCell);
       body.appendChild(row);
     });
-    setText("jobs-range", jobsTotal === 0 ? "0 файлов" : count(jobsOffset + 1) + "–" + count(jobsOffset + jobs.length) + " из " + count(jobsTotal));
+    setText("jobs-range", jobsTotal === 0 ? "0 задач" : "Задачи " + count(jobsOffset + 1) + "–" + count(jobsOffset + jobs.length) + " из " + count(jobsTotal));
     $("jobs-prev").disabled = jobsOffset === 0;
     $("jobs-next").disabled = jobsOffset + jobs.length >= jobsTotal;
   }
@@ -527,28 +554,52 @@
     } finally { pendingActions.delete(key); updateControls(); }
   }
 
-  function openSetup() {
-    if (snapshot && snapshot.configured) return;
-    setError("setup-error"); showDialog("setup-dialog");
-  }
   function openMail() {
     closeAccountMenu();
-    if (!snapshot || !snapshot.configured) { openSetup(); return; }
+    if (!snapshot || isBusy() || anyAction() || !connected) return;
     $("mail-email").value = plain(snapshot.account);
     $("mail-password").value = "";
     setError("mail-error"); showDialog("mail-dialog");
   }
-  function openSource() {
-    if (!snapshot || !snapshot.configured) { openSetup(); return; }
+  function sourceById(id) {
+    return snapshot && Array.isArray(snapshot.sources) ? snapshot.sources.find((source) => source.id === id) : null;
+  }
+  function openSource(id = null) {
+    if (!snapshot || isBusy() || anyAction() || !connected) return;
+    const source = id === null ? null : sourceById(id);
+    if (id !== null && !source) { toast("Источник уже убран. Список папок обновлён."); return; }
+    editingSourceId = source ? source.id : null;
     $("source-form").reset();
-    setError("source-error"); updateSourcePreview(); showDialog("source-dialog");
+    $("source-path").value = source ? plain(source.path) : "";
+    $("source-path").readOnly = Boolean(source);
+    $("source-alias").value = source ? plain(source.alias) : "";
+    $("source-remote-prefix").value = source ? plain(source.remote_prefix) : "";
+    setText("source-dialog-label", source ? "НАСТРОЙКИ ИСТОЧНИКА" : "НОВЫЙ ИСТОЧНИК");
+    setText("source-dialog-title", source ? "Изменить источник" : "Добавить папку с фото и видео");
+    setText("source-description", source ? "Измените название источника или назначение загрузки в Облаке." : "Файлы читаются прямо из этой папки. Все вложенные каталоги будут найдены автоматически.");
+    setText("source-submit", source ? "Сохранить изменения" : "Добавить источник");
+    setHidden("browse-folders", Boolean(source));
+    setHidden("source-path-hint", !source);
+    setHidden("source-update-note", !source);
+    setError("source-error"); updateSourcePreview(); updateControls(); showDialog("source-dialog");
+    if (source) $("source-alias").focus();
   }
   function updateSourcePreview() {
-    const destination = plain(snapshot && snapshot.destination, "/PhotoArchivePC").replace(/\/$/, "");
-    const alias = $("source-alias").value.trim();
-    setText("source-preview", alias ? "В Облаке: " + destination + "/" + alias : "Это имя подпапки внутри вашего фотоархива.");
+    const remote = $("source-remote-prefix").value.trim();
+    setText("source-remote-hint", remote.startsWith("/") ? "Например, файл 2024/IMG.jpg будет загружен в " + remote.replace(/\/+$/, "") + "/2024/IMG.jpg. Название источника к пути не добавляется." : "Полный путь от корня Облака, начиная с /. Например: /Фото/Семья. Название источника к пути не добавляется.");
+  }
+  function openSourceRemoval(id) {
+    if (!snapshot || isBusy() || anyAction() || !connected) return;
+    const source = sourceById(id);
+    if (!source) { toast("Источник уже убран. Список папок обновлён."); return; }
+    removingSourceId = source.id;
+    setText("source-remove-name", plain(source.alias, "Папка"));
+    setText("source-remove-path", "На сервере: " + plain(source.path));
+    setText("source-remove-remote", "В Облаке: " + plain(source.remote_prefix));
+    setError("source-remove-error"); updateControls(); showDialog("source-remove-dialog");
   }
   async function openFolderPicker() {
+    if (editingSourceId !== null || isBusy() || anyAction() || !connected) return;
     setError("folder-error"); showDialog("folder-dialog");
     await browseFolder(null);
   }
@@ -671,15 +722,8 @@
   $("pause-upload").addEventListener("click", () => perform("pause", "/api/pause", {}, { message: "Останавливаем текущую работу и сохраняем прогресс…" }));
   $("scan-folders").addEventListener("click", () => perform("scan", "/api/scan"));
   $("view-errors").addEventListener("click", () => { setFilter("failed"); location.hash = "queue"; if (activePage === "queue") loadJobs(); });
-  ["open-setup", "settings-setup"].forEach((id) => $(id).addEventListener("click", openSetup));
   ["settings-login", "onboarding-login"].forEach((id) => $(id).addEventListener("click", openMail));
-  ["add-source", "empty-add-source", "onboarding-source"].forEach((id) => $(id).addEventListener("click", openSource));
-
-  $("setup-form").addEventListener("submit", async (event) => {
-    event.preventDefault(); $("setup-submit").disabled = true;
-    try { await perform("setup", "/api/setup", { destination: $("destination-input").value.trim() }, { errorId: "setup-error", close: "setup-dialog", message: "Папка назначения сохранена. Теперь подключите Mail.ru." }); }
-    finally { $("setup-submit").disabled = false; }
-  });
+  ["add-source", "empty-add-source", "onboarding-source"].forEach((id) => $(id).addEventListener("click", () => openSource()));
   $("mail-form").addEventListener("submit", async (event) => {
     event.preventDefault(); if (pendingActions.has("login")) return;
     $("mail-submit").disabled = true;
@@ -689,7 +733,7 @@
       await request;
     } finally { $("mail-submit").disabled = false; }
   });
-  $("source-alias").addEventListener("input", updateSourcePreview);
+  $("source-remote-prefix").addEventListener("input", updateSourcePreview);
   $("browse-folders").addEventListener("click", openFolderPicker);
   $("folder-roots").addEventListener("click", () => browseFolder(null));
   $("folder-up").addEventListener("click", () => { if (folderState.parent) browseFolder(folderState.parent); });
@@ -700,9 +744,24 @@
     updateSourcePreview(); $("folder-dialog").close(); $("source-alias").focus();
   });
   $("source-form").addEventListener("submit", async (event) => {
-    event.preventDefault(); $("source-submit").disabled = true;
-    try { await perform("source", "/api/sources", { path: $("source-path").value.trim(), alias: $("source-alias").value.trim() }, { errorId: "source-error", close: "source-dialog", message: "Папка добавлена. Нажмите «Начать загрузку» или запустите сканирование." }); }
-    finally { $("source-submit").disabled = false; }
+    event.preventDefault();
+    if (isBusy() || anyAction() || !connected) return;
+    const alias = $("source-alias").value.trim(), remote_prefix = $("source-remote-prefix").value.trim();
+    if (!alias) { setError("source-error", "Укажите название источника."); $("source-alias").focus(); return; }
+    if (!remote_prefix.startsWith("/")) { setError("source-error", "Укажите полный путь в Облаке, начиная с /. Например: /Фото/Семья."); $("source-remote-prefix").focus(); return; }
+    const editing = editingSourceId !== null;
+    const body = editing ? { id: editingSourceId, remote_prefix, alias } : { path: $("source-path").value.trim(), alias, remote_prefix };
+    if (await perform("source", editing ? "/api/sources/update" : "/api/sources/add", body, { errorId: "source-error", close: "source-dialog", message: editing ? "Настройки источника сохранены. Уже загруженные файлы остаются на прежних местах." : "Папка добавлена. Нажмите «Начать загрузку» или запустите сканирование." })) {
+      $("add-source").focus();
+    }
+  });
+  $("source-remove-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (removingSourceId === null || isBusy() || anyAction() || !connected) return;
+    if (await perform("source-remove", "/api/sources/remove", { id: removingSourceId }, { errorId: "source-remove-error", close: "source-remove-dialog", message: "Источник и его задачи убраны. Файлы на сервере и в Облаке сохранены." })) {
+      removingSourceId = null;
+      $("add-source").focus();
+    }
   });
 
   function setFilter(filter) {
@@ -716,7 +775,7 @@
   $("retry-errors").addEventListener("click", () => { $("retry-permanent").checked = false; setError("retry-error"); showDialog("retry-dialog"); });
   $("retry-form").addEventListener("submit", async (event) => {
     event.preventDefault(); $("retry-submit").disabled = true;
-    try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задания возвращены в очередь." }); }
+    try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задачи возвращены в очередь." }); }
     finally { $("retry-submit").disabled = false; }
   });
   ["workers", "auto-resume", "preflight-check"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));

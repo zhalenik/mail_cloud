@@ -10,7 +10,7 @@ RUN python /build/build_sqlite.py /build/libsqlite3.so.0
 
 FROM python:3.12-slim-trixie
 
-ARG VERSION=0.4.4
+ARG VERSION=0.5.0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Mail Cloud Photo Client" \
       org.opencontainers.image.description="Resumable photo and video import with a browser interface" \

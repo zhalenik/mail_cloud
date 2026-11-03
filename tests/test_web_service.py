@@ -16,7 +16,7 @@ from mailru_photos.api import PROTOCOL_VERSION, ProtocolError, cloud_hash
 from mailru_photos.auth import AuthError, TokenStore, Tokens
 from mailru_photos.cli import write_json
 from mailru_photos.media import UNLIMITED_MAX_BYTES
-from mailru_photos.queue import Queue, QueueBusyError
+from mailru_photos.queue import Queue, QueueBusyError, QueueError
 from mailru_photos.runner import process_job
 from mailru_photos.transport import Cancelled, TransportError
 from mailru_photos.web_service import WebService
@@ -72,11 +72,11 @@ class WebServiceTests(unittest.TestCase):
             service.close(timeout=2)
         self.tmp.cleanup()
 
-    def make_service(self, **kwargs):
+    def make_service(self, *, state_dir=None, **kwargs):
         def factory(tokens, *, stop):
             self.cloud.stop = stop
             return self.cloud
-        service = WebService(self.state, [self.photos], api_factory=factory,
+        service = WebService(state_dir or self.state, [self.photos], api_factory=factory,
                              event_factory=self.events, **kwargs)
         self.services.append(service)
         return service
@@ -637,6 +637,143 @@ class WebServiceTests(unittest.TestCase):
                 self.service.add_folder(path, 'Private')
         self.assertEqual(self.service.snapshot()['stats']['roots'], 1)
 
+    def test_new_panel_can_log_in_without_global_destination_setup(self):
+        class Auth:
+            def login(self, email, password):
+                return Tokens('fresh-offline-access', 'fresh-offline-refresh', email)
+        fresh = self.make_service(state_dir=self.root / 'fresh-login', auth_client_factory=Auth)
+        state = fresh.snapshot()
+        self.assertFalse(state['configured'])
+        self.assertFalse(state['authenticated'])
+        self.assertEqual(state['sources'], [])
+        fresh.login(EMAIL, 'offline-application-password')
+        state = self.done(fresh)
+        self.assertTrue(state['configured'])
+        self.assertTrue(state['authenticated'])
+        self.assertEqual(state['destination'], '/')
+        self.assertEqual(state['account'], EMAIL)
+        self.assertEqual(state['sources'], [])
+        self.assertEqual(self.cloud.commits, [])
+        self.assertEqual(json.loads((fresh.state_dir / 'project.json').read_text()),
+                         {'version': 1, 'destination': '/'})
+        # New onboarding must not change a separately configured older queue.
+        self.assertEqual(self.service.snapshot()['destination'], '/Archive')
+
+    def test_source_add_initializes_panel_and_uses_exact_destination(self):
+        fresh = self.make_service(state_dir=self.root / 'fresh-source')
+        result = fresh.add_folder(str(self.photos), 'Local label', remote_prefix='/Camera/Family')
+        state = fresh.snapshot()
+        self.assertTrue(state['configured'])
+        self.assertFalse(state['authenticated'])
+        self.assertEqual(state['destination'], '/')
+        self.assertEqual(state['sources'], [result['source']])
+        self.assertEqual(state['sources'][0]['remote_prefix'], '/Camera/Family')
+        self.photos_count(1)
+        fresh.scan()
+        self.assertEqual(self.done(fresh)['stats']['total'], 1)
+        self.assertEqual(fresh.jobs()['jobs'][0]['remote_path'], '/Camera/Family/000.jpg')
+
+    def test_source_destination_update_is_independent_and_invalidates_probe(self):
+        first_dir, second_dir = self.photos / 'one', self.photos / 'two'
+        first_dir.mkdir()
+        second_dir.mkdir()
+        (first_dir / 'one.jpg').write_bytes(b'offline-photo-one')
+        (second_dir / 'two.jpg').write_bytes(b'offline-photo-two')
+        fresh = self.make_service(state_dir=self.root / 'separate-sources')
+        first = fresh.add_folder(str(first_dir), 'One', remote_prefix='/First')['source']
+        second = fresh.add_folder(str(second_dir), 'Two', remote_prefix='/Second')['source']
+        fresh.scan()
+        self.assertEqual(self.done(fresh)['stats']['pending'], 2)
+        with fresh._queue() as queue:
+            queue.set_metadata('probe', {'result': 'provisional_pass', 'finished_at': time.time()})
+        updated = fresh.update_source(first['id'], remote_prefix='/Changed/OnlyOne', alias='Renamed')['source']
+        self.assertEqual(updated['remote_prefix'], '/Changed/OnlyOne')
+        self.assertEqual(updated['alias'], 'Renamed')
+        self.assertEqual(updated['path'], first['path'])
+        state = fresh.snapshot()
+        self.assertIn(second, state['sources'])
+        self.assertFalse(state['last_scan']['complete'])
+        self.assertEqual(state['probe']['result'], 'invalidated')
+        self.assertEqual({row['remote_path'] for row in fresh.jobs()['jobs']},
+                         {'/Changed/OnlyOne/one.jpg', '/Second/two.jpg'})
+        self.assertEqual(state['stats']['total'], 2)
+        fresh.close()
+        restored = self.make_service(state_dir=fresh.state_dir)
+        self.assertEqual(restored.snapshot()['sources'], state['sources'])
+
+    def test_source_removal_clears_tasks_but_preserves_files_account_and_upload_evidence(self):
+        self.photos_count(2)
+        self.service.start()
+        before = self.done()
+        self.assertEqual(before['stats']['uploaded'], 2)
+        source = before['sources'][0]
+        result = self.service.remove_source(source['id'])
+        self.assertEqual(result['removed_tasks'], 2)
+        state = self.service.snapshot()
+        self.assertEqual(state['sources'], [])
+        self.assertEqual(state['stats']['total'], 0)
+        self.assertEqual(self.service.jobs()['jobs'], [])
+        self.assertTrue(state['authenticated'])
+        self.assertEqual(state['account'], EMAIL)
+        self.assertEqual(state['probe']['result'], 'invalidated')
+        self.assertTrue((self.state / 'auth.dat').exists())
+        self.assertEqual(len(list(self.photos.glob('*.jpg'))), 2)
+        self.assertEqual(len(self.cloud.commits), 2)
+        with sqlite3.connect(self.state / 'queue.sqlite3') as database:
+            self.assertEqual(database.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0], 2)
+            self.assertEqual(database.execute('SELECT COUNT(*) FROM upload_results WHERE job_id IS NULL').fetchone()[0], 2)
+
+    def test_readding_same_source_keeps_scan_and_probe_valid(self):
+        self.photos_count(1)
+        self.service.start()
+        before = self.done()
+        self.service.add_folder(str(self.photos), 'Photos')
+        after = self.service.snapshot()
+        self.assertEqual(after['last_scan'], before['last_scan'])
+        self.assertEqual(after['probe'], before['probe'])
+        self.assertEqual(after['sources'], before['sources'])
+        self.assertEqual(after['stats']['uploaded'], 1)
+
+    def test_source_mutations_reject_active_controller_and_competing_queue_lock(self):
+        source = self.service.snapshot()['sources'][0]
+        mutations = [
+            lambda: self.service.add_folder(str(self.photos), 'Photos'),
+            lambda: self.service.update_source(source['id'], remote_prefix='/Changed'),
+            lambda: self.service.remove_source(source['id']),
+        ]
+        self.service._operation = 'scanning'
+        try:
+            for mutate in mutations:
+                with self.assertRaises(QueueBusyError):
+                    mutate()
+        finally:
+            self.service._operation = None
+        with self.service._queue() as queue, queue.exclusive_run():
+            for mutate in mutations:
+                with self.assertRaises(QueueBusyError):
+                    mutate()
+        self.assertEqual(self.service.snapshot()['sources'], [source])
+
+    def test_invalid_source_edits_leave_tasks_and_configuration_unchanged(self):
+        self.photos_count(1)
+        self.service.scan()
+        before = self.done()
+        jobs = self.service.jobs()
+        source_id = before['sources'][0]['id']
+        for target in ('relative/path', '/Photo/../Other', '/Bad\\Path'):
+            with self.subTest(target=target), self.assertRaises(QueueError):
+                self.service.update_source(source_id, remote_prefix=target)
+        for source_id in (0, -1, True, '1', 2**63):
+            with self.subTest(source_id=source_id), self.assertRaises(ValueError):
+                self.service.remove_source(source_id)
+        with self.assertRaises(ValueError):
+            self.service.update_source(999999, remote_prefix='/NoSource')
+        after = self.service.snapshot()
+        self.assertEqual(after['sources'], before['sources'])
+        self.assertEqual(after['last_scan'], before['last_scan'])
+        self.assertEqual(after['destination'], '/Archive')
+        self.assertEqual(self.service.jobs(), jobs)
+
     def test_login_remembers_tokens_and_never_persists_password(self):
         secret = 'unique-offline-test-password-never-persist'
         class Auth:
@@ -649,6 +786,7 @@ class WebServiceTests(unittest.TestCase):
         state = self.done()
         self.assertTrue(state['authenticated'])
         self.assertEqual(state['account'], EMAIL)
+        self.assertEqual(state['destination'], '/Archive')
         for path in self.state.iterdir():
             if path.is_file():
                 self.assertNotIn(secret.encode(), path.read_bytes(), str(path))

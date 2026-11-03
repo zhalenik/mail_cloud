@@ -23,6 +23,15 @@ class FakeService:
     def logout(self):
         self.calls.append(("logout",))
 
+    def add_folder(self, path, alias, *, remote_prefix=None):
+        self.calls.append(("add_folder", path, alias, remote_prefix))
+
+    def update_source(self, source_id, *, remote_prefix, alias=None):
+        self.calls.append(("update_source", source_id, remote_prefix, alias))
+
+    def remove_source(self, source_id):
+        self.calls.append(("remove_source", source_id))
+
     def jobs(self, **kwargs):
         self.calls.append(("jobs", kwargs))
         return {"jobs": [], "total": 0, **kwargs}
@@ -202,6 +211,55 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request("/api/jobs?status=deleted")["status"], 400)
         self.assertEqual(self.request("/api/jobs?status=failed&offset=50&limit=50")["status"], 200)
         self.assertEqual(self.service.calls[-1], ("jobs", {"status": "failed", "offset": 50, "limit": 50}))
+
+    def test_source_routes_forward_explicit_paths_and_keep_legacy_add(self):
+        self.authenticate()
+        response = self.request('/api/sources/add', method='POST', data={
+            'path': '/photos/family', 'alias': 'Family', 'remote_prefix': '/Photos/Family'})
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('add_folder', '/photos/family', 'Family', '/Photos/Family'))
+        response = self.request('/api/sources/update', method='POST', data={
+            'id': 7, 'remote_prefix': '/Trips', 'alias': 'Travel'})
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('update_source', 7, '/Trips', 'Travel'))
+        response = self.request('/api/sources/update', method='POST', data={'id': 7, 'remote_prefix': '/Updated'})
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('update_source', 7, '/Updated', None))
+        self.assertEqual(self.request('/api/sources/remove', method='POST', data={'id': 7})['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('remove_source', 7))
+        for endpoint in ('/api/sources', '/api/add-folder'):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.request(endpoint, method='POST', data={
+                    'path': '/photos/old', 'alias': 'Old'})['status'], 200)
+                self.assertEqual(self.service.calls[-1], ('add_folder', '/photos/old', 'Old', None))
+
+    def test_source_mutations_require_session_csrf_and_valid_fields(self):
+        cases = [
+            ('/api/sources/add', {'path': '/photos', 'alias': 'Photos', 'remote_prefix': '/Photos'}),
+            ('/api/sources/update', {'id': 1, 'remote_prefix': '/Changed'}),
+            ('/api/sources/remove', {'id': 1}),
+        ]
+        self.request('/api/session')
+        for endpoint, data in cases:
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.request(endpoint, method='POST', data=data)['status'], 401)
+        self.authenticate()
+        for endpoint, data in cases:
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.request(endpoint, method='POST', data=data, csrf='invalid')['status'], 403)
+        invalid = [
+            ('/api/sources/add', {'path': '/photos', 'alias': 'Photos'}),
+            ('/api/sources/add', {'path': '/photos', 'alias': 'Photos', 'remote_prefix': None}),
+            ('/api/sources/update', {'id': 1, 'remote_prefix': '/Photos', 'alias': ''}),
+            ('/api/sources/update', {'id': 1, 'remote_prefix': '/Photos\x00private'}),
+            ('/api/sources/update', {'id': 1, 'remote_prefix': '/' + 'a' * 2048}),
+        ]
+        invalid.extend(('/api/sources/remove', {'id': value})
+                       for value in (0, -1, True, 1.5, '1x', 2**63, None))
+        for endpoint, data in invalid:
+            with self.subTest(endpoint=endpoint, data=data):
+                self.assertEqual(self.request(endpoint, method='POST', data=data)['status'], 400)
+        self.assertEqual(self.service.calls, [])
 
     def test_invalid_json_and_oversized_requests_do_not_reach_engine(self):
         self.authenticate()

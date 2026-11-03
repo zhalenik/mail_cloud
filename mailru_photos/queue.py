@@ -39,7 +39,7 @@ VIDEO_EXTENSIONS = frozenset({
 })
 MEDIA_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 STATES = ("pending", "running", "uploaded", "failed", "skipped")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SCHEMA_OBJECTS = frozenset({
     ("table", "metadata"), ("table", "roots"), ("table", "scans"),
     ("table", "jobs"), ("table", "upload_results"), ("table", "commit_intents"),
@@ -47,12 +47,19 @@ _SCHEMA_OBJECTS = frozenset({
     ("index", "jobs_pending_unlimited"), ("index", "jobs_pending_regular"),
     ("index", "jobs_retry_unlimited"), ("index", "jobs_retry_regular"),
     ("index", "jobs_root_scan"), ("index", "jobs_status"),
+    ("index", "jobs_current"), ("index", "jobs_current_status"),
+    ("index", "jobs_source_identity"),
     ("index", "upload_results_job"),
 })
 _JOB_SUMMARY_COLUMNS = (
-    "id,relative_path,local_path,remote_path,status,size,attempts,"
+    "id,root_id,relative_path,local_path,remote_path,status,size,attempts,present,"
     "last_error,skip_reason,next_attempt,uploaded_at,storage_mode"
 )
+_UPLOAD_RESULT_COLUMNS = frozenset({
+    "id", "job_id", "account_id", "local_path", "local_key", "remote_path",
+    "source_size", "source_mtime_ns", "source_device", "source_inode",
+    "remote_hash", "remote_id", "verified_metadata", "uploaded_at",
+})
 _STORAGE_MODES = ("unlimited", "regular")
 _SIZE_PARTITIONS = {
     "unlimited": f"size<={UNLIMITED_MAX_BYTES}",
@@ -142,6 +149,7 @@ class ScanResult:
     seen: int = 0
     added: int = 0
     changed: int = 0
+    moved: int = 0
     unchanged: int = 0
     missing: int = 0
     ignored_symlinks: int = 0
@@ -168,7 +176,7 @@ def _remote_key(path: str) -> str:
 
 
 def _destination(value: str) -> str:
-    if not value.startswith("/") or "\x00" in value or "\\" in value:
+    if not isinstance(value, str) or not value.startswith("/") or "\x00" in value or "\\" in value:
         raise QueueConfigurationError("Destination must be an absolute cloud path using '/' separators.")
     if any(part in (".", "..") for part in value.split("/")):
         raise QueueConfigurationError("Destination cannot contain '.' or '..' segments.")
@@ -176,7 +184,7 @@ def _destination(value: str) -> str:
 
 
 def _alias(value: str) -> str:
-    if not value or value in (".", "..") or any(ch in value for ch in ("/", "\\", "\x00")):
+    if not isinstance(value, str) or not value or value in (".", "..") or any(ch in value for ch in ("/", "\\", "\x00")):
         raise QueueConfigurationError("Root alias must be a nonempty single cloud folder name.")
     if value != value.strip() or value.endswith("."):
         raise QueueConfigurationError("Root alias cannot have surrounding whitespace or a trailing dot.")
@@ -265,36 +273,60 @@ class Queue:
 
     def _initialize(self, account_id: str | None) -> None:
         schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        if schema_version not in (0, SCHEMA_VERSION):
+        if schema_version not in (0, 1, SCHEMA_VERSION):
             raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
         objects = {(row["type"], row["name"]) for row in self._db.execute(
             "SELECT type,name FROM sqlite_master WHERE type IN ('table','index')"
         )}
         job_columns = {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}
-        has_schema = _SCHEMA_OBJECTS.issubset(objects) and "storage_mode" in job_columns
+        has_schema = (_SCHEMA_OBJECTS.issubset(objects) and "storage_mode" in job_columns
+                      and self._has_detached_upload_results())
         if ("table", "metadata") in objects:
             existing = self._get_meta("_destination")
             self._check_destination(existing)
             needs_account = account_id is not None and self._account_needs_binding(account_id)
-            # Browser reads and worker connections must not take the writer lock
-            # or checkpoint new metadata on every open. Older schema-1 queues
-            # still get missing tables/indexes installed once below.
+            # Polling/read connections must neither take the writer lock nor
+            # commit metadata. Schema inspection above is entirely read-only.
             if has_schema and schema_version == SCHEMA_VERSION and existing is not None and not needs_account:
                 return
-        if not has_schema:
-            self._db.executescript(f"""
-            CREATE TABLE IF NOT EXISTS metadata (
+        with self._transaction():
+            # A second first-opener may have migrated while this one waited.
+            schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if schema_version not in (0, 1, SCHEMA_VERSION):
+                raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
+            self._create_core_schema()
+            existing = self._get_meta("_destination")
+            self._check_destination(existing)
+            if existing is None:
+                self._put_meta("_destination", self.destination)
+            if account_id is not None:
+                self._bind_account(account_id)
+            job_columns = {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}
+            if "storage_mode" not in job_columns:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN storage_mode TEXT "
+                                 "CHECK(storage_mode IN ('unlimited','regular'))")
+            if not self._has_detached_upload_results():
+                self._migrate_upload_results()
+            self._create_queue_indexes()
+            if schema_version != SCHEMA_VERSION:
+                self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _create_core_schema(self) -> None:
+        # execute(), not executescript(): Python's executescript implicitly
+        # commits an open transaction and would make this migration partial.
+        statements = (
+            """CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS roots (
+            )""",
+            """CREATE TABLE IF NOT EXISTS roots (
                 id INTEGER PRIMARY KEY, path TEXT NOT NULL, path_key TEXT NOT NULL UNIQUE,
                 alias TEXT NOT NULL, alias_key TEXT NOT NULL UNIQUE, remote_prefix TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS scans (
+            )""",
+            """CREATE TABLE IF NOT EXISTS scans (
                 id INTEGER PRIMARY KEY, started_at REAL NOT NULL, finished_at REAL,
                 complete INTEGER NOT NULL DEFAULT 0, result_json TEXT
-            );
-            CREATE TABLE IF NOT EXISTS jobs (
+            )""",
+            """CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL REFERENCES roots(id),
                 relative_path TEXT NOT NULL, local_path TEXT NOT NULL,
                 local_key TEXT NOT NULL UNIQUE, remote_path TEXT NOT NULL,
@@ -308,49 +340,113 @@ class Queue:
                 storage_mode TEXT CHECK(storage_mode IN ('unlimited','regular')),
                 uploaded_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
                 seen_scan INTEGER, present INTEGER NOT NULL DEFAULT 1
-            );
-            CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status, present, next_attempt, id);
-            CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status='pending' AND present=1;
-            CREATE INDEX IF NOT EXISTS jobs_pending_unlimited ON jobs(id)
-                WHERE status='pending' AND present=1 AND size<={UNLIMITED_MAX_BYTES};
-            CREATE INDEX IF NOT EXISTS jobs_pending_regular ON jobs(id)
-                WHERE status='pending' AND present=1 AND size>{UNLIMITED_MAX_BYTES};
-            CREATE INDEX IF NOT EXISTS jobs_retry_unlimited ON jobs(next_attempt,id)
-                WHERE status='failed' AND present=1 AND next_attempt IS NOT NULL AND size<={UNLIMITED_MAX_BYTES};
-            CREATE INDEX IF NOT EXISTS jobs_retry_regular ON jobs(next_attempt,id)
-                WHERE status='failed' AND present=1 AND next_attempt IS NOT NULL AND size>{UNLIMITED_MAX_BYTES};
-            CREATE INDEX IF NOT EXISTS jobs_root_scan ON jobs(root_id, seen_scan);
-            CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, id);
-            CREATE TABLE IF NOT EXISTS upload_results (
-                id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
-                source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
-                remote_hash TEXT, remote_id TEXT, verified_metadata TEXT,
-                uploaded_at REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS upload_results_job ON upload_results(job_id);
-            CREATE TABLE IF NOT EXISTS commit_intents (
+            )""",
+            """CREATE TABLE IF NOT EXISTS commit_intents (
                 job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
                 source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
                 device INTEGER NOT NULL, inode TEXT NOT NULL,
                 remote_path TEXT NOT NULL, cloud_hash TEXT NOT NULL,
                 created_at REAL NOT NULL, intent_json TEXT NOT NULL
-            );
-            """)
-        with self._transaction():
-            # Additive schema-1 migration; recheck after taking the writer lock
-            # so simultaneous first opens cannot add the column twice.
-            job_columns = {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}
-            if "storage_mode" not in job_columns:
-                self._db.execute("ALTER TABLE jobs ADD COLUMN storage_mode TEXT "
-                                 "CHECK(storage_mode IN ('unlimited','regular'))")
-            existing = self._get_meta("_destination")
-            self._check_destination(existing)
-            if existing is None:
-                self._put_meta("_destination", self.destination)
-            if schema_version != SCHEMA_VERSION:
-                self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            if account_id is not None:
-                self._bind_account(account_id)
+            )""",
+        )
+        for statement in statements:
+            self._db.execute(statement)
+        if not self._db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='upload_results'").fetchone():
+            self._create_upload_results("upload_results")
+
+    def _create_upload_results(self, table: str) -> None:
+        # Both callers pass internal literal table names, never user input.
+        self._db.execute(f"""CREATE TABLE {table} (
+            id INTEGER PRIMARY KEY, job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+            account_id TEXT, local_path TEXT, local_key TEXT, remote_path TEXT,
+            source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
+            source_device INTEGER, source_inode TEXT,
+            remote_hash TEXT, remote_id TEXT, verified_metadata TEXT,
+            uploaded_at REAL NOT NULL
+        )""")
+
+    def _has_detached_upload_results(self) -> bool:
+        columns = {row["name"]: row for row in self._db.execute("PRAGMA table_info(upload_results)")}
+        if not _UPLOAD_RESULT_COLUMNS.issubset(columns) or columns["job_id"]["notnull"]:
+            return False
+        return any(row["table"] == "jobs" and row["from"] == "job_id"
+                   and row["to"] == "id" and row["on_delete"] == "SET NULL"
+                   for row in self._db.execute("PRAGMA foreign_key_list(upload_results)"))
+
+    def _migrate_upload_results(self) -> None:
+        """Detach durable evidence from task lifetime, in bounded batches.
+
+        Legacy evidence is retained verbatim. Its remote path is taken from
+        that evidence when available; the old task mapping is a fallback.
+        Legacy records did not persist filesystem identities; leave those
+        fields unknown instead of attaching the task's newer inode to proof.
+        """
+        self._create_upload_results("upload_results_migration")
+        account = self._get_meta("_account_id")
+        cursor = self._db.execute(
+            "SELECT r.*,j.local_path AS job_local_path,j.local_key AS job_local_key,"
+            "j.remote_path AS job_remote_path FROM upload_results r "
+            "LEFT JOIN jobs j ON j.id=r.job_id ORDER BY r.id"
+        )
+        while rows := cursor.fetchmany(500):
+            records = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    evidence = json.loads(item["verified_metadata"] or "{}")
+                except (ValueError, TypeError):
+                    evidence = {}
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                remote_path = item.get("remote_path")
+                if not remote_path:
+                    for key in ("remote_path", "path"):
+                        candidate = evidence.get(key)
+                        try:
+                            remote_path = _destination(candidate)
+                        except QueueConfigurationError:
+                            continue
+                        break
+                if not remote_path:
+                    remote_path = item["job_remote_path"]
+                records.append((
+                    item["id"], item["job_id"], item.get("account_id", account),
+                    item.get("local_path", item["job_local_path"]),
+                    item.get("local_key", item["job_local_key"]), remote_path,
+                    item["source_size"], item["source_mtime_ns"],
+                    item.get("source_device"), item.get("source_inode"),
+                    item["remote_hash"], item["remote_id"], item["verified_metadata"], item["uploaded_at"],
+                ))
+            self._db.executemany(
+                "INSERT INTO upload_results_migration(id,job_id,account_id,local_path,local_key,remote_path,"
+                "source_size,source_mtime_ns,source_device,source_inode,remote_hash,remote_id,verified_metadata,uploaded_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records,
+            )
+        cursor.close()
+        self._db.execute("DROP TABLE upload_results")
+        self._db.execute("ALTER TABLE upload_results_migration RENAME TO upload_results")
+
+    def _create_queue_indexes(self) -> None:
+        statements = (
+            "CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,present,next_attempt,id)",
+            "CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status='pending' AND present=1",
+            f"CREATE INDEX IF NOT EXISTS jobs_pending_unlimited ON jobs(id) "
+            f"WHERE status='pending' AND present=1 AND size<={UNLIMITED_MAX_BYTES}",
+            f"CREATE INDEX IF NOT EXISTS jobs_pending_regular ON jobs(id) "
+            f"WHERE status='pending' AND present=1 AND size>{UNLIMITED_MAX_BYTES}",
+            f"CREATE INDEX IF NOT EXISTS jobs_retry_unlimited ON jobs(next_attempt,id) "
+            f"WHERE status='failed' AND present=1 AND next_attempt IS NOT NULL AND size<={UNLIMITED_MAX_BYTES}",
+            f"CREATE INDEX IF NOT EXISTS jobs_retry_regular ON jobs(next_attempt,id) "
+            f"WHERE status='failed' AND present=1 AND next_attempt IS NOT NULL AND size>{UNLIMITED_MAX_BYTES}",
+            "CREATE INDEX IF NOT EXISTS jobs_root_scan ON jobs(root_id,seen_scan)",
+            "CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,id)",
+            "CREATE INDEX IF NOT EXISTS jobs_current ON jobs(id) WHERE present=1",
+            "CREATE INDEX IF NOT EXISTS jobs_current_status ON jobs(status,id) WHERE present=1",
+            "CREATE INDEX IF NOT EXISTS jobs_source_identity ON jobs(root_id,device,inode,size,mtime_ns)",
+            "CREATE INDEX IF NOT EXISTS upload_results_job ON upload_results(job_id)",
+        )
+        for statement in statements:
+            self._db.execute(statement)
 
     def _check_destination(self, existing: str | None) -> None:
         if existing is not None and existing != self.destination:
@@ -522,20 +618,42 @@ class Queue:
         with self._transaction():
             self._bind_account(account_id)
 
-    def add_root(self, path: str | os.PathLike[str], alias: str) -> Root:
+    def _require_idle_sources(self) -> None:
+        if self._get_meta("_scan_token"):
+            raise QueueBusyError("Cannot change source roots during a scan.")
+        if self._db.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone():
+            raise QueueBusyError("Pause/finish uploads or recover interrupted tasks before changing sources.")
+
+    @staticmethod
+    def _root(row: sqlite3.Row) -> Root:
+        return Root(row["id"], row["path"], row["alias"], row["remote_prefix"])
+
+    def _root_id_high_water(self) -> int:
+        stored = self._get_meta("_root_id_high_water", 0)
+        if type(stored) is not int or stored < 0:
+            raise QueueConfigurationError("Invalid saved source identifier sequence.")
+        existing = self._db.execute("SELECT COALESCE(MAX(id),0) FROM roots").fetchone()[0]
+        return max(stored, existing)
+
+    def add_root(self, path: str | os.PathLike[str], alias: str, remote_prefix: str | None = None) -> Root:
+        """Register a source with an exact optional cloud destination.
+
+        Omitting remote_prefix preserves the legacy destination/alias mapping.
+        Re-adding the same source never silently changes an existing mapping.
+        """
         root_path = _path_key(Path(path).expanduser())
         if not os.path.isdir(root_path):
             raise QueueConfigurationError(f"Source root is not an accessible directory: {root_path}")
         alias = _alias(alias)
-        remote_prefix = self.destination.rstrip("/") + "/" + alias
-        with self._transaction():
-            if self._get_meta("_scan_token"):
-                raise QueueBusyError("Cannot change source roots during a scan.")
+        selected_prefix = (_destination(remote_prefix) if remote_prefix is not None
+                           else self.destination.rstrip("/") + "/" + alias)
+        with self.exclusive_run(), self._transaction():
+            self._require_idle_sources()
             for row in self._db.execute("SELECT * FROM roots"):
                 if row["path_key"] == root_path:
-                    if row["alias"] != alias:
-                        raise QueueConfigurationError("An existing source root cannot be assigned a different alias.")
-                    return Root(row["id"], row["path"], row["alias"], row["remote_prefix"])
+                    if row["alias"] != alias or (remote_prefix is not None and row["remote_prefix"] != selected_prefix):
+                        raise QueueConfigurationError("Use update_root to change an existing source mapping.")
+                    return self._root(row)
                 if row["alias_key"] == _remote_key(alias):
                     raise ScanCollisionError(f"Root alias {alias!r} is already used by another source directory.")
                 try:
@@ -544,11 +662,81 @@ class Queue:
                     common = ""
                 if common in (row["path_key"], root_path):
                     raise QueueConfigurationError("Source roots cannot overlap; choose the parent root or separate children.")
-            cursor = self._db.execute(
-                "INSERT INTO roots(path,path_key,alias,alias_key,remote_prefix) VALUES(?,?,?,?,?)",
-                (root_path, root_path, alias, _remote_key(alias), remote_prefix),
+            root_id = self._root_id_high_water() + 1
+            self._db.execute(
+                "INSERT INTO roots(id,path,path_key,alias,alias_key,remote_prefix) VALUES(?,?,?,?,?,?)",
+                (root_id, root_path, root_path, alias, _remote_key(alias), selected_prefix),
             )
-            return Root(cursor.lastrowid, root_path, alias, remote_prefix)
+            self._put_meta("_root_id_high_water", root_id)
+            self._put_meta("last_scan", {"complete": False, "reason": "source_added"})
+            return Root(root_id, root_path, alias, selected_prefix)
+
+    def update_root(self, root_id: int, remote_prefix: str, alias: str | None = None) -> Root:
+        """Retarget work that has not been sent; keep actual uploaded paths.
+
+        Already uploaded tasks and tasks with a durable commit intent retain
+        their remote path. No server-side move, delete, or upload occurs here.
+        """
+        selected_prefix = _destination(remote_prefix)
+        selected_alias = _alias(alias) if alias is not None else None
+        with self.exclusive_run(), self._transaction():
+            self._require_idle_sources()
+            root = self._db.execute("SELECT * FROM roots WHERE id=?", (root_id,)).fetchone()
+            if root is None:
+                raise QueueConfigurationError(f"Unknown source root: {root_id}")
+            selected_alias = root["alias"] if selected_alias is None else selected_alias
+            if self._db.execute("SELECT 1 FROM roots WHERE alias_key=? AND id<>?",
+                                (_remote_key(selected_alias), root_id)).fetchone():
+                raise ScanCollisionError(f"Root alias {selected_alias!r} is already used by another source directory.")
+            if selected_prefix == root["remote_prefix"] and selected_alias == root["alias"]:
+                return self._root(root)
+            now = time.time()
+            try:
+                if selected_prefix != root["remote_prefix"]:
+                    mutable = ("root_id=? AND status<>'uploaded' AND NOT EXISTS "
+                               "(SELECT 1 FROM commit_intents WHERE job_id=jobs.id)")
+                    # Temporarily free old keys inside this transaction. This
+                    # permits a destination below the old prefix without false
+                    # collisions against another task that is also moving.
+                    # Valid cloud keys always begin with '/', unlike this key.
+                    temporary_key = "remap:" + uuid.uuid4().hex + ":"
+                    self._db.execute(f"UPDATE jobs SET remote_key=?||id WHERE {mutable}",
+                                     (temporary_key, root_id))
+                    cursor = self._db.execute(f"SELECT id,relative_path FROM jobs WHERE {mutable} ORDER BY id", (root_id,))
+                    while rows := cursor.fetchmany(500):
+                        updates = []
+                        for row in rows:
+                            remote = selected_prefix.rstrip("/") + "/" + row["relative_path"]
+                            updates.append((remote, _remote_key(remote), now, row["id"]))
+                        self._db.executemany("UPDATE jobs SET remote_path=?,remote_key=?,updated_at=? WHERE id=?", updates)
+                    cursor.close()
+                self._db.execute("UPDATE roots SET alias=?,alias_key=?,remote_prefix=? WHERE id=?",
+                                 (selected_alias, _remote_key(selected_alias), selected_prefix, root_id))
+            except sqlite3.IntegrityError as exc:
+                raise ScanCollisionError("The selected cloud folder conflicts with another task's destination.") from exc
+            self._put_meta("last_scan", {"complete": False, "reason": "source_updated"})
+            return Root(root_id, root["path"], selected_alias, selected_prefix)
+
+    def remove_root(self, root_id: int) -> int:
+        """Forget a source and its tasks, retaining detached upload evidence.
+
+        Neither local originals nor cloud objects are deleted. Returned count
+        includes absent historical task rows; upload_results remain separate.
+        """
+        with self.exclusive_run(), self._transaction():
+            self._require_idle_sources()
+            if not self._db.execute("SELECT 1 FROM roots WHERE id=?", (root_id,)).fetchone():
+                raise QueueConfigurationError(f"Unknown source root: {root_id}")
+            # Legacy queues may not yet have a sequence. Save it before the
+            # largest/current root disappears so a stale browser action can
+            # never address a subsequently added source using the old ID.
+            highest = self._root_id_high_water()
+            if self._get_meta("_root_id_high_water", 0) < highest:
+                self._put_meta("_root_id_high_water", highest)
+            count = self._db.execute("DELETE FROM jobs WHERE root_id=?", (root_id,)).rowcount
+            self._db.execute("DELETE FROM roots WHERE id=?", (root_id,))
+            self._put_meta("last_scan", {"complete": False, "reason": "source_removed"})
+            return count
 
     def roots(self) -> list[Root]:
         with self._mutex:
@@ -580,7 +768,7 @@ class Queue:
                                 continue
                             value = entry.stat(follow_symlinks=False)
                             relative = Path(entry.path).relative_to(root.path).as_posix()
-                            remote = root.remote_prefix + "/" + relative
+                            remote = root.remote_prefix.rstrip("/") + "/" + relative
                             yield (
                                 root.id, relative, entry.path, os.path.normcase(entry.path), remote,
                                 _remote_key(remote), value.st_size, value.st_mtime_ns, value.st_dev, str(value.st_ino),
@@ -677,47 +865,102 @@ class Queue:
             progress(result)
         return result
 
+    def _move_candidate(self, values: tuple) -> sqlite3.Row | None:
+        """Recognize one disappeared source identity, never guess by name/size.
+
+        A zero inode, existing old path, hard link, ambiguous database identity,
+        or a saved remote commit prevents adoption. These conservative cases
+        remain independent tasks; absent history is excluded from the queue.
+        """
+        if not int(values[9]):
+            return None
+        candidates = self._db.execute(
+            "SELECT * FROM jobs WHERE root_id=? AND device=? AND inode=? AND size=? AND mtime_ns=? LIMIT 2",
+            (values[0], values[8], values[9], values[6], values[7]),
+        ).fetchall()
+        if len(candidates) != 1:
+            return None
+        row = candidates[0]
+        if self._db.execute("SELECT 1 FROM commit_intents WHERE job_id=?", (row["id"],)).fetchone():
+            return None
+        try:
+            os.stat(row["local_path"], follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            return None
+        else:
+            return None
+        try:
+            current = os.stat(values[2], follow_symlinks=False)
+        except OSError:
+            return None
+        if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                or (current.st_size, current.st_mtime_ns, current.st_dev, str(current.st_ino)) != values[6:10]):
+            return None
+        return row
+
+    def _update_unchanged_source(self, row: sqlite3.Row, values: tuple, scan_id: int, now: float) -> None:
+        frozen = (row["status"] == "uploaded" or self._db.execute(
+            "SELECT 1 FROM commit_intents WHERE job_id=?", (row["id"],)).fetchone() is not None)
+        remote_path = row["remote_path"] if frozen else values[4]
+        remote_key = row["remote_key"] if frozen else values[5]
+        self._db.execute(
+            "UPDATE jobs SET relative_path=?,local_path=?,local_key=?,remote_path=?,remote_key=?,"
+            "seen_scan=?,present=1,updated_at=?,"
+            "status=CASE WHEN status='skipped' AND skip_reason='missing' THEN 'pending' ELSE status END,"
+            "next_attempt=CASE WHEN status='skipped' AND skip_reason='missing' THEN 0 ELSE next_attempt END,"
+            "last_error=CASE WHEN status='skipped' AND skip_reason='missing' THEN NULL ELSE last_error END,"
+            "skip_reason=CASE WHEN skip_reason='missing' THEN NULL ELSE skip_reason END WHERE id=?",
+            values[1:4] + (remote_path, remote_key, scan_id, now, row["id"]),
+        )
+
     def _ingest(self, batch: list[tuple], result: ScanResult) -> None:
         now = time.time()
         with self._transaction():
             for values in batch:
                 result.seen += 1
+                # A name collision must not leave half an update behind, such
+                # as removing an intent before a later UNIQUE check fails.
+                self._db.execute("SAVEPOINT ingest_task")
                 try:
                     row = self._db.execute("SELECT * FROM jobs WHERE local_key=?", (values[3],)).fetchone()
                     if row is None:
-                        self._db.execute(
-                            "INSERT INTO jobs(root_id,relative_path,local_path,local_key,remote_path,remote_key,"
-                            "size,mtime_ns,device,inode,created_at,updated_at,seen_scan,next_attempt) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                            values + (now, now, result.scan_id),
-                        )
-                        result.added += 1
-                        continue
-                    if row["root_id"] != values[0] or row["remote_path"] != values[4]:
-                        raise ScanCollisionError(f"Source mapping changed for {values[2]}")
-                    old_fingerprint = (row["size"], row["mtime_ns"], row["device"], str(row["inode"]))
-                    if old_fingerprint != values[6:10]:
-                        self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (row["id"],))
-                        self._db.execute(
-                            "UPDATE jobs SET size=?,mtime_ns=?,device=?,inode=?,status='pending',attempts=0,"
-                            "next_attempt=0,claim_token=NULL,last_error='Source changed since previous scan',"
-                            "skip_reason=NULL,remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,"
-                            "seen_scan=?,present=1,updated_at=? WHERE id=?",
-                            values[6:10] + (result.scan_id, now, row["id"]),
-                        )
-                        result.changed += 1
+                        moved = self._move_candidate(values)
+                        if moved is not None:
+                            self._update_unchanged_source(moved, values, result.scan_id, now)
+                            result.moved += 1
+                        else:
+                            self._db.execute(
+                                "INSERT INTO jobs(root_id,relative_path,local_path,local_key,remote_path,remote_key,"
+                                "size,mtime_ns,device,inode,created_at,updated_at,seen_scan,next_attempt) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                                values + (now, now, result.scan_id),
+                            )
+                            result.added += 1
                     else:
-                        self._db.execute(
-                            "UPDATE jobs SET seen_scan=?,present=1,updated_at=?,"
-                            "status=CASE WHEN status='skipped' AND skip_reason='missing' THEN 'pending' ELSE status END,"
-                            "next_attempt=CASE WHEN status='skipped' AND skip_reason='missing' THEN 0 ELSE next_attempt END,"
-                            "last_error=CASE WHEN status='skipped' AND skip_reason='missing' THEN NULL ELSE last_error END,"
-                            "skip_reason=CASE WHEN skip_reason='missing' THEN NULL ELSE skip_reason END WHERE id=?",
-                            (result.scan_id, now, row["id"]),
-                        )
-                        result.unchanged += 1
+                        if row["root_id"] != values[0]:
+                            raise ScanCollisionError(f"Source mapping changed for {values[2]}")
+                        old_fingerprint = (row["size"], row["mtime_ns"], row["device"], str(row["inode"]))
+                        if old_fingerprint != values[6:10]:
+                            self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (row["id"],))
+                            self._db.execute(
+                                "UPDATE jobs SET relative_path=?,local_path=?,local_key=?,remote_path=?,remote_key=?,"
+                                "size=?,mtime_ns=?,device=?,inode=?,status='pending',attempts=0,"
+                                "next_attempt=0,claim_token=NULL,last_error='Source changed since previous scan',"
+                                "skip_reason=NULL,remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,"
+                                "seen_scan=?,present=1,updated_at=? WHERE id=?",
+                                values[1:10] + (result.scan_id, now, row["id"]),
+                            )
+                            result.changed += 1
+                        else:
+                            self._update_unchanged_source(row, values, result.scan_id, now)
+                            result.unchanged += 1
                 except (sqlite3.IntegrityError, ScanCollisionError, UnicodeError) as exc:
+                    self._db.execute("ROLLBACK TO SAVEPOINT ingest_task")
                     result.error(f"Cannot map {values[2]} to {values[4]} (name collision or invalid name): {exc}")
+                finally:
+                    self._db.execute("RELEASE SAVEPOINT ingest_task")
 
     @staticmethod
     def _job(row: sqlite3.Row, token: str, attempts: int) -> Job:
@@ -793,20 +1036,35 @@ class Queue:
     def _invalidate_claim(self, job: Job, snapshot: tuple[int, int, int, int] | None) -> None:
         with self._transaction():
             self._require_claim(job)
-            self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
             if snapshot is None:
+                self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
                 self._db.execute(
                     "UPDATE jobs SET status='skipped',skip_reason='missing',present=0,claim_token=NULL,"
                     "storage_mode=NULL,last_error='Source is missing, inaccessible, or no longer a regular file',updated_at=? WHERE id=?",
                     (time.time(), job.id),
                 )
             else:
+                root = self._db.execute("SELECT remote_prefix FROM roots WHERE id=?", (job.root_id,)).fetchone()
+                remote = root["remote_prefix"].rstrip("/") + "/" + job.relative_path
+                if self._db.execute("SELECT 1 FROM jobs WHERE remote_key=? AND id<>?",
+                                    (_remote_key(remote), job.id)).fetchone():
+                    # Keep the old source snapshot and its uncertain commit
+                    # evidence. A corrected mapping/rescan can resolve this
+                    # one task; other ready tasks can still be claimed.
+                    self._db.execute(
+                        "UPDATE jobs SET status='failed',claim_token=NULL,next_attempt=NULL,updated_at=?,"
+                        "last_error='Source changed, but the current cloud destination conflicts with another task' "
+                        "WHERE id=?", (time.time(), job.id),
+                    )
+                    return
+                self._db.execute("DELETE FROM commit_intents WHERE job_id=?", (job.id,))
                 self._db.execute(
                     "UPDATE jobs SET size=?,mtime_ns=?,device=?,inode=?,status='pending',attempts=0,next_attempt=0,"
                     "claim_token=NULL,last_error='Source changed; any remote partial result must be reconciled',"
-                    "remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,skip_reason=NULL,updated_at=? "
+                    "remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,skip_reason=NULL,updated_at=?,"
+                    "remote_path=?,remote_key=? "
                     "WHERE id=?",
-                    snapshot[:3] + (str(snapshot[3]), time.time(), job.id),
+                    snapshot[:3] + (str(snapshot[3]), time.time(), remote, _remote_key(remote), job.id),
                 )
 
     def save_commit_intent(self, job: Job, cloud_hash: str, *, storage_mode: str = "unlimited") -> None:
@@ -978,9 +1236,11 @@ class Queue:
             if claimed["storage_mode"] not in (None, storage_mode):
                 raise QueueError("Verified storage mode does not match the saved commit intent.")
             self._db.execute(
-                "INSERT INTO upload_results(job_id,source_size,source_mtime_ns,remote_hash,remote_id,verified_metadata,uploaded_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (job.id, job.size, job.mtime_ns, remote_hash, remote_id, evidence, now),
+                "INSERT INTO upload_results(job_id,account_id,local_path,local_key,remote_path,"
+                "source_size,source_mtime_ns,source_device,source_inode,remote_hash,remote_id,verified_metadata,uploaded_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job.id, self._get_meta("_account_id"), job.local_path, claimed["local_key"], job.remote_path,
+                 job.size, job.mtime_ns, job.device, str(job.inode), remote_hash, remote_id, evidence, now),
             )
             self._db.execute(
                 "UPDATE jobs SET status='uploaded',claim_token=NULL,last_error=NULL,skip_reason=NULL,"
@@ -1082,14 +1342,16 @@ class Queue:
                 (time.time(), int(include_permanent)),
             ).rowcount
 
-    def stats(self, *, now: float | None = None, storage_mode: str | None = None) -> dict[str, Any]:
+    def stats(self, *, now: float | None = None, storage_mode: str | None = None,
+              include_missing: bool = False) -> dict[str, Any]:
         current = time.time() if now is None else now
         partition = _size_partition(storage_mode)
+        selected = partition if include_missing else partition + " AND present=1"
         with self._mutex:
             counts = {state: 0 for state in STATES}
             sizes = {state: 0 for state in STATES}
             for row in self._db.execute(
-                f"SELECT status,COUNT(*) AS n,COALESCE(SUM(size),0) AS bytes FROM jobs WHERE {partition} GROUP BY status"
+                f"SELECT status,COUNT(*) AS n,COALESCE(SUM(size),0) AS bytes FROM jobs WHERE {selected} GROUP BY status"
             ):
                 counts[row["status"]] = row["n"]
                 sizes[row["status"]] = row["bytes"]
@@ -1102,7 +1364,7 @@ class Queue:
                 (current,),
             ).fetchone()[0]
             permanent = self._db.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE {partition} AND status='failed' AND next_attempt IS NULL"
+                f"SELECT COUNT(*) FROM jobs WHERE {selected} AND status='failed' AND next_attempt IS NULL"
             ).fetchone()[0]
             return {
                 **counts, "total": sum(counts.values()), "total_bytes": sum(sizes.values()),
@@ -1113,7 +1375,7 @@ class Queue:
             }
 
     def list_jobs(self, status: str | None = None, *, limit: int = 100, offset: int = 0,
-                  summary: bool = False) -> list[dict[str, Any]]:
+                  summary: bool = False, include_missing: bool = False) -> list[dict[str, Any]]:
         if status is not None and status not in STATES:
             raise ValueError(f"Unknown status: {status}")
         if not 1 <= limit <= 10000 or offset < 0:
@@ -1121,13 +1383,25 @@ class Queue:
         # A fixed projection keeps persisted verification evidence out of UI
         # polling. The default retains the complete records used by the CLI.
         columns = _JOB_SUMMARY_COLUMNS if summary else "*"
-        where = " WHERE status=?" if status is not None else ""
-        parameters = (status, limit, offset) if status is not None else (limit, offset)
+        conditions = [] if include_missing else ["present=1"]
+        parameters = []
+        if status is not None:
+            conditions.append("status=?")
+            parameters.append(status)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        parameters.extend((limit, offset))
         with self._mutex:
             return [dict(row) for row in self._db.execute(
                 f"SELECT {columns} FROM jobs{where} ORDER BY id LIMIT ? OFFSET ?",
                 parameters,
             )]
+
+    def get_job(self, job_id: int, *, include_missing: bool = False) -> dict[str, Any] | None:
+        """Return a task without loading or decoding unrelated queue rows."""
+        where = "id=?" if include_missing else "id=? AND present=1"
+        with self._mutex:
+            row = self._db.execute(f"SELECT * FROM jobs WHERE {where}", (job_id,)).fetchone()
+            return dict(row) if row is not None else None
 
     def upload_history(self, job_id: int) -> list[dict[str, Any]]:
         with self._mutex:
