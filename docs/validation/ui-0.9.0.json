@@ -1,0 +1,129 @@
+{
+  "suite": "v0.9.0 browser UI",
+  "mode": "offline API fixtures",
+  "live_mail_requests": 0,
+  "live_smtp_requests": 0,
+  "checks": [
+    {
+      "name": "single Overview heading and no existing-object storage split",
+      "passed": true
+    },
+    {
+      "name": "remote_exists hides storage hints while confirmed upload retains them",
+      "passed": true
+    },
+    {
+      "name": "source group accepts multiple Unicode server paths",
+      "passed": true
+    },
+    {
+      "name": "source scan selects scoped Overview and sends source_id",
+      "passed": true
+    },
+    {
+      "name": "scoped queue and bulk-delete preview stay in the selected group",
+      "passed": true
+    },
+    {
+      "name": "300000-file inventory renders directory-only lazy tree and escapes folder names",
+      "passed": true
+    },
+    {
+      "name": "folder exclusion refreshes persisted selection and inherited tree state",
+      "passed": true
+    },
+    {
+      "name": "asynchronous plan construction cannot activate an incomplete draft",
+      "passed": true
+    },
+    {
+      "name": "preview passes combined targets/calendar and requires separate activation",
+      "passed": true
+    },
+    {
+      "name": "activation produces persistent batch list",
+      "passed": true
+    },
+    {
+      "name": "keyboard-friendly reorder updates batch order without full-id download",
+      "passed": true
+    },
+    {
+      "name": "drag reorder sends stable anchor id",
+      "passed": true
+    },
+    {
+      "name": "date editor sends timezone-local value for server validation",
+      "passed": true
+    },
+    {
+      "name": "pause keeps files until a separate owned-cloud cleanup preview is confirmed",
+      "passed": true
+    },
+    {
+      "name": "batch deletion is explicit and leaves physical files",
+      "passed": true
+    },
+    {
+      "name": "SMTP password stays write-only and test email is sent only on explicit click",
+      "passed": true
+    },
+    {
+      "name": "390px mobile pages fit viewport with usable navigation",
+      "passed": true
+    },
+    {
+      "name": "directory DOM is capped at 1000 and loaded tree pages survive exclusions",
+      "passed": true
+    },
+    {
+      "name": "source cards request bounded server pages for large plans",
+      "passed": true
+    },
+    {
+      "name": "source scope survives state refresh when selected source is outside first 50",
+      "passed": true
+    },
+    {
+      "name": "paged schedule picker remains within its mobile dialog",
+      "passed": true
+    },
+    {
+      "name": "schedule source selection survives server paging and Unicode search",
+      "passed": true
+    },
+    {
+      "name": "interrupted activation rollback is named and protected from plan edits",
+      "passed": true
+    },
+    {
+      "name": "no browser exceptions or unexpected network/API calls",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "plan-tree-desktop.png",
+    "plan-preview-desktop.png",
+    "plans-desktop.png",
+    "notifications-desktop.png",
+    "settings-mobile.png",
+    "plans-mobile.png",
+    "sources-mobile.png",
+    "queue-mobile.png",
+    "overview-mobile.png",
+    "schedule-source-search.png",
+    "schedule-source-search-mobile.png"
+  ],
+  "status": "passed",
+  "source_files": {
+    "mailru_photos/web_static/app.js": "7b5e87124fe23129a5e665027ef92400109e5e7a619a949bb1054fd2c9e4a891",
+    "mailru_photos/web_static/index.html": "b7b23849cea71ad31005ea6de5f155aa058a21b07e97d00bd38d98ab3e99e9da",
+    "mailru_photos/web_static/style.css": "127dddf499b44d4114669cd8f204292e4cfc957ded7e1848fc00fc10ec6cfa79",
+    "tests/browser_plans_v090.cjs": "4847150d0cf37f934e6041aaf63a36175531523f1b6ec023e350cdbf2168c800"
+  },
+  "started_at": "2026-11-04T21:58:38.116Z",
+  "files_changed_during_run": [],
+  "browser": "151.0.7922.34",
+  "check_count": 24,
+  "finished_at": "2026-11-04T21:59:26.324Z"
+}

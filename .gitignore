@@ -22,6 +22,8 @@ project.json
 *.key
 credentials.json
 secrets.json
+email.json
+*.smtp-private.json
 
 # Local diagnostics, reverse-engineering inputs, and personal media.
 /analysis/

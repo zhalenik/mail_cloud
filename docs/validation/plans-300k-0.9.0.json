@@ -1,0 +1,140 @@
+{
+  "benchmark": "plans-v0.9.0",
+  "count": 300000,
+  "top_level_folders": 3000,
+  "scope": {
+    "real_local_directory_entries": true,
+    "real_stat_calls": true,
+    "real_sqlite": true,
+    "journal_mode": "WAL",
+    "synchronous": "FULL",
+    "media_contents_read": false,
+    "network_requests": false,
+    "account_access": false,
+    "sparse_file_sizes_synthetic": true,
+    "limitations": [
+      "Local filesystem timings do not predict HDD, NAS, cloud scans or upload speed.",
+      "Sparse files are metadata fixtures, not valid photographs or videos.",
+      "RSS covers this benchmark process; it is not total production application memory."
+    ]
+  },
+  "environment": {
+    "python": "3.12.14",
+    "sqlite": "3.53.1",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_count": 9,
+    "inventory_sha256": "53d5006baf7568ed11d0fd1f6131f9a4eb806b6b90d8513c4d92008ce9289fa7",
+    "plans_sha256": "50c4a5a9667d32a31a14cc9f211a101ded5f6db1e0d84a7da4f437a41297fb08"
+  },
+  "baseline_rss_mb": 20.33984375,
+  "measurements": {
+    "create_sparse_fixture": {
+      "seconds": 78.50730739600112,
+      "result": {
+        "files": 300000,
+        "total_bytes": 1100834947072
+      },
+      "rss_mb": 21.765625,
+      "peak_rss_mb": 21.66015625
+    },
+    "initial_stat_inventory": {
+      "seconds": 4.5083513889985625,
+      "result": {
+        "status": "ready",
+        "total_count": 300000,
+        "total_bytes": 1100834947072,
+        "directory_count": 3001,
+        "selected_errors": 0
+      },
+      "rss_mb": 25.80078125,
+      "peak_rss_mb": 25.59765625
+    },
+    "repeat_stat_inventory": {
+      "seconds": 5.5273646079986065,
+      "result": {
+        "status": "ready",
+        "total_count": 300000,
+        "total_bytes": 1100834947072,
+        "directory_count": 3001,
+        "selected_errors": 0
+      },
+      "rss_mb": 25.83984375,
+      "peak_rss_mb": 25.59765625
+    },
+    "paged_tree": {
+      "seconds": 0.050369280001177685,
+      "result": {
+        "folders_read": 3000,
+        "max_page": 200
+      },
+      "rss_mb": 26.15234375,
+      "peak_rss_mb": 25.84765625
+    },
+    "grouping_and_calendar": {
+      "seconds": 0.2779756349991658,
+      "result": {
+        "batch_count": 45,
+        "file_count": 300000,
+        "total_bytes": 1100834947072,
+        "oversized_count": 0
+      },
+      "rss_mb": 27.00390625,
+      "peak_rss_mb": 26.62109375
+    },
+    "verify_every_batch_member": {
+      "seconds": 0.05045782800152665,
+      "result": {
+        "batches": 45,
+        "files": 300000,
+        "bytes": 1100834947072,
+        "unique_directory_members": 3000
+      },
+      "rss_mb": 27.015625,
+      "peak_rss_mb": 26.62109375
+    },
+    "cancelled_rebuild_atomicity": {
+      "seconds": 0.020183792999887373,
+      "result": {
+        "previous_preview_preserved": true,
+        "stale_preview_activation_blocked": true
+      },
+      "rss_mb": 27.02734375,
+      "peak_rss_mb": 26.7734375
+    },
+    "regroup_after_cancellation": {
+      "seconds": 0.39673934200254735,
+      "result": {
+        "batch_count": 45,
+        "file_count": 300000,
+        "total_bytes": 1100834947072,
+        "oversized_count": 0
+      },
+      "rss_mb": 27.10546875,
+      "peak_rss_mb": 26.8984375
+    },
+    "idle_cached_reads": {
+      "seconds": 0.20714784699885058,
+      "result": {
+        "iterations": 100,
+        "sqlite_connections": 0
+      },
+      "rss_mb": 27.10546875,
+      "peak_rss_mb": 26.8984375
+    }
+  },
+  "assertions": [
+    "300k-scale initial and repeated inventories use real stat calls and store directories only.",
+    "Nested tree pages are capped at 200; selected counts subtract and restore an excluded directory.",
+    "All directory members appear exactly once; both hard caps and serial dates are respected.",
+    "Canceling a rebuild preserves the old preview atomically and invalidates activation until rebuild.",
+    "One hundred idle summary/list/cached-page/tick cycles open no SQLite connections.",
+    "SQLite integrity checks pass and the last preview survives process-object restart."
+  ],
+  "database_bytes": {
+    "plans.sqlite3": 3866624,
+    "inventory.sqlite3": 1712128
+  },
+  "total_seconds": 97.16924006699992,
+  "final_rss_mb": 28.125,
+  "peak_rss_mb": 27.7734375
+}

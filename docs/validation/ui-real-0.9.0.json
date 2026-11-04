@@ -1,0 +1,90 @@
+{
+  "suite": "v0.9.0 real HTTP/browser integration",
+  "mode": "real WebService/SQLite; offline remote Cloud boundary; SMTP delivery disabled",
+  "live_mail_requests": 0,
+  "live_smtp_requests": 0,
+  "checks": [
+    {
+      "name": "real panel setup creates authenticated CSRF session",
+      "passed": true
+    },
+    {
+      "name": "multiple-source form reaches real group/membership controller",
+      "passed": true
+    },
+    {
+      "name": "source scan and filtered queue use real scoped task totals",
+      "passed": true
+    },
+    {
+      "name": "real SMTP settings save write-only secret and do not send automatically",
+      "passed": true
+    },
+    {
+      "name": "actual stat tree/exclusions and asynchronous two-dimensional planner agree with wizard",
+      "passed": true
+    },
+    {
+      "name": "activation creates owned source groups and keeps one-shot batches out of recurring schedules",
+      "passed": true
+    },
+    {
+      "name": "pause persists; real cleanup preview and token trash only one owned object",
+      "passed": true
+    },
+    {
+      "name": "resume requeues trashed objects; completed batch leaves manual-source tasks untouched and queues notification",
+      "passed": true
+    },
+    {
+      "name": "batch task link filters the actual completed tasks",
+      "passed": true
+    },
+    {
+      "name": "explicit SMTP test enters real outbox while delivery remains disabled",
+      "passed": true
+    },
+    {
+      "name": "real populated plan renders at 390px without page overflow",
+      "passed": true
+    },
+    {
+      "name": "real paged source API bounds state to 50 and retains selected off-page group",
+      "passed": true
+    },
+    {
+      "name": "real scheduler stores both selected groups across paging and Unicode search",
+      "passed": true
+    },
+    {
+      "name": "real HTTP responses and browser produce no server exceptions",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "real-plan-preview.png",
+    "real-plans-completed.png",
+    "real-plans-mobile.png"
+  ],
+  "started_at": "2026-11-04T22:02:05.845Z",
+  "status": "passed",
+  "source_files": {
+    "mailru_photos/web_static/app.js": "7b5e87124fe23129a5e665027ef92400109e5e7a619a949bb1054fd2c9e4a891",
+    "mailru_photos/web_static/index.html": "b7b23849cea71ad31005ea6de5f155aa058a21b07e97d00bd38d98ab3e99e9da",
+    "mailru_photos/web_static/style.css": "127dddf499b44d4114669cd8f204292e4cfc957ded7e1848fc00fc10ec6cfa79",
+    "mailru_photos/web.py": "965781042f2dca7d295acfa577e0f93b30aba5c2e08775ee29d4d73f2524e056",
+    "mailru_photos/web_service.py": "966e157cd32bac5d96d147036edb6adf82c436c1963eef4c8cf707f240130ba7",
+    "mailru_photos/planning_service.py": "a783c87be0c54606732c57afbe46c040f107e194346c9f93dc7f4cbb3cdc3bc7",
+    "mailru_photos/plans.py": "d1e589f23c7ec4e9fca68fc3c303ed4453c1f2886bccc472c661878df703738f",
+    "mailru_photos/plan_inventory.py": "53d5006baf7568ed11d0fd1f6131f9a4eb806b6b90d8513c4d92008ce9289fa7",
+    "mailru_photos/queue.py": "c9f6f06cc447f149006506919c634236d277aa7a87face4b8269a7ae8bb6608d",
+    "mailru_photos/batch_cleanup.py": "a548e2979e30f0b60b24354a385e2f1d7cc8addd2299587cca5c023baf3d9a36",
+    "mailru_photos/notifications.py": "c8f8b6273add82303944da78f15b6250e13801f97b1070d83445df49f596bf89",
+    "scripts/browser_fixture_server.py": "990cbb2747e6a2119320b6de0f9aa51f1e3621ae2718839d222eacc21105835b",
+    "tests/browser_plans_real_v090.cjs": "5e3d028bb6327de956cc4e793c7e114ad130862a86896ea4ab46852e342d12db"
+  },
+  "browser": "151.0.7922.34",
+  "check_count": 14,
+  "files_changed_during_run": [],
+  "finished_at": "2026-11-04T22:02:34.025Z"
+}
