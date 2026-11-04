@@ -1,0 +1,420 @@
+{
+  "count": 300000,
+  "environment": {
+    "python": "3.12.14",
+    "sqlite": "3.53.1",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_count": 9,
+    "queue_source_sha256": "cb58cfc158fc00c9d761873544dd5f35ad2f4499c18cbd04dbd9868d2dadaba9"
+  },
+  "scope": {
+    "real_sqlite": true,
+    "journal_mode": "WAL",
+    "synchronous": "FULL",
+    "virtual_source_enumeration": true,
+    "virtual_stat": true,
+    "patched_snapshot": true,
+    "network_uploads": false,
+    "bulk_prefixes_are_sql_fixtures": true,
+    "virtual_jpeg_files": 270000,
+    "virtual_m4v_files": 30000,
+    "fixture_verified_completions": 100,
+    "fixture_existing_observations": 25
+  },
+  "baseline_rss_mb": 19.53125,
+  "measurements": {
+    "initial_scan": {
+      "seconds": 40.87599738300014,
+      "rss_mb": 24.921875,
+      "peak_rss_mb": 24.921875,
+      "disk_mb": {
+        "db": 243.793,
+        "-wal": 7.839,
+        "-shm": 0.031
+      },
+      "result": {
+        "scan_id": 1,
+        "seen": 300000,
+        "added": 300000,
+        "changed": 0,
+        "moved": 0,
+        "unchanged": 0,
+        "missing": 0,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 40.874442356000145,
+        "complete": true,
+        "cancelled": false,
+        "root_ids": null
+      }
+    },
+    "stats_initial": {
+      "median_ms": 408.0173050006124,
+      "p95_ms": 408.1643500003338,
+      "min_ms": 392.9505220003193,
+      "max_ms": 408.1643500003338,
+      "samples": 3,
+      "rss_mb": 30.8671875
+    },
+    "list_asc_offset_0": {
+      "median_ms": 0.6361730002026889,
+      "p95_ms": 0.8103479995043017,
+      "min_ms": 0.5962040004305891,
+      "max_ms": 0.8103479995043017,
+      "samples": 7,
+      "rss_mb": 30.875
+    },
+    "list_asc_offset_150000": {
+      "median_ms": 4.635753000002296,
+      "p95_ms": 5.037350999373302,
+      "min_ms": 4.428387999723782,
+      "max_ms": 5.037350999373302,
+      "samples": 7,
+      "rss_mb": 30.87890625
+    },
+    "list_asc_offset_299900": {
+      "median_ms": 8.981646999927761,
+      "p95_ms": 10.813611000230594,
+      "min_ms": 8.542780999960087,
+      "max_ms": 10.813611000230594,
+      "samples": 7,
+      "rss_mb": 30.890625
+    },
+    "list_desc_offset_0": {
+      "median_ms": 0.7068410004649195,
+      "p95_ms": 0.799170999925991,
+      "min_ms": 0.6154819993753335,
+      "max_ms": 0.799170999925991,
+      "samples": 7,
+      "rss_mb": 30.890625
+    },
+    "list_desc_offset_150000": {
+      "median_ms": 4.70279399996798,
+      "p95_ms": 5.031843000324443,
+      "min_ms": 4.460195999854477,
+      "max_ms": 5.031843000324443,
+      "samples": 7,
+      "rss_mb": 30.89453125
+    },
+    "list_desc_offset_299900": {
+      "median_ms": 9.365347999846563,
+      "p95_ms": 9.922352000103274,
+      "min_ms": 8.52707800004282,
+      "max_ms": 9.922352000103274,
+      "samples": 7,
+      "rss_mb": 30.89453125
+    },
+    "candidate_after_0": {
+      "median_ms": 0.993865999589616,
+      "p95_ms": 2.0825249994231854,
+      "min_ms": 0.9364990000904072,
+      "max_ms": 2.0825249994231854,
+      "samples": 7,
+      "rss_mb": 31.46484375
+    },
+    "candidate_after_150000": {
+      "median_ms": 1.0388640002929606,
+      "p95_ms": 1.1842839994642418,
+      "min_ms": 0.8985810000012862,
+      "max_ms": 1.1842839994642418,
+      "samples": 7,
+      "rss_mb": 31.74609375
+    },
+    "candidate_after_299500": {
+      "median_ms": 0.9544859995003208,
+      "p95_ms": 2.6777069997478975,
+      "min_ms": 0.9017259999382077,
+      "max_ms": 2.6777069997478975,
+      "samples": 7,
+      "rss_mb": 31.74609375
+    },
+    "claim_first": {
+      "median_ms": 0.44529499973577913,
+      "p95_ms": 1.7307620000792667,
+      "max_ms": 1.7307620000792667,
+      "samples": 11,
+      "claimed_id": 1,
+      "sqlite_vm_operations_upper_bound": 600
+    },
+    "claim_first_unlimited": {
+      "median_ms": 0.39109200042730663,
+      "p95_ms": 0.9852429993770784,
+      "max_ms": 0.9852429993770784,
+      "samples": 11,
+      "claimed_id": 1,
+      "sqlite_vm_operations_upper_bound": 600
+    },
+    "claim_first_regular": {
+      "median_ms": 0.4718249992947676,
+      "p95_ms": 0.7079130000420264,
+      "max_ms": 0.7079130000420264,
+      "samples": 11,
+      "claimed_id": 10,
+      "sqlite_vm_operations_upper_bound": 500
+    },
+    "filter_totals_uploaded_unlimited": {
+      "median_ms": 0.01645500015001744,
+      "p95_ms": 0.10749299963208614,
+      "min_ms": 0.012888999663118739,
+      "max_ms": 0.10749299963208614,
+      "samples": 3,
+      "rss_mb": 31.75390625,
+      "result": {
+        "total": 90,
+        "total_bytes": 4700160
+      }
+    },
+    "filter_totals_uploaded_regular": {
+      "median_ms": 0.006931000825716183,
+      "p95_ms": 0.014311999620986171,
+      "min_ms": 0.005648999831464607,
+      "max_ms": 0.014311999620986171,
+      "samples": 3,
+      "rss_mb": 31.75390625,
+      "result": {
+        "total": 10,
+        "total_bytes": 573440
+      }
+    },
+    "filter_totals_uploaded_unknown": {
+      "median_ms": 0.0066200000219396316,
+      "p95_ms": 0.01105699993786402,
+      "min_ms": 0.0057489996834192425,
+      "max_ms": 0.01105699993786402,
+      "samples": 3,
+      "rss_mb": 31.75390625,
+      "result": {
+        "total": 25,
+        "total_bytes": 2918400
+      }
+    },
+    "filter_totals_all": {
+      "median_ms": 48.75112399986392,
+      "p95_ms": 50.97685500004445,
+      "min_ms": 48.4536140002092,
+      "max_ms": 50.97685500004445,
+      "samples": 3,
+      "rss_mb": 31.75390625,
+      "result": {
+        "total": 300000,
+        "total_bytes": 627723681792
+      }
+    },
+    "claim_last_after_terminal_prefix": {
+      "median_ms": 0.2880769998228061,
+      "p95_ms": 1.1804989999291138,
+      "max_ms": 1.1804989999291138,
+      "samples": 11,
+      "claimed_id": 300000,
+      "sqlite_vm_operations_upper_bound": 600
+    },
+    "claim_last_after_paused_prefix": {
+      "median_ms": 0.3947280001739273,
+      "p95_ms": 0.8082049998847651,
+      "max_ms": 0.8082049998847651,
+      "samples": 11,
+      "claimed_id": 300000,
+      "sqlite_vm_operations_upper_bound": 600
+    },
+    "claim_retry_after_paused_prefix": {
+      "median_ms": 0.3495900000416441,
+      "p95_ms": 2.7887149999514804,
+      "max_ms": 2.7887149999514804,
+      "samples": 11,
+      "claimed_id": 300000,
+      "sqlite_vm_operations_upper_bound": 600
+    },
+    "stats_paused_prefix": {
+      "median_ms": 427.3469750005461,
+      "p95_ms": 454.23199200013187,
+      "min_ms": 410.0136980005118,
+      "max_ms": 454.23199200013187,
+      "samples": 3,
+      "rss_mb": 32.11328125
+    },
+    "unchanged_rescan": {
+      "seconds": 35.37987022700054,
+      "rss_mb": 32.1484375,
+      "peak_rss_mb": 32.1484375,
+      "disk_mb": {
+        "db": 267.812,
+        "-wal": 195.471,
+        "-shm": 0.406
+      },
+      "result": {
+        "scan_id": 2,
+        "seen": 300000,
+        "added": 0,
+        "changed": 0,
+        "moved": 0,
+        "unchanged": 300000,
+        "missing": 0,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 35.37877868399937,
+        "complete": true,
+        "cancelled": false,
+        "root_ids": null
+      }
+    },
+    "moved_rescan": {
+      "seconds": 35.37227743399944,
+      "rss_mb": 32.15625,
+      "peak_rss_mb": 32.15625,
+      "disk_mb": {
+        "db": 268.266,
+        "-wal": 195.471,
+        "-shm": 0.406
+      },
+      "result": {
+        "scan_id": 3,
+        "seen": 300000,
+        "added": 0,
+        "changed": 0,
+        "moved": 3000,
+        "unchanged": 297000,
+        "missing": 0,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 35.37104484599968,
+        "complete": true,
+        "cancelled": false,
+        "root_ids": null
+      }
+    },
+    "removed_rescan": {
+      "seconds": 34.55662377600038,
+      "rss_mb": 32.6484375,
+      "peak_rss_mb": 32.6484375,
+      "disk_mb": {
+        "db": 268.273,
+        "-wal": 195.471,
+        "-shm": 0.406
+      },
+      "result": {
+        "scan_id": 4,
+        "seen": 290000,
+        "added": 0,
+        "changed": 0,
+        "moved": 0,
+        "unchanged": 290000,
+        "missing": 10000,
+        "ignored_symlinks": 0,
+        "error_count": 0,
+        "errors": [],
+        "seconds": 34.55556733699996,
+        "complete": true,
+        "cancelled": false,
+        "root_ids": null
+      }
+    },
+    "reopen": {
+      "milliseconds": 1.0119729995494708,
+      "writes": 0,
+      "rss_mb": 32.2890625
+    },
+    "stats_final": {
+      "median_ms": 502.479778999259,
+      "p95_ms": 506.47559000026376,
+      "min_ms": 418.8902030000463,
+      "max_ms": 506.47559000026376,
+      "samples": 3,
+      "rss_mb": 32.2890625
+    }
+  },
+  "plans": {
+    "pending_claim": [
+      [
+        5,
+        0,
+        212,
+        "SCAN jobs USING INDEX jobs_pending"
+      ]
+    ],
+    "retry_claim": [
+      [
+        5,
+        0,
+        172,
+        "SEARCH jobs USING INDEX jobs_retry (next_attempt>? AND next_attempt<?)"
+      ]
+    ],
+    "pending_claim_unlimited": [
+      [
+        5,
+        0,
+        212,
+        "SCAN jobs USING INDEX jobs_pending_unlimited"
+      ]
+    ],
+    "pending_claim_regular": [
+      [
+        5,
+        0,
+        212,
+        "SCAN jobs USING INDEX jobs_pending_regular"
+      ]
+    ],
+    "task_list_asc": [
+      [
+        8,
+        0,
+        212,
+        "SCAN jobs USING INDEX jobs_current_created"
+      ]
+    ],
+    "task_list_desc": [
+      [
+        8,
+        0,
+        212,
+        "SCAN jobs USING INDEX jobs_current_created"
+      ]
+    ],
+    "reconcile_candidates": [
+      [
+        5,
+        0,
+        192,
+        "SEARCH jobs USING INDEX jobs_reconcile (id>?)"
+      ],
+      [
+        12,
+        0,
+        0,
+        "CORRELATED SCALAR SUBQUERY 1"
+      ],
+      [
+        16,
+        12,
+        33,
+        "SEARCH commit_intents USING INTEGER PRIMARY KEY (rowid=?)"
+      ]
+    ]
+  },
+  "assertions": [
+    "initial count exactly matches virtual source count",
+    "unchanged rescan creates no tasks",
+    "3000 moves preserve task IDs and do not grow the queue",
+    "uploaded and existing observations retain their actual cloud paths after moves",
+    "10000 absent sources excluded from current totals and retained in history",
+    "paused prefix has remaining=0 and no claimable task",
+    "first/last/paused-prefix claims stay below 10000 SQLite VM operations",
+    "planned unlimited and regular claims use their respective partitions",
+    "both creation-time sort directions preserve stable task order",
+    "observed-storage filter totals cover all matching tasks independently of pagination",
+    "ordered claim/list/keyset queries require no temporary sort",
+    "reopen performs zero writes and preserves current counts, actual paths and proof history"
+  ],
+  "final_disk_mb": {
+    "db": 268.273
+  },
+  "final_rss_mb": 29.0703125,
+  "peak_rss_mb": 32.6484375,
+  "observed_peak_rss_mb": 32.6484375,
+  "rss_after_initial_scan_mb": 30.82421875,
+  "total_seconds": 163.52574492200074
+}

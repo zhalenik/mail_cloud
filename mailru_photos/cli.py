@@ -17,7 +17,7 @@ from . import __version__
 from .api import CloudAPI, ProtocolError
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .queue import Queue, QueueError
-from .runner import ProbeRequired, probe, run
+from .runner import run
 from .transport import Cancelled, TransportError
 
 
@@ -70,12 +70,6 @@ class Reporter:
             if event == "progress":
                 print(f"Загружено: {data['uploaded']:,}; в очереди: {data['pending']:,}; "
                       f"ошибки: {data['failed']:,}; пропущено: {data['skipped']:,}", flush=True)
-            elif event == "probe_wait":
-                print(f"Ожидание обновления квоты: {data['seconds']:g} с…", flush=True)
-            elif event == "probe_quota":
-                print(f"Изменение used.cloud: {data['delta_bytes']:+,} байт", flush=True)
-            elif event == "probe_upload":
-                print(f"Проверочная загрузка: {data['path']}", flush=True)
             else:
                 print(event + ": " + json.dumps(data, ensure_ascii=False), flush=True)
 
@@ -107,12 +101,14 @@ def parser() -> argparse.ArgumentParser:
     scan = commands.add_parser("scan", help="обойти все источники и обновить очередь")
     scan.add_argument("--extensions", help="расширения через запятую; по умолчанию фото и видео, например jpg,png,heic,mp4,mov")
     commands.add_parser("status", help="показать состояние очереди без сети")
-    trial = commands.add_parser("probe", help="проверить несколько фото или видео до 2 ГБ и измерить квоту")
-    trial.add_argument("--count", type=int, default=3)
-    trial.add_argument("--settle-seconds", type=float, default=60)
-    upload = commands.add_parser("run", help="загрузить очередь после probe; повторный запуск продолжает работу")
+    upload = commands.add_parser("run", help="загрузить очередь; повторный запуск продолжает работу")
     upload.add_argument("--workers", type=int, default=4)
     upload.add_argument("--max-attempts", type=int, default=5)
+    upload.add_argument("--regular-policy", choices=("skip", "upload"), default="skip",
+                        help="файлы с расходом квоты: пропускать (по умолчанию) или загружать")
+    upload.add_argument("--unexpected-unlimited-action", choices=("trash", "keep"), default="trash",
+                        help="если сервер не подтвердил ожидаемый безлимит: в корзину (по умолчанию) или оставить")
+    upload.add_argument("--job-id", type=int, help="запустить только эту задачу, включая остановленную или ошибочную")
     retry = commands.add_parser("retry-failed", help="вернуть ошибки в очередь после устранения причины")
     retry.add_argument("--include-permanent", action="store_true")
     errors = commands.add_parser("errors", help="показать записи с ошибками")
@@ -168,9 +164,6 @@ def _account_login(queue: Queue, directory: Path, email: str) -> None:
                             code="account_mismatch", stage="user_info", client_id=memory.value.client_id)
         queue.bind_account(account.email)
         TokenStore(directory / "auth.dat").save(memory.value)
-        previous_probe = queue.get_metadata("probe")
-        if isinstance(previous_probe, dict) and previous_probe.get("result") == "provisional_pass":
-            queue.set_metadata("probe", {**previous_probe, "result": "invalidated", "reason": "new_login"})
         queue.set_metadata("last_auth", {"result": "success", "at": time.time(),
                                          "client_id": memory.value.client_id, "stage": "user_info"})
         pretty({"account": account.email, "unlimited_upload_enabled": account.unlimited_enabled,
@@ -228,8 +221,7 @@ def dispatch(args) -> int:
         if args.command == "status":
             pretty({"destination": queue.destination, "account": queue.account_id,
                     "sources": [dataclasses.asdict(item) for item in queue.roots()],
-                    "stats": queue.stats(), "last_scan": queue.get_metadata("last_scan"),
-                    "probe": queue.get_metadata("probe", {}).get("result")})
+                    "stats": queue.stats(), "last_scan": queue.get_metadata("last_scan")})
             return 0
         if args.command == "errors":
             pretty(queue.list_jobs("failed", limit=args.limit))
@@ -243,7 +235,7 @@ def dispatch(args) -> int:
         if args.command == "report":
             data = {"client_version": __version__, "destination": queue.destination,
                     "stats": queue.stats(), "last_scan": queue.get_metadata("last_scan"),
-                    "probe": queue.get_metadata("probe"), "last_run": queue.get_metadata("last_run"),
+                    "last_run": queue.get_metadata("last_run"),
                     "last_auth": queue.get_metadata("last_auth"),
                     "errors": queue.list_jobs("failed", limit=100)}
             write_json(args.output.expanduser().resolve(), data)
@@ -260,7 +252,7 @@ def dispatch(args) -> int:
         if args.command == "doctor":
             # TokenManager loads auth.dat immediately and may rotate its refresh
             # token on either request.  Hold the same process lock as login,
-            # probe and run before loading it, not only during the requests.
+            # and run before loading it, not only during the requests.
             with queue.exclusive_run():
                 tokens = TokenManager(TokenStore(directory / "auth.dat"))
                 api = CloudAPI(tokens)
@@ -269,30 +261,40 @@ def dispatch(args) -> int:
                     queue.bind_account(account.email)
                     pretty({"account": account.email, "unlimited_upload_enabled": account.unlimited_enabled,
                             "server_upload_limit": account.upload_limit, "quota": api.quota(),
-                            "warning": "Живая загрузка проверяется отдельной командой probe."})
+                            "note": "Диагностика не загружает файлы. Результат хранения проверяется для каждой задачи."})
                     return 0 if account.unlimited_enabled else 2
                 finally:
                     api.close_thread()
-        tokens = TokenManager(TokenStore(directory / "auth.dat"))
-        api = CloudAPI(tokens)
-        reporter = None
-        try:
-            reporter = Reporter(directory / "events.jsonl", quiet=args.quiet)
-            if args.command == "probe":
-                result = probe(queue, api, count=args.count, settle_seconds=args.settle_seconds, emit=reporter.emit)
-                write_json(directory / "probe-report.json", result)
-                pretty(result)
-                return 0 if result["result"] == "provisional_pass" else 2
-            if args.command == "run":
-                result = run(queue, api, workers=args.workers, max_attempts=args.max_attempts, emit=reporter.emit)
-                write_json(directory / "last-run.json", result)
-                pretty(result)
-                stats = result["stats"]
-                return 0 if not result["stopped"] and not (stats["pending"] or stats["running"] or stats["failed"] or stats["skipped"]) else 2
-        finally:
-            api.close_thread()
-            if reporter is not None:
-                reporter.close()
+        if args.command == "run":
+            if args.job_id is not None and args.job_id <= 0:
+                raise ValueError("--job-id должен быть положительным номером задачи.")
+            # Load and rotate credentials under the same process lock as the
+            # runner; exclusive_run permits nesting on its owning thread.
+            with queue.exclusive_run():
+                tokens = TokenManager(TokenStore(directory / "auth.dat"))
+                api = CloudAPI(tokens)
+                reporter = None
+                try:
+                    if args.job_id is not None:
+                        queue.request_control(args.job_id, "start")
+                    reporter = Reporter(directory / "events.jsonl", quiet=args.quiet)
+                    result = run(queue, api, workers=args.workers, max_attempts=args.max_attempts,
+                                 regular_policy=args.regular_policy,
+                                 unexpected_unlimited_action=args.unexpected_unlimited_action,
+                                 job_id=args.job_id, emit=reporter.emit)
+                    write_json(directory / "last-run.json", result)
+                    pretty(result)
+                    if args.job_id is not None:
+                        job = queue.get_job(args.job_id)
+                        completed = job is not None and (job["status"] == "uploaded" or
+                                    job["status"] == "skipped" and job.get("skip_reason") == "remote_exists")
+                        return 0 if completed and not result["stopped"] else 2
+                    stats = result["stats"]
+                    return 0 if not result["stopped"] and not (stats["pending"] or stats["running"] or stats["failed"] or stats["skipped"]) else 2
+                finally:
+                    api.close_thread()
+                    if reporter is not None:
+                        reporter.close()
     return 0
 
 
@@ -304,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Ошибка: " + str(error), file=sys.stderr)
         print("Диагностика входа: " + json.dumps(error.safe_diagnostics(), ensure_ascii=False), file=sys.stderr)
         return 2
-    except (QueueError, ProtocolError, ProbeRequired, TransportError, Cancelled, ValueError) as error:
+    except (QueueError, ProtocolError, TransportError, Cancelled, ValueError) as error:
         print("Ошибка: " + str(error), file=sys.stderr)
         return 2
     except KeyboardInterrupt:

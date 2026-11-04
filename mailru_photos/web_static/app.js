@@ -3,16 +3,16 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const numberFormat = new Intl.NumberFormat("ru-RU");
-  const pageNames = { overview: "Обзор", queue: "Очередь задач", sources: "Исходные папки", settings: "Настройки" };
-  const busyPhases = new Set(["login", "logout", "scanning", "checking", "probing", "uploading", "pausing", "reconciling", "quota"]);
+  const pageNames = { overview: "Обзор", queue: "Очередь задач", sources: "Исходные папки", schedules: "Планировщик", settings: "Настройки" };
+  const busyPhases = new Set(["login", "logout", "scanning", "checking", "uploading", "pausing", "reconciling", "quota", "deleting"]);
   const phaseInfo = {
     idle: ["Готов к работе", "Ожидание", "neutral", "cloud"],
     login: ["Подключаем аккаунт", "Подключение", "blue", "lock"],
     logout: ["Выходим из Mail.ru", "Выход", "orange", "logout"],
     scanning: ["Ищем фото и видео", "Сканирование", "blue", "scan"],
     checking: ["Проверяем доступ к Облаку", "Проверка", "blue", "lock"],
-    probing: ["Проверяем безлимит", "Проверка", "blue", "lock"],
     reconciling: ["Проверяем файлы в Облаке", "Проверка", "blue", "scan"],
+    deleting: ["Удаляем выбранные задачи", "Удаление", "orange", "remove"],
     quota: ["Обновляем данные о месте", "Обновление", "blue", "cloud"],
     uploading: ["Загружаем файлы", "Загрузка", "blue", "cloud"],
     pausing: ["Сохраняем прогресс", "Останавливаем", "orange", "pause"],
@@ -23,6 +23,12 @@
   const jobStates = {
     pending: ["Ожидает", "neutral"], running: ["В работе", "blue"], uploaded: ["Выполнена", "green"],
     failed: ["Ошибка", "red"], skipped: ["Пропущена", "orange"], paused: ["На паузе", "orange"]
+  };
+  const planReasons = {
+    size_limit: "Размер больше 2 ГБ: требуется обычное хранилище.",
+    documented_format: "Формат указан в справке автозагрузки; итоговый режим подтвердит Облако.",
+    account_confirmed_mov: "MOV проверен в аккаунте; итоговый режим каждого файла подтвердит Облако.",
+    outside_documented_formats: "Формат вне подтверждённого списка: запланирована загрузка в квоту."
   };
   const transferStages = { hash: "Проверка файла", hashing: "Проверка файла", upload: "Передача", uploading: "Передача", blob_upload: "Передача", stat: "Проверка результата", verify: "Проверка результата", verifying: "Проверка результата", commit: "Подтверждение", add: "Подтверждение", unlimited_add: "Подтверждение", preparing: "Подготовка" };
   let session = { authenticated: false, setup_required: false, csrf: "" };
@@ -37,7 +43,28 @@
   let jobsFilter = "all";
   let jobsOffset = 0;
   let jobsTotal = 0;
+  let jobsTotalBytes = null;
+  let jobsSort = "asc";
+  let actionMenuJobId = null;
+  let actionMenuSignature = "";
+  let deleteContext = null;
+  let deletePreview = null;
+  let deletePreviewRequest = 0;
+  let deletePreviewLoading = false;
+  let deletePreviewTimer = null;
+  const warnedScans = (() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem("mail-cloud.scan-warnings.v1") || "[]");
+      return new Set(Array.isArray(saved) ? saved.filter((value) => typeof value === "string").slice(-100) : []);
+    } catch { return new Set(); }
+  })();
   let jobsRequest = 0;
+  let schedules = [];
+  let schedulesRequest = 0;
+  let schedulesTimezone = "Europe/Moscow";
+  let schedulesSignature = null;
+  let editingScheduleId = null;
+  let removingScheduleId = null;
   let folderState = { path: null, parent: null };
   let folderRequest = 0;
   let editingSourceId = null;
@@ -62,6 +89,10 @@
     const noun = lastTwo >= 11 && lastTwo <= 14 ? "задач" : last === 1 ? "задача" : last >= 2 && last <= 4 ? "задачи" : "задач";
     return count(amount) + " " + noun;
   }
+  function fileCount(value) {
+    const amount = Math.max(0, Math.floor(finite(value))), lastTwo = amount % 100, last = amount % 10;
+    return count(amount) + " " + (lastTwo >= 11 && lastTwo <= 14 ? "файлов" : last === 1 ? "файл" : last >= 2 && last <= 4 ? "файла" : "файлов");
+  }
   function bytes(value) {
     const amount = Math.max(0, finite(value));
     if (amount < 1024) return count(amount) + " Б";
@@ -72,7 +103,7 @@
   }
   function dateTime(value) {
     if (!Number.isFinite(value) || value <= 0) return "";
-    return new Date(value * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+    return new Date(value * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
   }
   function plain(value, fallback = "") { return typeof value === "string" ? value : fallback; }
   function mediaIcon(path) { return /\.(mp4|3gp|3g2|3gpp|3gpp2|avi|vob|mov|mkv|m2t|m2ts|ts|mts|f4v|flv|wmv|m4v|mpg|ogv|webm|hevc)$/i.test(path) ? "video" : "image"; }
@@ -95,7 +126,7 @@
   }
   function appendStorageMode(container, mode) {
     if (mode !== "regular") return;
-    const label = element("span", "storage-mode", "Обычное хранение");
+    const label = element("span", "storage-mode", "В квоту");
     label.title = "Режим загрузки с расходованием места по тарифу";
     container.appendChild(label);
   }
@@ -164,6 +195,7 @@
     clearTimeout(pollTimer);
     closeDialogs();
     closeAccountMenu();
+    closeTaskMenu();
     mailLogoutRequested = false;
     setHidden("loading-screen", true);
     setHidden("app", true);
@@ -244,19 +276,26 @@
   }
 
   async function poll() {
-    if (pollInFlight || !session.authenticated || pendingActions.has("password")) return;
+    if (document.hidden || pollInFlight || !session.authenticated || pendingActions.has("password")) return;
     pollInFlight = true;
     try {
       await refreshState();
       if (pendingActions.has("password")) return;
       if (activePage === "queue") await loadJobs(false);
+      if (activePage === "schedules") await loadSchedules(false);
     } catch (error) {
       if (session.authenticated && !error.staleSession) setConnectivity(false, error.message + " Данные на экране могут быть устаревшими.");
     } finally {
       pollInFlight = false;
       clearTimeout(pollTimer);
-      if (session.authenticated && !pendingActions.has("password")) pollTimer = setTimeout(poll, document.hidden ? 5000 : 2000);
+      schedulePoll();
     }
+  }
+
+  function schedulePoll(soon = false) {
+    clearTimeout(pollTimer);
+    if (document.hidden || !session.authenticated || pendingActions.has("password")) return;
+    pollTimer = setTimeout(poll, soon || isBusy() || anyAction() ? 2000 : 30000);
   }
 
   function phase() { return plain(snapshot && snapshot.activity && snapshot.activity.phase, "idle"); }
@@ -271,22 +310,24 @@
     const busy = isBusy();
     const transient = anyAction();
     const current = phase();
-    $("start-upload").disabled = busy || transient || !snapshot.authenticated || !hasSources || !connected;
+    const resumeDeletion = Boolean(snapshot.deletion && snapshot.deletion.resume_available === true);
+    $("start-upload").disabled = busy || transient || !connected || !resumeDeletion && (!snapshot.authenticated || !hasSources);
     $("scan-folders").disabled = busy || transient || !hasSources || !connected;
-    const pausable = ["scanning", "checking", "probing", "uploading", "pausing", "reconciling"].includes(current);
+    const pausable = ["scanning", "checking", "uploading", "pausing", "reconciling", "deleting"].includes(current);
     setHidden("pause-upload", !pausable);
     setHidden("start-upload", pausable);
     $("pause-upload").disabled = current === "pausing" || pendingActions.has("pause") || pendingActions.has("password") || !connected;
-    $("pause-upload").querySelector("span").textContent = current === "scanning" ? "Остановить сканирование" : current === "pausing" ? "Сохраняем прогресс…" : "Приостановить";
+    $("pause-upload").querySelector("span").textContent = current === "scanning" ? "Остановить сканирование" : current === "pausing" ? "Сохраняем прогресс…" : current === "deleting" ? "Приостановить удаление" : "Приостановить";
     const resumed = ["paused", "error"].includes(current) || finite(snapshot.stats && snapshot.stats.uploaded) > 0;
-    $("start-upload").querySelector("span").textContent = resumed ? "Продолжить загрузку" : "Начать загрузку";
-    const sourcesDisabled = busy || transient || !connected;
+    $("start-upload").querySelector("span").textContent = resumeDeletion ? "Продолжить удаление" : resumed ? "Продолжить загрузку" : "Начать загрузку";
+    const sourcesDisabled = busy || transient || resumeDeletion || !connected;
     ["add-source", "empty-add-source", "onboarding-source", "source-submit", "source-remove-submit", "browse-folders", "source-path", "source-alias", "source-remote-prefix"].forEach((id) => { $(id).disabled = sourcesDisabled; });
     document.querySelectorAll("[data-source-action]").forEach((button) => { button.disabled = sourcesDisabled; });
-    setHidden("sources-busy-note", !busy);
+    setHidden("sources-busy-note", !busy && !resumeDeletion);
+    setText("sources-busy-note", resumeDeletion ? "Завершите удаление, прежде чем изменять исходные папки." : "Чтобы изменить источники, приостановите текущую работу и дождитесь сохранения прогресса.");
     setHidden("source-form-busy", !busy);
     setHidden("source-remove-busy", !busy);
-    ["onboarding-login", "settings-login", "account-menu-login"].forEach((id) => { $(id).disabled = busy || transient || !connected; });
+    ["onboarding-login", "account-menu-login"].forEach((id) => { $(id).disabled = busy || transient || !connected; });
     $("account-button").disabled = ["login", "logout"].includes(current) || transient || !connected;
     $("account-menu-logout").disabled = !snapshot.authenticated || current === "logout" || transient || !connected;
     setText("account-menu-note", busy ? "Выход остановит текущую работу и сохранит очередь." : "Очередь и завершённые задачи сохранятся. Для продолжения войдите в этот же аккаунт.");
@@ -294,8 +335,10 @@
     $("save-settings").disabled = busy || transient || !connected;
     $("workers").disabled = busy || transient;
     $("auto-resume").disabled = busy || transient;
-    $("preflight-check").disabled = busy || transient;
+    $("regular-policy").disabled = busy || transient;
+    $("unexpected-unlimited-action").disabled = busy || transient;
     $("remote-reconcile").disabled = busy || transient;
+    $("timezone").disabled = busy || transient;
     $("change-panel-password").disabled = transient || !connected || !session.authenticated;
     const changingPassword = pendingActions.has("password");
     ["panel-password-current", "panel-password-new", "panel-password-confirm", "panel-password-submit"].forEach((id) => { $(id).disabled = changingPassword || !connected; });
@@ -306,12 +349,11 @@
     $("quota-refresh").querySelector("span").textContent = quotaRefreshing ? "Обновляем…" : "Обновить";
     const canClear = canClearQueue();
     $("clear-queue").disabled = !canClear;
-    $("queue-clear-submit").disabled = !canClear;
-    $("queue-clear-options").disabled = !canClear;
-    setHidden("queue-clear-busy", snapshot.queue_clear_available === true || !connected);
-    setText("queue-clear-submit", pendingActions.has("clear") ? "Очищаем…" : $("queue-clear-all").checked ? "Очистить всю очередь" : "Убрать обработанные");
+    updateDeletionControls();
     setHidden("task-controls-note", snapshot.task_controls_available === true || !connected || jobsTotal === 0);
     jobViews.forEach(updateJobControls);
+    updateTaskMenu();
+    updateScheduleControls();
   }
 
   function renderState() {
@@ -321,7 +363,7 @@
     const sources = Array.isArray(state.sources) ? state.sources : [];
     const activity = state.activity || {};
     const current = phase();
-    const info = phaseInfo[current] || phaseInfo.idle;
+    const info = state.deletion && state.deletion.resume_available === true && !isBusy() ? ["Удаление приостановлено", "На паузе", "orange", "pause"] : phaseInfo[current] || phaseInfo.idle;
     const total = Math.max(0, finite(stats.total));
     const uploaded = Math.max(0, finite(stats.uploaded));
     const failed = Math.max(0, finite(stats.failed)), skipped = Math.max(0, finite(stats.skipped));
@@ -329,12 +371,14 @@
     const finishedErrors = Math.max(0, finite(stats.permanent_failures ?? failed));
     const processed = Math.min(total, uploaded + finishedErrors + skipped);
     const percentage = total > 0 ? processed / total * 100 : 0;
-    setText("version-label", "Версия " + plain(state.version, "0.4"));
+    setText("version-label", "Версия " + plain(state.version, "—"));
     setText("account-label", state.authenticated ? plain(state.account, "Вход сохранён") : "Подключить Mail.ru");
     $("account-button").title = state.authenticated ? "Вход в Mail.ru сохранён: " + plain(state.account) : "Подключить аккаунт Mail.ru";
-    $("account-button").setAttribute("aria-haspopup", state.authenticated ? "menu" : "dialog");
+    $("account-button").setAttribute("aria-haspopup", "menu");
     setText("account-menu-email", plain(state.account, "Аккаунт Mail.ru"));
-    if (!state.authenticated) closeAccountMenu();
+    setHidden("account-menu-login", state.authenticated === true);
+    setHidden("account-menu-logout", state.authenticated !== true);
+    setHidden("account-menu-note", state.authenticated !== true);
     setText("nav-queue-count", count(finite(stats.pending) + finite(stats.running)));
     setText("transfer-title", info[0]);
     setText("phase-badge", info[1]);
@@ -369,9 +413,6 @@
     setText("reconcile-matched", count(reconcile.matched));
     setText("reconcile-errors", count(reconcile.errors));
     setText("reconcile-total", typeof reconcile.total === "number" && Number.isFinite(reconcile.total) && reconcile.total >= 0 ? " из " + count(reconcile.total) : "");
-    setHidden("probe-live", current !== "probing" && current !== "checking");
-    setText("probe-message", current === "checking" ? "Проверяем аккаунт и доступность безлимита…" : "Контрольная проверка безлимита выполняется автоматически.");
-    renderProbeCountdown();
     const error = plain(activity.last_error);
     setHidden("activity-error", !error);
     setText("activity-error-text", error);
@@ -383,7 +424,16 @@
     renderSources(sources);
     renderSettings(state);
     renderQuota(state);
+    renderStoragePlan(state);
+    renderDeletionProgress(state);
+    schedulesTimezone = plain(state.settings && state.settings.timezone, plain(state.scheduler && state.scheduler.timezone, schedulesTimezone));
+    setText("scheduler-timezone", "Часовой пояс: " + schedulesTimezone);
+    const schedulerError = plain(state.scheduler && state.scheduler.error);
+    setText("scheduler-error", schedulerError); setHidden("scheduler-error", !schedulerError);
+    setHidden("scheduled-pause-note", current !== "paused" || finite(state.scheduler && state.scheduler.enabled) === 0);
+    if (activePage === "schedules") renderSchedules();
     updateControls();
+    maybeShowScanWarning();
     maybeRefreshQuota();
   }
 
@@ -392,12 +442,21 @@
     const refreshing = state.quota_refreshing === true || Boolean(quota && quota.refreshing);
     const valid = Boolean(state.authenticated && quota && typeof quota.used_bytes === "number" && Number.isFinite(quota.used_bytes) && quota.used_bytes >= 0 && typeof quota.total_bytes === "number" && Number.isFinite(quota.total_bytes) && quota.total_bytes >= 0);
     setHidden("quota-content", !valid); setHidden("quota-empty", valid);
+    setHidden("account-quota", !valid);
+    setHidden("account-quota-empty", valid || !state.authenticated);
+    setText("account-quota-empty", refreshing ? "Получаем данные о месте…" : "Данные о месте ещё не получены.");
     setText("quota-empty", !state.authenticated ? "Подключите Mail.ru, чтобы получить данные о свободном месте." : refreshing ? "Получаем данные о месте в аккаунте…" : "Данные о квоте ещё не получены. Нажмите «Обновить», когда кнопка станет доступна.");
     if (valid) {
       const used = quota.used_bytes, total = quota.total_bytes;
       const percent = total > 0 ? Math.max(0, Math.min(100, used / total * 100)) : used > 0 ? 100 : 0;
       setText("quota-used", bytes(used) + " занято из " + bytes(total));
       setText("quota-free", typeof quota.free_bytes === "number" && Number.isFinite(quota.free_bytes) ? "Свободно: " + bytes(quota.free_bytes) : "");
+      setText("account-quota-used", bytes(used) + " из " + bytes(total));
+      setText("account-quota-free", typeof quota.free_bytes === "number" && Number.isFinite(quota.free_bytes) ? "Свободно " + bytes(quota.free_bytes) : "Свободное место неизвестно");
+      $("account-quota-fill").style.width = percent + "%";
+      $("account-quota-progress").setAttribute("aria-valuenow", percent.toFixed(1));
+      $("account-quota-progress").setAttribute("aria-valuetext", bytes(used) + " занято из " + bytes(total));
+      setText("account-quota-note", quota.stale ? "Последние полученные данные" : quota.updated_at ? "Обновлено: " + dateTime(quota.updated_at) : "");
       $("quota-progress-fill").style.width = percent + "%";
       $("quota-progress").setAttribute("aria-valuenow", percent.toFixed(1));
       $("quota-progress").setAttribute("aria-valuetext", bytes(used) + " занято из " + bytes(total));
@@ -438,10 +497,58 @@
     setText("step-sources-text", completed[1] ? "Подключено папок: " + count(sources.length) : "Откуда читать и куда загружать файлы");
   }
 
-  function renderProbeCountdown() {
-    const until = finite(snapshot && snapshot.activity && snapshot.activity.probe_wait_until);
-    const seconds = until > 0 ? Math.max(0, Math.ceil(until - Date.now() / 1000)) : 0;
-    setText("probe-countdown", seconds > 0 ? seconds + " с" : "");
+  function renderStoragePlan(state) {
+    const plan = state.storage_plan || {};
+    ["unlimited", "regular", "uploaded"].forEach((kind) => {
+      const value = plan[kind];
+      setText("plan-" + kind + "-bytes", value ? bytes(value.bytes) : "—");
+      setText("plan-" + kind + "-count", value ? taskCount(value.count) : "Данные ещё не получены");
+    });
+    setText("plan-policy", state.settings && state.settings.regular_policy === "upload" ? "Файлы с расходом квоты будут загружены в обычное хранилище." : "Файлы с расходом квоты будут пропущены.");
+    const detail = [];
+    if (plan.uploaded_unlimited) detail.push("В безлимите: " + bytes(plan.uploaded_unlimited.bytes));
+    if (plan.uploaded_regular) detail.push("В квоте: " + bytes(plan.uploaded_regular.bytes));
+    if (plan.uploaded_unknown && plan.uploaded_unknown.count) detail.push("Режим не определён: " + bytes(plan.uploaded_unknown.bytes));
+    setText("plan-uploaded-detail", detail.join(" · "));
+    if ($("scan-warning-dialog").open) renderScanWarning();
+  }
+
+  function renderScanWarning() {
+    const regular = snapshot && snapshot.storage_plan && snapshot.storage_plan.regular || {};
+    setText("scan-warning-count", taskCount(regular.count));
+    setText("scan-warning-bytes", bytes(regular.bytes));
+    const quota = snapshot && snapshot.quota;
+    const known = Boolean(snapshot && snapshot.authenticated && quota && typeof quota.free_bytes === "number" && Number.isFinite(quota.free_bytes) && quota.free_bytes >= 0);
+    const upload = snapshot && snapshot.settings && snapshot.settings.regular_policy === "upload";
+    let quotaText = known ? "Свободно в аккаунте: " + bytes(quota.free_bytes) + (quota.stale ? " (последние полученные данные)." : ".") : "Свободное место пока неизвестно: данные о квоте ещё не получены.";
+    if (known && finite(regular.bytes) > quota.free_bytes) quotaText += " Для всех этих файлов места недостаточно.";
+    setText("scan-warning-quota", quotaText);
+    setText("scan-warning-policy", upload ? "По вашим настройкам эти файлы будут загружены и займут место в квоте." : "По вашим настройкам эти файлы будут пропущены. Разрешить их загрузку можно в настройках.");
+    $("scan-warning-policy").className = "notice " + (upload ? "warning" : "info");
+  }
+
+  function maybeShowScanWarning() {
+    if (!snapshot || !session.authenticated || document.hidden || document.querySelector("dialog[open]")) return;
+    const scan = snapshot.last_scan;
+    const id = snapshot.scan_id ?? (scan && scan.scan_id);
+    if (!scan || scan.complete !== true || id == null || ["scanning", "reconciling"].includes(phase())) return;
+    const key = plain(snapshot.account) + ":" + String(id);
+    if (warnedScans.has(key)) return;
+    const regular = snapshot.storage_plan && snapshot.storage_plan.regular;
+    if (!regular || finite(regular.count) === 0) return;
+    warnedScans.add(key);
+    while (warnedScans.size > 100) warnedScans.delete(warnedScans.values().next().value);
+    try { sessionStorage.setItem("mail-cloud.scan-warnings.v1", JSON.stringify([...warnedScans])); } catch { /* Memory deduplication still applies when browser storage is unavailable. */ }
+    renderScanWarning(); showDialog("scan-warning-dialog");
+  }
+
+  function renderDeletionProgress(state) {
+    if (phase() !== "deleting") return;
+    const progress = state.deletion || state.activity && state.activity.deletion;
+    if (!progress || typeof progress !== "object") return;
+    const done = progress.processed ?? progress.done;
+    const total = progress.total ?? progress.task_count;
+    if (Number.isFinite(done) && Number.isFinite(total)) setText("activity-message", "Обработано " + count(done) + " из " + count(total) + " задач. Результат удаления сохраняется.");
   }
 
   function emptyBlock(symbol, title, description, compact = false) {
@@ -536,17 +643,18 @@
   }
 
   function renderSettings(state) {
-    setText("settings-account", state.authenticated ? plain(state.account, "Вход сохранён") : "Аккаунт не подключён");
-    setText("settings-login", state.authenticated ? "Войти заново" : "Войти");
     if (!settingsDirty && !pendingActions.has("settings")) {
       $("workers").value = String(finite(state.settings && state.settings.workers, 2));
       $("auto-resume").checked = !state.settings || state.settings.auto_resume !== false;
-      $("preflight-check").checked = !state.settings || state.settings.preflight_check !== false;
+      $("regular-policy").value = state.settings && state.settings.regular_policy === "upload" ? "upload" : "skip";
+      $("unexpected-unlimited-action").value = state.settings && state.settings.unexpected_unlimited_action === "keep" ? "keep" : "trash";
       $("remote-reconcile").checked = Boolean(state.settings && state.settings.remote_reconcile === true);
+      $("timezone").value = plain(state.settings && state.settings.timezone, "Europe/Moscow");
     }
   }
 
   function navigate(page) {
+    closeTaskMenu();
     activePage = Object.prototype.hasOwnProperty.call(pageNames, page) ? page : "overview";
     Object.keys(pageNames).forEach((name) => setHidden("page-" + name, name !== activePage));
     document.querySelectorAll(".nav-item").forEach((item) => {
@@ -557,18 +665,20 @@
     setText("breadcrumb-page", pageNames[activePage]);
     document.title = pageNames[activePage] + " · Фотоархив";
     if (activePage === "queue" && session.authenticated) loadJobs();
+    if (activePage === "schedules" && session.authenticated) loadSchedules();
   }
 
   async function loadJobs(showLoading = true) {
     if (!session.authenticated || pendingActions.has("password")) return;
     const request = ++jobsRequest, generation = sessionGeneration;
-    const offset = jobsOffset, filter = jobsFilter;
+    const offset = jobsOffset, filter = jobsFilter, sort = jobsSort;
     if (showLoading) setText("jobs-loading", "Обновляем…");
     try {
-      const query = new URLSearchParams({ status: filter, offset: String(offset), limit: String(jobsLimit) });
+      const query = new URLSearchParams({ status: filter, offset: String(offset), limit: String(jobsLimit), sort });
       const result = await api("/api/jobs?" + query.toString());
-      if (request !== jobsRequest || generation !== sessionGeneration || offset !== jobsOffset || filter !== jobsFilter) return;
+      if (request !== jobsRequest || generation !== sessionGeneration || offset !== jobsOffset || filter !== jobsFilter || sort !== jobsSort) return;
       jobsTotal = Math.max(0, finite(result.total));
+      jobsTotalBytes = typeof result.total_bytes === "number" && Number.isFinite(result.total_bytes) ? Math.max(0, result.total_bytes) : null;
       if (jobsOffset >= jobsTotal && jobsOffset > 0) {
         jobsOffset = Math.max(0, Math.floor(Math.max(0, jobsTotal - 1) / jobsLimit) * jobsLimit);
         return loadJobs(showLoading);
@@ -580,19 +690,217 @@
     }
   }
 
+  function scheduleDateTime(value) {
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const zone = schedulesTimezone || snapshot && snapshot.settings && snapshot.settings.timezone || "Europe/Moscow";
+    try {
+      return new Intl.DateTimeFormat("ru-RU", { timeZone: zone, day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value * 1000));
+    } catch { return dateTime(value); }
+  }
+
+  function scheduleById(id) { return schedules.find((value) => value.id === id); }
+  function canManageSchedules() {
+    return Boolean(snapshot && connected && session.authenticated && !pendingActions.has("password") && !pendingActions.has("schedule"));
+  }
+  function updateScheduleControls() {
+    const available = canManageSchedules(), saving = pendingActions.has("schedule");
+    ["add-schedule", "empty-add-schedule"].forEach((id) => { $(id).disabled = !available; });
+    document.querySelectorAll("[data-schedule-action]").forEach((button) => { button.disabled = !available; });
+    $("schedule-submit").disabled = !available || !snapshot || !Array.isArray(snapshot.sources) || snapshot.sources.length === 0;
+    $("schedule-remove-submit").disabled = !available;
+    setText("schedule-submit", saving ? "Сохраняем…" : "Сохранить расписание");
+    setText("schedule-remove-submit", saving ? "Удаляем…" : "Удалить расписание");
+    $("schedule-form").querySelectorAll("input,fieldset,button").forEach((input) => { if (input.id !== "schedule-submit") input.disabled = saving; });
+    $("schedule-remove-dialog").querySelectorAll("[data-close-dialog]").forEach((button) => { button.disabled = saving; });
+  }
+
+  async function loadSchedules(showLoading = true) {
+    if (!session.authenticated || pendingActions.has("password") || pendingActions.has("schedule")) return;
+    const request = ++schedulesRequest, generation = sessionGeneration;
+    if (showLoading) setText("schedules-loading", "Обновляем…");
+    try {
+      const result = await api("/api/schedules");
+      if (request !== schedulesRequest || generation !== sessionGeneration) return;
+      applySchedules(result); setText("schedules-loading", "");
+    } catch (error) {
+      if (request === schedulesRequest && !error.staleSession) setText("schedules-loading", error.message);
+    }
+  }
+
+  function applySchedules(result) {
+    schedules = Array.isArray(result.schedules) ? result.schedules : [];
+    schedulesTimezone = plain(result.timezone, snapshot && snapshot.settings && snapshot.settings.timezone || "Europe/Moscow");
+    renderSchedules(); updateScheduleControls();
+  }
+
+  function renderSchedules() {
+    const sources = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources : [];
+    setText("scheduler-timezone", "Часовой пояс: " + schedulesTimezone);
+    const signature = JSON.stringify([schedules, schedulesTimezone, sources.map((source) => [source.id, source.alias, source.path])]);
+    if (signature === schedulesSignature) return;
+    schedulesSignature = signature;
+    const focused = document.activeElement && document.activeElement.dataset.scheduleAction ?
+      { id: document.activeElement.dataset.scheduleId, action: document.activeElement.dataset.scheduleAction } : null;
+    const list = $("schedules-list"); list.replaceChildren();
+    setHidden("schedules-empty", schedules.length > 0);
+    const weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+    const runStates = { complete: ["Завершено", "green"], completed: ["Завершено", "green"], error: ["Ошибка", "red"], paused: ["На паузе", "orange"], running: ["В работе", "blue"], queued: ["Ожидает очередь", "orange"], cancelled: ["Отменено", "neutral"] };
+    schedules.forEach((schedule) => {
+      const card = element("article", "card schedule-card" + (schedule.enabled ? "" : " is-disabled"));
+      const clock = element("div", "schedule-clock");
+      clock.append(element("strong", "", plain(schedule.time, "—")));
+      const days = schedule.mode === "monthly" ? "Числа: " + (Array.isArray(schedule.month_days) ? schedule.month_days.join(", ") : "—") :
+        Array.isArray(schedule.weekdays) && schedule.weekdays.length === 7 ? "Каждый день" :
+          (Array.isArray(schedule.weekdays) ? schedule.weekdays.map((value) => weekdays[value - 1]).filter(Boolean).join(", ") : "—");
+      const repeat = element("span", "schedule-repeat-label", days); repeat.title = days; clock.appendChild(repeat);
+      const info = element("div", "schedule-info"), title = element("h2", "", plain(schedule.name, "Расписание"));
+      const selected = Array.isArray(schedule.source_ids) ? schedule.source_ids : [];
+      const sourceNames = selected.map((id) => { const source = sources.find((value) => value.id === id); return source ? plain(source.alias, source.path) : "Источник недоступен"; });
+      const sourceLine = element("p", "schedule-source-summary", sourceNames.length ? sourceNames.join(" · ") : "Исходные папки не выбраны");
+      sourceLine.title = sourceNames.join("\n"); info.append(title, sourceLine);
+      const next = element("p", "schedule-next", schedule.queued ? "Ожидает завершения текущей операции" : !schedule.enabled ? "Новые запуски выключены" : schedule.next_run ? "Следующий запуск: " + scheduleDateTime(schedule.next_run) : "Нет доступной даты запуска");
+      info.appendChild(next);
+      const last = schedule.last_run;
+      if (last && typeof last === "object") {
+        const status = runStates[plain(last.status)] || ["Последний запуск", "neutral"];
+        const history = element("div", "schedule-last-run");
+        history.append(element("span", "badge " + status[1], status[0]));
+        const at = scheduleDateTime(last.finished_at || last.started_at);
+        if (at) history.appendChild(element("span", "", at));
+        if (last.message) {
+          const message = element("span", "schedule-last-message", plain(last.message)); message.title = plain(last.message); history.appendChild(message);
+        }
+        info.appendChild(history);
+      } else if (schedule.queued) info.appendChild(element("span", "badge orange", "Ожидает очередь"));
+      const actions = element("div", "schedule-card-actions");
+      const enabled = element("label", "schedule-switch");
+      const toggle = element("input"); toggle.type = "checkbox"; toggle.checked = schedule.enabled === true;
+      toggle.setAttribute("role", "switch"); toggle.setAttribute("aria-label", "Включить расписание «" + plain(schedule.name) + "»");
+      toggle.dataset.scheduleId = String(schedule.id); toggle.dataset.scheduleAction = "toggle";
+      enabled.append(toggle, element("span", "switch"));
+      toggle.addEventListener("change", async () => {
+        const wanted = toggle.checked;
+        const saved = await mutateSchedule("/api/schedules/toggle", { id: schedule.id, enabled: wanted }, { message: wanted ? "Расписание включено." : "Расписание выключено." });
+        if (!saved && toggle.isConnected) toggle.checked = schedule.enabled === true;
+      });
+      const edit = element("button", "icon-button"), remove = element("button", "icon-button schedule-remove");
+      edit.type = remove.type = "button";
+      edit.appendChild(icon("edit", "small")); remove.appendChild(icon("remove", "small"));
+      edit.setAttribute("aria-label", "Изменить расписание «" + plain(schedule.name) + "»"); edit.title = "Изменить";
+      remove.setAttribute("aria-label", "Удалить расписание «" + plain(schedule.name) + "»"); remove.title = "Удалить";
+      [edit, remove].forEach((button) => { button.dataset.scheduleId = String(schedule.id); });
+      edit.dataset.scheduleAction = "edit"; remove.dataset.scheduleAction = "remove";
+      edit.addEventListener("click", () => openSchedule(schedule.id));
+      remove.addEventListener("click", () => openScheduleRemoval(schedule.id));
+      actions.append(enabled, edit, remove); card.append(clock, info, actions); list.appendChild(card);
+    });
+    if (focused && !document.querySelector("dialog[open]")) {
+      const target = [...document.querySelectorAll("[data-schedule-action]")].find((node) => node.dataset.scheduleId === focused.id && node.dataset.scheduleAction === focused.action);
+      (target || $("schedules-title")).focus({ preventScroll: true });
+    }
+  }
+
+  function updateScheduleMode() {
+    const monthly = $("schedule-monthly").checked;
+    setHidden("schedule-month-days-wrap", !monthly); setHidden("schedule-weekdays", monthly);
+    $("schedule-month-days").required = monthly;
+  }
+  function openSchedule(id = null) {
+    if (!canManageSchedules()) return;
+    const value = id === null ? null : scheduleById(id);
+    if (id !== null && !value) { toast("Это расписание уже удалено."); return; }
+    editingScheduleId = id;
+    $("schedule-form").reset(); setError("schedule-error");
+    setText("schedule-dialog-title", value ? "Изменить расписание" : "Добавить расписание");
+    $("schedule-name").value = value ? plain(value.name) : "";
+    $("schedule-time").value = value ? plain(value.time, "03:00") : "03:00";
+    $("schedule-enabled").checked = !value || value.enabled === true;
+    $("schedule-monthly").checked = Boolean(value && value.mode === "monthly");
+    $("schedule-weekly").checked = !$("schedule-monthly").checked;
+    $("schedule-month-days").value = value && Array.isArray(value.month_days) ? value.month_days.join(", ") : "";
+    const weekdays = value && Array.isArray(value.weekdays) ? value.weekdays : [1, 2, 3, 4, 5, 6, 7];
+    document.querySelectorAll('[name="schedule-weekday"]').forEach((input) => { input.checked = weekdays.includes(Number(input.value)); });
+    setText("schedule-timezone-hint", "Часовой пояс: " + schedulesTimezone);
+    const selected = value && Array.isArray(value.source_ids) ? value.source_ids : [];
+    const sourceList = $("schedule-source-list"); sourceList.replaceChildren();
+    const sources = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources : [];
+    sources.forEach((source) => {
+      const label = element("label", "checkbox-row schedule-source-choice"), checkbox = element("input"), body = element("span");
+      checkbox.type = "checkbox"; checkbox.name = "schedule-source"; checkbox.value = String(source.id); checkbox.checked = selected.includes(source.id);
+      body.append(element("strong", "", plain(source.alias, "Источник")), element("small", "", plain(source.path)));
+      label.append(checkbox, body); sourceList.appendChild(label);
+    });
+    setHidden("schedule-no-sources", sources.length > 0);
+    updateScheduleMode(); updateScheduleControls(); showDialog("schedule-dialog");
+  }
+  function openScheduleRemoval(id) {
+    if (!canManageSchedules()) return;
+    const value = scheduleById(id); if (!value) return;
+    removingScheduleId = id; setText("schedule-remove-name", plain(value.name)); setError("schedule-remove-error");
+    updateScheduleControls(); showDialog("schedule-remove-dialog");
+  }
+
+  async function mutateSchedule(path, body, options = {}) {
+    if (!canManageSchedules()) return false;
+    pendingActions.add("schedule"); schedulesRequest += 1; updateControls();
+    if (options.errorId) setError(options.errorId);
+    try {
+      const result = await api(path, { method: "POST", body });
+      applySchedules(result);
+      if (options.close) $(options.close).close();
+      await refreshState();
+      if (options.message) toast(options.message);
+      return true;
+    } catch (error) {
+      if (options.errorId) setError(options.errorId, error.message); else toast(error.message, true);
+      return false;
+    } finally { pendingActions.delete("schedule"); updateControls(); schedulePoll(true); }
+  }
+
+  async function saveSchedule(event) {
+    event.preventDefault(); if (!canManageSchedules()) return;
+    const sourceIds = [...document.querySelectorAll('[name="schedule-source"]:checked')].map((input) => Number(input.value));
+    if (!sourceIds.length) { setError("schedule-error", "Выберите хотя бы одну исходную папку."); return; }
+    const mode = $("schedule-monthly").checked ? "monthly" : "weekly";
+    const weekdays = [...document.querySelectorAll('[name="schedule-weekday"]:checked')].map((input) => Number(input.value));
+    let monthDays = [];
+    if (mode === "weekly" && !weekdays.length) { setError("schedule-error", "Выберите хотя бы один день недели."); return; }
+    if (mode === "monthly") {
+      const pieces = $("schedule-month-days").value.split(",").map((value) => value.trim());
+      if (!pieces.length || pieces.some((value) => !/^\d{1,2}$/.test(value) || Number(value) < 1 || Number(value) > 30)) {
+        setError("schedule-error", "Введите числа от 1 до 30 через запятую, например 1, 15, 30."); $("schedule-month-days").focus(); return;
+      }
+      monthDays = [...new Set(pieces.map(Number))].sort((a, b) => a - b);
+    }
+    const body = { name: $("schedule-name").value.trim(), source_ids: sourceIds, time: $("schedule-time").value,
+      mode, weekdays, month_days: monthDays, enabled: $("schedule-enabled").checked };
+    if (editingScheduleId !== null) body.id = editingScheduleId;
+    await mutateSchedule("/api/schedules/save", body, { errorId: "schedule-error", close: "schedule-dialog", message: "Расписание сохранено." });
+  }
+
   function taskPrimaryAction(job) {
     if (["uploaded", "skipped"].includes(job.status) || job.remove_requested === true) return null;
-    if (job.paused === true) return job.status === "running" ? ["pause", "Пауза…", "pause"] : ["resume", "Продолжить", "play"];
-    if (job.status === "failed") return ["resume", "Повторить", "retry"];
-    return ["pending", "running"].includes(job.status) ? ["pause", "Пауза", "pause"] : null;
+    if (job.status === "running") return job.paused === true ? null : ["pause", "Остановить", "pause"];
+    if (job.status === "failed") return ["start", "Повторить попытку", "retry"];
+    if (job.paused === true || ["pending", "paused"].includes(job.status)) return ["start", "Запустить", "play"];
+    return null;
   }
 
   function taskState(job) {
-    if (job.remove_requested === true) return ["Убирается…", "neutral"];
+    if (job.remove_requested === true) return ["Удаляется…", "neutral"];
     if (job.paused === true && job.status === "running") return ["Останавливается…", "orange"];
     if (job.paused === true && !["uploaded", "skipped"].includes(job.status)) return jobStates.paused;
+    if (job.status === "failed") {
+      if (job.cloud_present === true && job.observed_mode === "regular") return ["Ошибка · в квоте", "red"];
+      if (job.cloud_deleted_at) return ["Ошибка · в корзине", "red"];
+      return jobStates.failed;
+    }
+    if (job.cloud_present === true || job.status === "uploaded") {
+      if (job.observed_mode === "unlimited") return ["В безлимите", "green"];
+      if (job.observed_mode === "regular") return ["В квоте", "blue"];
+      return [job.status === "skipped" ? "Уже в Облаке" : "Загружена", "green"];
+    }
     if (job.status === "skipped" && job.skip_reason === "remote_exists") return ["Уже в Облаке", "green"];
-    if (job.status === "failed" && job.next_attempt != null) return ["Повтор позже", "orange"];
     return jobStates[job.status] || ["Неизвестно", "neutral"];
   }
 
@@ -609,116 +917,78 @@
     } catch { return ""; }
   }
 
-  function createTaskLink(symbol, text, kind) {
-    const link = element("a", "task-link");
-    link.target = "_blank"; link.rel = "noopener noreferrer"; link.dataset.taskLink = kind;
-    link.append(icon(symbol, "small"), document.createTextNode(text));
-    if (kind === "download") link.setAttribute("download", "");
-    return link;
-  }
-
-  function updateTaskLink(link, value, description, cloud = false) {
-    const url = taskLinkURL(value, cloud);
-    link.hidden = !url;
-    if (url) link.setAttribute("href", url); else link.removeAttribute("href");
-    link.setAttribute("aria-label", description);
-  }
-
   function createJobView(job) {
     const row = element("tr", "task-row"); row.dataset.taskId = String(job.id);
     const nameCell = element("td", "task-name-cell");
     const name = element("div", "job-name"), fileIcon = icon("image"), label = element("span");
-    name.append(fileIcon, label);
-    const remote = element("div", "job-path");
-    const links = element("div", "task-links");
-    const previewLink = createTaskLink("image", "Открыть фото", "preview"), downloadLink = createTaskLink("download", "Скачать", "download"), cloudLink = createTaskLink("external", "В Облаке", "cloud");
-    links.append(previewLink, downloadLink, cloudLink);
-    const storage = element("span", "storage-mode", "Обычное хранение");
-    storage.title = "Режим загрузки с расходованием места по тарифу";
-    const detail = element("div", "job-detail"), actionError = element("div", "task-action-error");
-    actionError.setAttribute("role", "status"); actionError.hidden = true;
-    nameCell.append(name, remote, links, storage, detail, actionError);
-    const statusCell = element("td", "task-status-cell"), badge = element("span", "badge neutral");
-    const progress = element("div", "task-progress"), progressHeading = element("div", "task-progress-heading");
-    const stage = element("span"), percentage = element("span", "task-percent");
-    progressHeading.append(stage, percentage);
-    const track = element("div", "progress-track"), fill = element("div", "progress-fill"), transferred = element("div", "task-transferred");
+    name.append(fileIcon, label); nameCell.append(name);
+    const progressCell = element("td", "task-progress-cell"), progress = element("div", "task-progress");
+    const track = element("div", "progress-track"), fill = element("div", "progress-fill"), percentage = element("span", "task-percent");
     track.setAttribute("role", "progressbar"); track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100");
-    track.appendChild(fill); progress.append(progressHeading, track, transferred); statusCell.append(badge, progress);
-    const size = element("td", "task-size"), attempts = element("td", "task-attempts"), actionsCell = element("td", "task-actions-cell"), actions = element("div", "task-actions");
-    const primary = element("button", "button compact task-primary"), primaryIcon = icon("pause", "small"), primaryLabel = element("span");
-    primary.type = "button"; primary.dataset.taskControl = "primary"; primary.append(primaryIcon, primaryLabel);
-    const remove = element("button", "button compact danger subtle task-remove"); remove.type = "button"; remove.dataset.taskControl = "remove"; remove.appendChild(icon("remove", "small"));
-    actions.append(primary, remove); actionsCell.appendChild(actions); row.append(nameCell, statusCell, size, attempts, actionsCell);
-    const view = { row, name, fileIcon, label, remote, links, previewLink, downloadLink, cloudLink, storage, detail, actionError, badge, progress, stage, percentage, track, fill, transferred, size, attempts, actions, primary, primaryIcon, primaryLabel, remove, job, error: "" };
-    primary.addEventListener("click", () => {
-      const action = taskPrimaryAction(view.job);
-      if (action && primary.getAttribute("aria-disabled") !== "true") performTask(view, action[0]);
-    });
-    remove.addEventListener("click", () => { if (remove.getAttribute("aria-disabled") !== "true") performTask(view, "remove"); });
+    track.appendChild(fill); progress.append(track, percentage); progressCell.appendChild(progress);
+    const size = element("td", "task-size"), statusCell = element("td", "task-status-cell"), badge = element("span", "badge neutral");
+    statusCell.appendChild(badge);
+    const uploaded = element("td", "task-uploaded"), actionsCell = element("td", "task-actions-cell"), actions = element("div", "task-actions");
+    const menu = element("button", "icon-button task-menu-button"); menu.type = "button"; menu.dataset.taskControl = "menu";
+    menu.setAttribute("aria-haspopup", "menu"); menu.setAttribute("aria-expanded", "false"); menu.setAttribute("aria-controls", "task-action-menu"); menu.appendChild(icon("more", "small"));
+    const remove = element("button", "icon-button task-remove"); remove.type = "button"; remove.dataset.taskControl = "remove"; remove.appendChild(icon("remove", "small"));
+    actions.append(menu, remove); actionsCell.appendChild(actions); row.append(nameCell, progressCell, size, statusCell, uploaded, actionsCell);
+    const view = { row, name, fileIcon, label, badge, progress, percentage, track, fill, size, uploaded, actions, menu, remove, job, error: "" };
+    menu.addEventListener("click", () => actionMenuJobId === view.job.id ? closeTaskMenu(true) : openTaskMenu(view));
+    menu.addEventListener("keydown", (event) => { if (["ArrowDown", "ArrowUp"].includes(event.key)) { event.preventDefault(); openTaskMenu(view, event.key === "ArrowUp"); } });
+    remove.addEventListener("click", () => { if (remove.getAttribute("aria-disabled") !== "true") openDeletion(view.job); });
     return view;
   }
 
   function updateJobControls(view) {
     const job = view.job, pending = pendingTaskActions.get(job.id);
-    const action = taskPrimaryAction(job), allowed = canControlTasks() && !pending && job.remove_requested !== true;
-    const pausing = job.paused === true && job.status === "running";
+    const allowed = canControlTasks() && !pending && job.remove_requested !== true;
     const name = plain(job.relative_path, plain(job.local_path, "Файл"));
-    view.primary.hidden = !action;
-    if (action) {
-      view.primaryIcon.firstElementChild.setAttribute("href", "#i-" + action[2]);
-      view.primaryLabel.textContent = pending === "pause" ? "Пауза…" : pending === "resume" ? "Возврат…" : action[1];
-      view.primary.setAttribute("aria-label", action[1] + ": " + name);
-      view.primary.setAttribute("aria-disabled", String(!allowed || pausing));
-      view.primary.title = pausing ? "Дождитесь сохранения прогресса этой задачи." : action[0] === "resume" ? "Вернуть задачу в очередь. Общая пауза сохраняется." : "Приостановить только эту задачу.";
-    }
-    view.remove.setAttribute("aria-label", "Убрать задачу: " + name);
+    view.menu.setAttribute("aria-label", "Действия: " + name);
+    view.menu.title = view.error || "Действия с задачей";
+    view.menu.classList.toggle("has-error", Boolean(view.error));
+    view.remove.setAttribute("aria-label", "Удалить задачу: " + name);
     view.remove.setAttribute("aria-disabled", String(!allowed));
-    view.remove.title = "Убрать задачу из очереди. Файлы на сервере и в Облаке останутся.";
+    view.remove.title = "Выбрать, что удалить";
     view.actions.setAttribute("aria-busy", String(Boolean(pending)));
-    view.actionError.textContent = view.error;
-    view.actionError.hidden = !view.error;
   }
 
   function updateJobView(view, job) {
     view.job = job;
     const fullName = plain(job.relative_path, plain(job.local_path, "Файл"));
-    view.label.textContent = fullName;
+    const name = fullName.split(/[\\/]/).filter(Boolean).pop() || fullName;
+    view.label.textContent = name;
     view.fileIcon.firstElementChild.setAttribute("href", "#i-" + mediaIcon(fullName));
-    view.name.title = plain(job.local_path, fullName);
-    view.remote.textContent = plain(job.remote_path); view.remote.title = plain(job.remote_path);
-    updateTaskLink(view.previewLink, job.preview_url, "Открыть фото в новой вкладке: " + fullName);
-    updateTaskLink(view.downloadLink, job.download_url, "Скачать файл с сервера: " + fullName);
-    updateTaskLink(view.cloudLink, job.cloud_url, "Открыть в Облаке: " + fullName, true);
-    view.links.hidden = view.previewLink.hidden && view.downloadLink.hidden && view.cloudLink.hidden;
-    view.storage.hidden = job.storage_mode !== "regular";
+    const reason = planReasons[plain(job.planned_reason)] || plain(job.planned_reason);
+    const storageHint = job.planned_mode === "regular" ? "Ожидается загрузка в квоту" : job.planned_mode === "unlimited" ? "Кандидат в безлимит" : "";
+    view.name.title = [plain(job.local_path, fullName), plain(job.cloud_path, plain(job.remote_path)), storageHint, reason].filter(Boolean).join("\n");
     const state = taskState(job);
     view.badge.textContent = state[0]; view.badge.className = "badge " + state[1];
-    let detail = plain(job.last_error);
-    if (job.next_attempt != null && job.status === "failed") detail += (detail ? " · " : "") + "Автоматический повтор: " + dateTime(job.next_attempt);
-    if (!detail && job.status === "uploaded") detail = job.uploaded_at ? "Загружено: " + dateTime(job.uploaded_at) : "Файл сохранён в Облаке";
-    if (!detail && job.status === "skipped") detail = job.skip_reason === "remote_exists" ? "Файл уже есть в указанной папке Облака. Повторная передача пропущена." : "Задача пропущена. Подробности — в журнале работы.";
-    view.detail.textContent = detail; view.detail.hidden = !detail;
-    view.detail.className = "job-detail" + (job.status === "failed" ? " failed" : "");
-    view.size.textContent = bytes(job.size); view.attempts.textContent = count(job.attempts);
+    let detail = plain(job.last_error) || reason;
+    if (job.status === "skipped" && job.skip_reason === "remote_exists") detail = "Файл уже есть в указанной папке Облака. Повторная передача пропущена.";
+    if (job.status === "failed" && job.next_attempt != null) detail += (detail ? " · " : "") + "Повтор: " + dateTime(job.next_attempt);
+    view.badge.title = detail || state[0];
+    view.badge.setAttribute("aria-label", state[0] + (detail ? ": " + detail : ""));
+    view.size.textContent = bytes(job.size);
+    view.size.title = count(job.size) + " байт";
+    const at = job.uploaded_at || job.cloud_observed_at;
+    view.uploaded.textContent = dateTime(at) || "—";
+    view.uploaded.title = at ? "Облако подтвердило файл: " + dateTime(at) : "Файл ещё не загружен";
     const progress = job.progress && typeof job.progress === "object" ? job.progress : null;
-    const completed = job.status === "uploaded";
-    const hasProgress = completed || progress !== null;
-    view.progress.hidden = !hasProgress;
-    if (hasProgress) {
-      const total = completed ? Math.max(0, finite(job.size)) : Math.max(0, finite(progress.total, finite(job.size)));
-      const sent = completed ? total : Math.max(0, Math.min(total, finite(progress.sent)));
-      const percent = completed ? 100 : Math.max(0, Math.min(100, finite(progress.percent, total > 0 ? sent / total * 100 : 0)));
-      const stage = completed ? "Готово" : transferStages[plain(progress.stage)] || "Обработка";
-      const label = percent.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%";
-      view.stage.textContent = stage; view.percentage.textContent = label;
-      view.track.setAttribute("aria-label", "Передача: " + fullName);
-      view.track.setAttribute("aria-valuenow", percent.toFixed(1));
-      view.track.setAttribute("aria-valuetext", stage + ": " + label);
-      view.fill.style.width = percent + "%";
-      view.progress.classList.toggle("complete", completed);
-      view.transferred.textContent = bytes(sent) + " / " + bytes(total);
-    }
+    const completed = job.status === "uploaded" || job.cloud_present === true;
+    const total = Math.max(0, finite(progress && progress.total, finite(job.size)));
+    const sent = completed ? total : Math.max(0, Math.min(total, finite(progress && progress.sent)));
+    const percent = completed ? 100 : Math.max(0, Math.min(100, finite(progress && progress.percent, total > 0 ? sent / total * 100 : 0)));
+    const stage = completed ? "Передача завершена" : progress ? transferStages[plain(progress.stage)] || "Обработка" : job.status === "skipped" ? "Пропущено" : "Передача ещё не началась";
+    const progressLabel = job.status === "skipped" && !completed ? "—" : Math.floor(percent) + "%";
+    view.percentage.textContent = progressLabel;
+    view.track.setAttribute("aria-label", "Передача: " + fullName);
+    view.track.setAttribute("aria-valuenow", percent.toFixed(1));
+    view.track.setAttribute("aria-valuetext", stage + ": " + progressLabel);
+    view.fill.style.width = percent + "%";
+    view.progress.classList.toggle("complete", completed);
+    view.progress.classList.toggle("inactive", !progress && !completed);
+    view.progress.title = stage + " · " + bytes(sent) + " / " + bytes(total);
     updateJobControls(view);
   }
 
@@ -728,8 +998,67 @@
     if (current === focused.element && current.isConnected && !current.hidden) return;
     if (current && current !== document.body && current !== focused.element && current.isConnected) return;
     const view = jobViews.get(focused.id) || views[Math.min(focused.index, views.length - 1)];
-    const target = view ? focused.control === "remove" || view.primary.hidden ? view.remove : view.primary : $("queue-title");
+    const target = view ? focused.control === "remove" ? view.remove : view.menu : $("queue-title");
     target.focus({ preventScroll: true });
+  }
+
+  function taskMenuItems() { return [...$("task-action-menu").querySelectorAll('[role="menuitem"]')].filter((item) => !item.disabled && !item.hidden); }
+  function closeTaskMenu(restoreFocus = false) {
+    const view = jobViews.get(actionMenuJobId);
+    if (view) view.menu.setAttribute("aria-expanded", "false");
+    actionMenuJobId = null; actionMenuSignature = "";
+    setHidden("task-action-menu", true);
+    if (restoreFocus && view && view.menu.isConnected) view.menu.focus({ preventScroll: true });
+  }
+  function positionTaskMenu() {
+    const view = jobViews.get(actionMenuJobId), menu = $("task-action-menu");
+    if (!view || menu.hidden) return;
+    const anchor = view.menu.getBoundingClientRect(), bounds = menu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(innerWidth - bounds.width - 8, anchor.right - bounds.width));
+    const top = anchor.bottom + bounds.height + 8 <= innerHeight ? anchor.bottom + 5 : Math.max(8, anchor.top - bounds.height - 5);
+    menu.style.left = left + "px"; menu.style.top = top + "px";
+  }
+  function openTaskMenu(view, last = false) {
+    closeTaskMenu(); actionMenuJobId = view.job.id;
+    view.menu.setAttribute("aria-expanded", "true"); setHidden("task-action-menu", false);
+    updateTaskMenu(); positionTaskMenu();
+    const items = taskMenuItems(); if (items.length) items[last ? items.length - 1 : 0].focus();
+  }
+  function updateTaskMenu() {
+    if (actionMenuJobId === null) return;
+    const view = jobViews.get(actionMenuJobId);
+    if (!view) { closeTaskMenu(); return; }
+    const job = view.job, action = taskPrimaryAction(job), menu = $("task-action-menu");
+    const openURL = taskLinkURL(job.preview_url) || taskLinkURL(job.download_url);
+    const cloudURL = job.cloud_present === false || job.cloud_deleted_at ? "" : taskLinkURL(job.cloud_url, true);
+    const allowed = canControlTasks() && !pendingTaskActions.has(job.id);
+    const signature = JSON.stringify([job.id, openURL, cloudURL, action, allowed, view.error, job.planned_reason]);
+    if (signature === actionMenuSignature) return;
+    actionMenuSignature = signature;
+    const focused = menu.contains(document.activeElement) ? document.activeElement.dataset.menuAction : null;
+    menu.replaceChildren();
+    const link = (url, symbol, title, key) => {
+      if (!url) return;
+      const node = element("a", "task-menu-item"); node.href = url; node.target = "_blank"; node.rel = "noopener noreferrer";
+      node.setAttribute("role", "menuitem"); node.tabIndex = -1; node.dataset.menuAction = key;
+      node.append(icon(symbol, "small"), document.createTextNode(title));
+      node.addEventListener("click", () => closeTaskMenu(true)); menu.appendChild(node);
+    };
+    link(openURL, "external", "Открыть", "open");
+    link(cloudURL, "cloud", "В Облаке", "cloud");
+    if (action) {
+      const button = element("button", "task-menu-item"); button.type = "button";
+      button.setAttribute("role", "menuitem"); button.tabIndex = -1; button.dataset.menuAction = action[0]; button.disabled = !allowed;
+      button.append(icon(action[2], "small"), document.createTextNode(action[1]));
+      button.addEventListener("click", () => { closeTaskMenu(true); performTask(view, action[0]); }); menu.appendChild(button);
+    }
+    if (!menu.children.length) menu.appendChild(element("p", "task-menu-note", "Для этой задачи нет доступных действий."));
+    if (view.error) menu.appendChild(element("p", "task-menu-note error", view.error));
+    if (focused) {
+      const item = [...menu.querySelectorAll("[data-menu-action]")].find((node) => node.dataset.menuAction === focused && !node.disabled);
+      (item || taskMenuItems()[0] || view.menu).focus({ preventScroll: true });
+    }
+    positionTaskMenu();
   }
 
   function renderJobs(jobs) {
@@ -757,13 +1086,16 @@
     $("jobs-prev").disabled = jobsOffset === 0;
     $("jobs-next").disabled = jobsOffset + jobs.length >= jobsTotal;
     setHidden("task-controls-note", snapshot && snapshot.task_controls_available === true || !connected || jobsTotal === 0);
+    setText("jobs-summary-count", taskCount(jobsTotal));
+    setText("jobs-summary-bytes", jobsTotalBytes === null ? "Объём неизвестен" : bytes(jobsTotalBytes));
     restoreTaskFocus(focused, views);
+    updateTaskMenu();
   }
 
   async function performTask(view, action) {
     const job = view.job;
     if (!canControlTasks() || pendingTaskActions.has(job.id) || job.remove_requested === true) return;
-    if (action !== "remove" && (!taskPrimaryAction(job) || taskPrimaryAction(job)[0] !== action)) return;
+    if (!taskPrimaryAction(job) || taskPrimaryAction(job)[0] !== action) return;
     if (action === "pause" && job.paused === true) return;
     pendingTaskActions.set(job.id, action); view.error = ""; updateControls();
     let accepted = false;
@@ -772,16 +1104,123 @@
       accepted = true;
       await refreshState();
       if (activePage === "queue") await loadJobs(false);
-      if (action === "remove") toast("Убираем задачу из очереди. Файлы на сервере и в Облаке остаются.");
-      else if (action === "pause") toast("Запрос на паузу выбранной задачи принят.");
-      else if (phase() === "paused") toast("Задача возвращена в очередь. Общая пауза сохранена — нажмите «Продолжить загрузку», когда будете готовы.");
-      else if (snapshot && snapshot.queue_clear_available === true) toast("Задача возвращена в очередь. Запустите загрузку на странице «Обзор».");
-      else toast("Задача возвращена в очередь.");
+      toast(action === "pause" ? "Останавливаем выбранную задачу." : "Выбранная задача запущена.");
     } catch (error) {
       view.error = accepted ? "Команда принята, но состояние не удалось обновить. " + error.message : error.message;
       toast(view.error, true);
     } finally {
-      pendingTaskActions.delete(job.id); updateControls();
+      pendingTaskActions.delete(job.id); updateControls(); schedulePoll(true);
+    }
+  }
+
+  function deleteRequestBody() {
+    if (!deleteContext) return null;
+    const body = { delete_cloud: $("delete-cloud").checked, delete_local: $("delete-local").checked };
+    if (deleteContext.id !== null) body.id = deleteContext.id;
+    else {
+      body.scope = $("queue-clear-scope").value;
+      if (body.scope === "filter") body.status = deleteContext.filter;
+    }
+    return body;
+  }
+
+  function updateDeletionControls() {
+    const submitting = pendingActions.has("delete"), available = canControlTasks() || canClearQueue();
+    const physical = !isBusy() && !anyAction() && connected;
+    const localSupported = Boolean(snapshot && snapshot.local_delete_available === true);
+    $("queue-clear-options").disabled = submitting || !available;
+    $("delete-cloud").disabled = submitting || !physical || !snapshot || !snapshot.authenticated;
+    $("delete-local").disabled = submitting || !physical || !localSupported;
+    $("delete-local-confirm").disabled = submitting;
+    setHidden("queue-clear-busy", !isBusy());
+    setHidden("delete-local-unavailable", localSupported);
+    setHidden("delete-local-confirm-wrap", !$("delete-local").checked);
+    const physicalSelected = $("delete-cloud").checked || $("delete-local").checked;
+    const validPreview = Boolean(deletePreview && typeof deletePreview.token === "string" && deletePreview.token && finite(deletePreview.task_count) > 0);
+    const localAllowed = !$("delete-local").checked || Boolean(deletePreview && deletePreview.local_delete_allowed === true && $("delete-local-confirm").value === "УДАЛИТЬ С ДИСКА");
+    $("queue-clear-submit").disabled = submitting || !available || deletePreviewLoading || !validPreview || !localAllowed || physicalSelected && !physical;
+    setText("queue-clear-submit", submitting ? "Удаляем…" : "Удалить");
+    $("queue-clear-dialog").querySelectorAll("[data-close-dialog]").forEach((button) => { button.disabled = submitting; });
+  }
+
+  function openDeletion(job = null) {
+    if (job ? !canControlTasks() : !canClearQueue()) return;
+    closeTaskMenu();
+    deleteContext = { id: job ? job.id : null, filter: jobsFilter };
+    deletePreview = null; deletePreviewRequest += 1;
+    $("queue-clear-form").reset();
+    setHidden("queue-clear-options", Boolean(job));
+    setText("queue-clear-title", job ? "Удалить задачу?" : "Удалить задачи?");
+    setText("queue-clear-description", job ? plain(job.relative_path, plain(job.local_path, "Выбранная задача")) : "Выберите задачи и укажите, что удалить вместе с ними. Исходные папки останутся подключёнными.");
+    const tab = [...document.querySelectorAll(".filter-tab")].find((node) => node.dataset.filter === jobsFilter);
+    $("queue-clear-scope").querySelector('option[value="filter"]').textContent = "Текущий фильтр: " + (tab ? tab.textContent : "Все");
+    setError("queue-clear-error");
+    showDialog("queue-clear-dialog");
+    scheduleDeletePreview(0);
+  }
+
+  function scheduleDeletePreview(delay = 120) {
+    clearTimeout(deletePreviewTimer); deletePreviewRequest += 1; deletePreview = null;
+    deletePreviewLoading = true;
+    setError("queue-clear-error");
+    setText("delete-preview-summary", "Подсчитываем выбранные задачи…");
+    setText("delete-preview-files", "");
+    $("delete-preview-warnings").replaceChildren(); setHidden("delete-preview-warnings", true);
+    updateDeletionControls();
+    if (!deleteContext || !$("queue-clear-dialog").open) return;
+    deletePreviewTimer = setTimeout(refreshDeletePreview, delay);
+  }
+
+  async function refreshDeletePreview() {
+    const body = deleteRequestBody();
+    if (!body || !$("queue-clear-dialog").open) return;
+    const request = ++deletePreviewRequest;
+    deletePreviewLoading = true; updateDeletionControls();
+    try {
+      const result = await api("/api/tasks/delete/preview", { method: "POST", body });
+      if (request !== deletePreviewRequest || !deleteContext || !$("queue-clear-dialog").open) return;
+      deletePreview = result;
+      setText("delete-preview-summary", taskCount(result.task_count) + " · " + bytes(result.total_bytes));
+      const detail = [];
+      if (body.delete_cloud) detail.push("В корзину Облака: " + fileCount(result.cloud_count));
+      if (body.delete_local) detail.push("Навсегда с диска: " + fileCount(result.local_count));
+      if (!body.delete_cloud && !body.delete_local) detail.push("Файлы на диске и в Облаке сохранятся.");
+      setText("delete-preview-files", detail.join(". "));
+      const warnings = Array.isArray(result.warnings) ? result.warnings.filter((value) => typeof value === "string") : [];
+      if (body.delete_local && result.local_delete_allowed !== true && !warnings.length) warnings.push("Удаление с диска недоступно. Проверьте права и разрешение записи для исходной папки.");
+      const list = $("delete-preview-warnings"); list.replaceChildren(...warnings.map((message) => element("li", "", message)));
+      list.hidden = warnings.length === 0;
+    } catch (error) {
+      if (request !== deletePreviewRequest) return;
+      deletePreview = null; setText("delete-preview-summary", "Не удалось подготовить удаление.");
+      setError("queue-clear-error", error.message);
+    } finally {
+      if (request === deletePreviewRequest) { deletePreviewLoading = false; updateDeletionControls(); }
+    }
+  }
+
+  async function submitDeletion(event) {
+    event.preventDefault(); updateDeletionControls();
+    if ($("queue-clear-submit").disabled || !deletePreview || !deleteContext) return;
+    if (Number.isFinite(deletePreview.expires_at) && deletePreview.expires_at <= Date.now() / 1000) {
+      scheduleDeletePreview(0); toast("Список обновляется. Проверьте итог перед удалением."); return;
+    }
+    const body = { token: deletePreview.token };
+    if ($("delete-local").checked) body.local_confirmation = $("delete-local-confirm").value;
+    pendingActions.add("delete"); updateControls(); setError("queue-clear-error");
+    try {
+      await api("/api/tasks/delete", { method: "POST", body });
+      $("queue-clear-dialog").close(); jobsOffset = 0;
+      await refreshState();
+      if (activePage === "queue") await loadJobs(false);
+      toast("Удаление выбранных задач запущено. Результат появится в журнале.");
+      $("queue-title").focus({ preventScroll: true });
+    } catch (error) {
+      setError("queue-clear-error", error.message);
+      deletePreview = null;
+      if ($("queue-clear-dialog").open) await refreshDeletePreview();
+    } finally {
+      pendingActions.delete("delete"); updateControls(); schedulePoll(true);
     }
   }
 
@@ -801,7 +1240,7 @@
       if (options.errorId) setError(options.errorId, error.message);
       else toast(error.message, true);
       return false;
-    } finally { pendingActions.delete(key); updateControls(); }
+    } finally { pendingActions.delete(key); updateControls(); schedulePoll(true); }
   }
 
   function openMail() {
@@ -888,10 +1327,36 @@
   }
 
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
+  document.querySelectorAll("dialog").forEach((dialog) => dialog.addEventListener("close", () => setTimeout(maybeShowScanWarning, 0)));
+  $("queue-clear-dialog").addEventListener("cancel", (event) => { if (pendingActions.has("delete")) event.preventDefault(); });
+  $("task-action-menu").addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.preventDefault(); closeTaskMenu(true); }
+    else if (event.key === "Tab") closeTaskMenu(true);
+    else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const items = taskMenuItems(); if (!items.length) return;
+      const current = items.indexOf(document.activeElement);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (current + (event.key === "ArrowUp" ? -1 : 1) + items.length) % items.length;
+      items[next].focus();
+    }
+  });
+  document.addEventListener("pointerdown", (event) => {
+    const view = jobViews.get(actionMenuJobId);
+    if (view && !$("task-action-menu").contains(event.target) && !view.menu.contains(event.target)) closeTaskMenu();
+  });
+  document.addEventListener("focusin", (event) => {
+    const view = jobViews.get(actionMenuJobId);
+    if (view && !$("task-action-menu").contains(event.target) && event.target !== view.menu) closeTaskMenu();
+  });
+  window.addEventListener("resize", () => closeTaskMenu());
+  document.querySelector(".table-scroll").addEventListener("scroll", () => closeTaskMenu());
   $("mail-dialog").addEventListener("close", () => { $("mail-password").value = ""; });
   $("panel-password-dialog").addEventListener("close", clearPanelPasswords);
   window.addEventListener("hashchange", () => navigate(location.hash.slice(1)));
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && session.authenticated) { clearTimeout(pollTimer); poll(); } });
+  document.addEventListener("visibilitychange", () => {
+    clearTimeout(pollTimer);
+    if (!document.hidden && session.authenticated) { poll(); maybeShowScanWarning(); }
+  });
 
   $("access-form").addEventListener("submit", async (event) => {
     event.preventDefault(); if (accessBusy) return;
@@ -917,7 +1382,7 @@
       await refreshSession(); setError("access-error");
     } catch (error) { toast(error.message, true); }
   }
-  function accountMenuItems() { return [...$("account-menu").querySelectorAll('[role="menuitem"]')].filter((item) => !item.disabled); }
+  function accountMenuItems() { return [...$("account-menu").querySelectorAll('[role="menuitem"]')].filter((item) => !item.disabled && !item.hidden); }
   function closeAccountMenu(restoreFocus = false) {
     const wasOpen = !$("account-menu").hidden;
     setHidden("account-menu", true);
@@ -925,7 +1390,7 @@
     if (wasOpen && restoreFocus) $("account-button").focus();
   }
   function openAccountMenu(last = false) {
-    if (!snapshot || !snapshot.authenticated) { openMail(); return; }
+    if (!snapshot) return;
     updateControls();
     if ($("account-button").disabled) return;
     setHidden("account-menu", false);
@@ -943,7 +1408,7 @@
     else openAccountMenu();
   });
   $("account-button").addEventListener("keydown", (event) => {
-    if (["ArrowDown", "ArrowUp"].includes(event.key) && snapshot && snapshot.authenticated) {
+    if (["ArrowDown", "ArrowUp"].includes(event.key) && snapshot) {
       event.preventDefault(); openAccountMenu(event.key === "ArrowUp");
     }
   });
@@ -974,7 +1439,7 @@
   $("pause-upload").addEventListener("click", () => perform("pause", "/api/pause", {}, { message: "Останавливаем текущую работу и сохраняем прогресс…" }));
   $("scan-folders").addEventListener("click", () => perform("scan", "/api/scan"));
   $("view-errors").addEventListener("click", () => { setFilter("failed"); location.hash = "queue"; if (activePage === "queue") loadJobs(); });
-  ["settings-login", "onboarding-login"].forEach((id) => $(id).addEventListener("click", openMail));
+  ["onboarding-login"].forEach((id) => $(id).addEventListener("click", openMail));
   ["add-source", "empty-add-source", "onboarding-source"].forEach((id) => $(id).addEventListener("click", () => openSource()));
   $("mail-form").addEventListener("submit", async (event) => {
     event.preventDefault(); if (pendingActions.has("login")) return;
@@ -1017,11 +1482,13 @@
   });
 
   function setFilter(filter) {
-    jobsFilter = Object.prototype.hasOwnProperty.call(jobStates, filter) ? filter : "all";
+    closeTaskMenu();
+    jobsFilter = ["all", "pending", "running", "paused", "uploaded_unlimited", "uploaded_regular", "failed", "skipped"].includes(filter) ? filter : "all";
     jobsOffset = 0;
     document.querySelectorAll(".filter-tab").forEach((button) => { const active = button.dataset.filter === jobsFilter; button.classList.toggle("active", active); button.setAttribute("aria-pressed", String(active)); });
   }
   document.querySelectorAll(".filter-tab").forEach((button) => button.addEventListener("click", () => { setFilter(button.dataset.filter); loadJobs(); }));
+  $("jobs-sort").addEventListener("change", () => { closeTaskMenu(); jobsSort = $("jobs-sort").value === "desc" ? "desc" : "asc"; jobsOffset = 0; loadJobs(); });
   $("jobs-prev").addEventListener("click", () => { jobsOffset = Math.max(0, jobsOffset - jobsLimit); loadJobs(); });
   $("jobs-next").addEventListener("click", () => { if (jobsOffset + jobsLimit < jobsTotal) { jobsOffset += jobsLimit; loadJobs(); } });
   $("retry-errors").addEventListener("click", () => { $("retry-permanent").checked = false; setError("retry-error"); showDialog("retry-dialog"); });
@@ -1030,21 +1497,28 @@
     try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задачи возвращены в очередь." }); }
     finally { $("retry-submit").disabled = false; }
   });
-  $("clear-queue").addEventListener("click", () => {
-    if (!canClearQueue()) return;
-    $("queue-clear-form").reset();
-    setError("queue-clear-error"); updateControls(); showDialog("queue-clear-dialog");
+  $("clear-queue").addEventListener("click", () => openDeletion());
+  ["queue-clear-scope", "delete-cloud", "delete-local"].forEach((id) => $(id).addEventListener("change", () => {
+    $("delete-local-confirm").value = "";
+    scheduleDeletePreview();
+  }));
+  $("delete-local-confirm").addEventListener("input", updateDeletionControls);
+  $("queue-clear-dialog").addEventListener("close", () => {
+    deleteContext = null; deletePreview = null; deletePreviewRequest += 1; deletePreviewLoading = false;
+    clearTimeout(deletePreviewTimer); $("delete-local-confirm").value = "";
   });
-  ["queue-clear-finished", "queue-clear-all"].forEach((id) => $(id).addEventListener("change", updateControls));
-  $("queue-clear-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    if (!canClearQueue()) return;
-    const scope = $("queue-clear-all").checked ? "all" : "finished";
-    const message = scope === "all" ? "Очередь очищена. Источники и файлы сохранены. Новые задачи появятся после ручного сканирования." : "Обработанные задачи убраны. Ожидающие загрузки и автоматического повтора сохранены.";
-    if (await perform("clear", "/api/tasks/clear", { scope }, { errorId: "queue-clear-error", close: "queue-clear-dialog", message, resetJobs: true })) {
-      $("queue-title").focus({ preventScroll: true });
-    }
+  $("queue-clear-form").addEventListener("submit", submitDeletion);
+  $("scan-warning-settings").addEventListener("click", () => { $("scan-warning-dialog").close(); location.hash = "settings"; });
+  ["add-schedule", "empty-add-schedule"].forEach((id) => $(id).addEventListener("click", () => openSchedule()));
+  ["schedule-weekly", "schedule-monthly"].forEach((id) => $(id).addEventListener("change", updateScheduleMode));
+  $("schedule-select-all").addEventListener("click", () => document.querySelectorAll('[name="schedule-source"]').forEach((input) => { input.checked = true; }));
+  $("schedule-select-none").addEventListener("click", () => document.querySelectorAll('[name="schedule-source"]').forEach((input) => { input.checked = false; }));
+  $("schedule-form").addEventListener("submit", saveSchedule);
+  $("schedule-remove-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); if (removingScheduleId === null) return;
+    await mutateSchedule("/api/schedules/remove", { id: removingScheduleId }, { errorId: "schedule-remove-error", close: "schedule-remove-dialog", message: "Расписание удалено." });
   });
+  ["schedule-dialog", "schedule-remove-dialog"].forEach((id) => $(id).addEventListener("cancel", (event) => { if (pendingActions.has("schedule")) event.preventDefault(); }));
   $("quota-refresh").addEventListener("click", () => {
     if (!snapshot || snapshot.quota_refresh_available !== true || anyAction() || !connected) return;
     quotaAutoRequested = true;
@@ -1086,16 +1560,15 @@
     }
   });
 
-  ["workers", "auto-resume", "preflight-check", "remote-reconcile"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
+  ["workers", "auto-resume", "remote-reconcile", "regular-policy", "unexpected-unlimited-action", "timezone"].forEach((id) => $(id).addEventListener("input", () => { settingsDirty = true; }));
   $("settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const workers = Number($("workers").value);
     if (!Number.isInteger(workers) || workers < 1 || workers > 16) { setError("settings-error", "Укажите целое число потоков от 1 до 16."); return; }
-    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, preflight_check: $("preflight-check").checked, remote_reconcile: $("remote-reconcile").checked }, { errorId: "settings-error", message: "Настройки сохранены." });
+    const success = await perform("settings", "/api/settings", { workers, auto_resume: $("auto-resume").checked, regular_policy: $("regular-policy").value, unexpected_unlimited_action: $("unexpected-unlimited-action").value, remote_reconcile: $("remote-reconcile").checked, timezone: $("timezone").value.trim() }, { errorId: "settings-error", message: "Настройки сохранены." });
     if (success) { settingsDirty = false; if (snapshot) renderSettings(snapshot); }
   });
 
-  setInterval(renderProbeCountdown, 1000);
   navigate(location.hash.slice(1));
   (async () => {
     try {

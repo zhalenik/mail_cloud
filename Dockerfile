@@ -10,7 +10,12 @@ RUN python /build/build_sqlite.py /build/libsqlite3.so.0
 
 FROM python:3.12-slim-trixie
 
-ARG VERSION=0.6.0
+# IANA timezone data is used by persistent upload schedules.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG VERSION=0.7.0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Mail Cloud Photo Client" \
       org.opencontainers.image.description="Resumable photo and video import with a browser interface" \
@@ -20,6 +25,7 @@ LABEL org.opencontainers.image.title="Mail Cloud Photo Client" \
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    MAILRU_TIMEZONE=Europe/Moscow \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app

@@ -99,7 +99,9 @@ def smoke(image: str, *, version: str | None = None) -> None:
             return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
         photo_bytes = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
                        + png_chunk(b"IDAT", zlib.compress(b"\x00\x20\x80\xf0\xff")) + png_chunk(b"IEND", b""))
-        photo = photos / "smoke.png"
+        unicode_source = photos / "Семейный архив"
+        unicode_source.mkdir(mode=0o755)
+        photo = unicode_source / "снимок.png"
         photo.write_bytes(photo_bytes)
         photo.chmod(0o644)
         # GitHub's Ubuntu runner has a non-root host account. This fallback also
@@ -121,7 +123,7 @@ def smoke(image: str, *, version: str | None = None) -> None:
             try:
                 docker(*args, image)
                 if not mounted:
-                    docker("cp", str(photo), f"{name}:/photos/smoke.png")
+                    docker("cp", str(unicode_source), f"{name}:/photos/Семейный архив")
                 bound = json.loads(docker("inspect", name))[0]["NetworkSettings"]["Ports"]["8787/tcp"][0]
                 origin = f"http://127.0.0.1:{bound['HostPort']}"
                 opener = build_opener(HTTPCookieProcessor(CookieJar()))
@@ -161,6 +163,7 @@ def smoke(image: str, *, version: str | None = None) -> None:
                 if mounted:
                     require(process_uid == uid, "Explicit mounted-state UID was not honored")
                 print(docker("exec", name, "python", "-c", SQLITE_SMOKE))
+                docker("exec", name, "python", "-c", "from zoneinfo import ZoneInfo; assert ZoneInfo('Europe/Moscow'); assert ZoneInfo('Asia/Yekaterinburg')")
                 for path in ("/", "/static/app.js", "/static/style.css"):
                     page, _ = request(path)
                     require(bool(page), f"Empty static asset: {path}")
@@ -177,15 +180,20 @@ def smoke(image: str, *, version: str | None = None) -> None:
                 require(session["authenticated"] is True, "Panel setup did not establish a session")
                 initial, _ = request("/api/state")
                 require(initial["authenticated"] is False, "A fresh image must not claim Mail account authorization")
-                require(initial["settings"]["preflight_check"] is True, "Preflight must default to enabled")
+                require("preflight_check" not in initial["settings"], "Preflight is no longer a setting")
+                require(initial["settings"]["timezone"] == "Europe/Moscow", "Scheduler timezone default is missing")
+                require(initial["settings"]["regular_policy"] == "skip", "Quota uploads must be opt-in")
+                require(initial["settings"]["unexpected_unlimited_action"] == "trash", "Unexpected quota uploads default to trash")
                 require("upload_large_files" not in initial["settings"],
-                        "Ordinary large uploads must not be exposed")
+                        "The legacy large-file toggle must not be restored")
                 changed, _ = request("/api/settings", {"workers": 2, "auto_resume": True,
-                                                        "preflight_check": False}, session["csrf"])
-                require(changed["settings"]["preflight_check"] is False, "The preflight setting was not saved")
+                                                        "regular_policy": "upload",
+                                                        "unexpected_unlimited_action": "keep"}, session["csrf"])
+                require(changed["settings"]["regular_policy"] == "upload", "Quota policy was not saved")
+                require(changed["settings"]["unexpected_unlimited_action"] == "keep", "Unexpected outcome policy was not saved")
                 require(initial["settings"]["remote_reconcile"] is False, "Remote comparison must be opt-in")
                 require(initial["quota"] is None, "An account-free image must not invent quota values")
-                sources, _ = request("/api/sources/add", {"path":"/photos", "alias":"Fixture", "remote_prefix":"/Smoke"}, session["csrf"])
+                sources, _ = request("/api/sources/add", {"path":"/photos/Семейный архив", "alias":"Семья", "remote_prefix":"/Архив/Семья"}, session["csrf"])
                 source_id = sources["sources"][0]["id"]
                 request("/api/scan", {}, session["csrf"])
                 deadline = time.monotonic() + 30
@@ -210,17 +218,29 @@ def smoke(image: str, *, version: str | None = None) -> None:
                         "Byte range response is incorrect")
                 body, headers = request(task["preview_url"], method="HEAD")
                 require(body == b"" and int(headers["Content-Length"]) == len(photo_bytes), "HEAD must not stream bytes")
-                paused, _ = request("/api/tasks/pause", {"id":task["id"]}, session["csrf"])
-                require(paused["stats"]["paused"] == 1, "Individual task pause was not persisted")
-                request("/api/tasks/resume", {"id":task["id"]}, session["csrf"])
-                request("/api/tasks/pause", {"id":task["id"]}, session["csrf"])
+                require("снимок.png" in task["local_path"], "Cyrillic source path was lost")
+                require(tasks["total"] == 1 and tasks["total_bytes"] == len(photo_bytes),
+                        "Filtered task totals must cover all matched tasks")
+                require(scanned["storage_plan"]["unlimited"]["count"] == 1,
+                        "Scan did not classify the PNG candidate")
+                regular_tasks, _ = request("/api/jobs?status=uploaded_regular&sort=desc")
+                require(regular_tasks["total"] == 0 and regular_tasks["total_bytes"] == 0,
+                        "Empty observed storage filter returned unexpected totals")
+                schedules, _ = request("/api/schedules/save", {"name":"Ночной архив", "source_ids":[source_id],
+                    "time":"23:45", "mode":"weekly", "weekdays":[1,2,3,4,5,6,7], "month_days":[],
+                    "enabled":False}, session["csrf"])
+                schedule_id = schedules["schedules"][0]["id"]
+                require(schedules["schedules"][0]["source_ids"] == [source_id], "Scheduler source scope was not saved")
+                request("/api/settings", {"workers":2,"auto_resume":True,"timezone":"Asia/Yekaterinburg"}, session["csrf"])
+                schedules, _ = request("/api/schedules")
+                require(schedules["timezone"] == "Asia/Yekaterinburg", "Scheduler timezone was not updated")
                 old_csrf = session["csrf"]
                 next_password = secrets.token_urlsafe(24)
                 session, _ = request("/api/session/password", {"current_password":password, "new_password":next_password}, old_csrf)
                 require(session["authenticated"] is True and session["csrf"] != old_csrf, "Password change must rotate the session")
                 request("/api/settings", {"workers":2,"auto_resume":True}, old_csrf, expected=403)
                 password = next_password
-                request("/api/settings", {"workers":2,"auto_resume":True,"preflight_check":False,"remote_reconcile":True}, session["csrf"])
+                request("/api/settings", {"workers":2,"auto_resume":True,"regular_policy":"upload","unexpected_unlimited_action":"keep","remote_reconcile":True}, session["csrf"])
                 if mounted:
                     saved = docker("exec", name, "python", "-c",
                                    "from pathlib import Path; import json, stat; "
@@ -247,18 +267,35 @@ def smoke(image: str, *, version: str | None = None) -> None:
                     require(session["authenticated"] is True and session["setup_required"] is False,
                             "Mounted state or panel session did not survive a restart")
                     restored, _ = request("/api/state")
-                    require(restored["settings"]["preflight_check"] is False,
-                            "The preflight setting did not survive a container restart")
+                    require("preflight_check" not in restored["settings"], "Restart restored obsolete preflight setting")
+                    require(restored["settings"]["regular_policy"] == "upload" and
+                            restored["settings"]["unexpected_unlimited_action"] == "keep",
+                            "Storage policy settings did not survive a container restart")
                     require("upload_large_files" not in restored["settings"],
                             "Restart must not restore the removed ordinary upload setting")
                     require(restored["settings"]["remote_reconcile"] is True, "Comparison setting was not restored")
-                    require(restored["stats"]["paused"] == 1, "Individual task pause did not survive restart")
+                    require(restored["stats"]["pending"] == 1, "Scanned queue did not survive restart")
+                    schedules, _ = request("/api/schedules")
+                    require(schedules["timezone"] == "Asia/Yekaterinburg" and len(schedules["schedules"]) == 1,
+                            "Schedule and its timezone did not survive restart")
+                    require(schedules["schedules"][0]["enabled"] is False, "Restart enabled a disabled schedule")
                     body, _ = request(task["preview_url"])
                     require(body == photo_bytes, "Restored queue cannot open the original source")
-                request("/api/tasks/clear", {"scope":"all"}, session["csrf"])
-                cleared, _ = request("/api/state")
+                preview, _ = request("/api/tasks/delete/preview", {"scope":"all", "delete_cloud":False,
+                                                                    "delete_local":False}, session["csrf"])
+                require(preview["task_count"] == 1 and preview["total_bytes"] == len(photo_bytes),
+                        "Deletion preview did not identify the selected task")
+                request("/api/tasks/delete", {"token":preview["token"]}, session["csrf"])
+                deadline = time.monotonic() + 30
+                while True:
+                    cleared, _ = request("/api/state")
+                    if cleared["activity"]["phase"] != "deleting":
+                        break
+                    require(time.monotonic() < deadline, "Queue deletion did not finish")
+                    time.sleep(0.1)
                 require(cleared["stats"]["total"] == 0 and len(cleared["sources"]) == 1,
                         "Queue clear must retain source registrations")
+                request("/api/schedules/remove", {"id":schedule_id}, session["csrf"])
                 request("/api/sources/remove", {"id":source_id}, session["csrf"])
                 require(photo.read_bytes() == photo_bytes, "Source controls changed host originals")
                 # Execute the Dockerfile's health command as the configured user,

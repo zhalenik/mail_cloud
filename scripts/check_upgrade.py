@@ -14,6 +14,7 @@ VERSIONS = {
     '0.5.0': '363cfba34adf9e2ebbcaa2531b3a1e378fcee54d',
     '0.5.1': '982fa269ebe5ea1eefe33bd669459c86159eb4c9',
     '0.5.2': '1025b7813e8210b197b89aaceee5a89cecc54e85',
+    '0.6.0': '87e9e48c1f4c54f9d49e0d0fa2d0944112acb052',
 }
 CREATE = r'''
 from dataclasses import asdict
@@ -49,13 +50,21 @@ q.close()
 VERIFY = r'''
 from pathlib import Path
 from dataclasses import asdict
-import json, sys
+import json, sqlite3, sys
 sys.path.insert(0, sys.argv[1])
 from mailru_photos import __version__
 from mailru_photos.queue import Queue
 base = Path(sys.argv[2]); before = json.loads((base/'before.json').read_text())
 q = Queue(base/'queue.sqlite3', destination='/Legacy', account_id='offline-fixture')
-assert q._db.execute('PRAGMA user_version').fetchone()[0] == 3
+assert q._db.execute('PRAGMA user_version').fetchone()[0] == 4
+backups = list((base/'backups').glob('queue-schema%d-before4-*.sqlite3' % before['schema']))
+assert len(backups) == 1, backups
+with sqlite3.connect(backups[0]) as backup:
+    assert backup.execute('PRAGMA user_version').fetchone()[0] == before['schema']
+    assert backup.execute('PRAGMA journal_mode').fetchone()[0] == 'delete'
+    assert backup.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
+    assert backup.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == len(before['rows'])
+    assert backup.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0] == before['upload_history_count']
 assert [asdict(r) for r in q.roots()] == before['roots']
 fields = ('id','root_id','local_path','remote_path','size','mtime_ns','device','inode',
     'status','present','attempts','last_error','skip_reason','remote_hash','uploaded_at','storage_mode')
@@ -67,6 +76,10 @@ for old in before['rows']:
             assert rows[old['id']][name] == old[name], (old['id'], name, old[name], rows[old['id']][name])
 assert q.stats()['total'] == sum(r['present'] for r in before['rows'])
 assert q.get_job(before['done'])['status'] == 'uploaded'
+assert q.get_job(before['done'])['observed_mode'] == 'unlimited'
+assert q.get_job(before['done'])['cloud_present'] is True
+assert q.get_job(before['failed'])['cloud_present'] is False
+assert q._db.execute('SELECT COUNT(*) FROM cloud_observations').fetchone()[0] >= 1
 assert q.get_job(before['failed'])['status'] == 'failed'
 assert len(q.upload_history(before['done'])) == 1
 assert q._db.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0] == before['upload_history_count']
@@ -87,10 +100,12 @@ assert q.stats()['total'] == 0
 assert q.upload_history(before['done'])[0]['remote_path'].startswith('/Legacy/Camera/')
 assert q._db.execute('PRAGMA foreign_key_check').fetchall() == []
 q.close()
-print(json.dumps({'target_version':__version__, 'schema_before':before['schema'],'schema_after':3,
+print(json.dumps({'target_version':__version__, 'schema_before':before['schema'],'schema_after':4,
     'current_tasks':after_stats['total'], 'uploaded':after_stats['uploaded'],
     'paused':after_stats['paused'], 'rescan_added':rescan.added,
     'confirmed_intent_preserved':True,'detached_history_preserved':True,
+    'observed_storage_migrated':True,'failed_tasks_not_assumed_uploaded':True,
+    'migration_backup_preserved':True,
     'reopen_writes':0}))
 '''
 

@@ -1,12 +1,20 @@
 # TrueNAS with Docker Apps (24.10 or later).
 # Replace /mnt/CHANGE_ME/... with existing datasets before installing.
 # 192.168.1.10 is an example: replace it with your NAS address.
+# Portal metadata is read on fresh app creation by TrueNAS 24.10.2.3.
+# Existing YAML apps may need the URL opened manually; see docs/TRUENAS_RU.md.
+x-portals:
+  - name: Web UI
+    scheme: http
+    host: "0.0.0.0"
+    port: 31800
+    path: /
 services:
   mailru-photos:
     image: ghcr.io/zhalenik/mail_cloud:stable
     # Fetch the current tag on install, Edit/Save, and TrueNAS app Start.
     pull_policy: always
-    # Pin a release when needed: ghcr.io/zhalenik/mail_cloud:v0.6.0
+    # Pin a release when needed: ghcr.io/zhalenik/mail_cloud:v0.7.0
     user: "1000:1000"
     init: true
     restart: unless-stopped
@@ -15,6 +23,7 @@ services:
       - "31800:8787"
     environment:
       MAILRU_ALLOWED_HOSTS: "192.168.1.10"
+      MAILRU_TIMEZONE: "Europe/Moscow"
     volumes:
       - type: bind
         source: /mnt/CHANGE_ME/appdata/mail_cloud
@@ -24,6 +33,7 @@ services:
       - type: bind
         source: /mnt/CHANGE_ME/photos
         target: /photos
+        # Set false only to enable explicitly confirmed deletion of originals.
         read_only: true
         bind:
           create_host_path: false

@@ -1,0 +1,71 @@
+{
+  "scope": "300000 synthetic SQL task rows, real SQLite and indexed queries; one real source file for claim; no network transfers",
+  "queries": {
+    "all_asc": {
+      "plan": [
+        "SCAN jobs USING INDEX jobs_current_created"
+      ],
+      "first100_median_ms": 0.7503060005547013
+    },
+    "all_desc": {
+      "plan": [
+        "SCAN jobs USING INDEX jobs_current_created"
+      ],
+      "first100_median_ms": 0.7031340001049102
+    },
+    "failed_asc": {
+      "plan": [
+        "SEARCH jobs USING INDEX jobs_current_status_created (status=?)"
+      ],
+      "first100_median_ms": 0.7118080002328497
+    },
+    "failed_desc": {
+      "plan": [
+        "SEARCH jobs USING INDEX jobs_current_status_created (status=?)"
+      ],
+      "first100_median_ms": 0.7375559998763492
+    },
+    "paused_asc": {
+      "plan": [
+        "SCAN jobs USING INDEX jobs_paused_created"
+      ],
+      "first100_median_ms": 0.7132600003387779
+    },
+    "paused_desc": {
+      "plan": [
+        "SCAN jobs USING INDEX jobs_paused_created"
+      ],
+      "first100_median_ms": 0.6837250002718065
+    },
+    "uploaded_regular_asc": {
+      "plan": [
+        "SEARCH jobs USING INDEX jobs_observed_created (observed_mode=?)"
+      ],
+      "first100_median_ms": 0.6312550003713113
+    },
+    "uploaded_regular_desc": {
+      "plan": [
+        "SEARCH jobs USING INDEX jobs_observed_created (observed_mode=?)"
+      ],
+      "first100_median_ms": 0.6631039996136678
+    }
+  },
+  "fixture_seconds": 2.814630973000021,
+  "deep_page_desc_median_ms": 9.076692000235198,
+  "scoped_claim": {
+    "ms": 1.4296540002760594,
+    "vm_ops_upper_bound": 300,
+    "id": 300000
+  },
+  "scoped_reconcile_and_stats": {
+    "ms": 0.7812630001353682,
+    "vm_ops_upper_bound": 200,
+    "total": 1
+  },
+  "scoped_reconcile_and_stats_before_index_guard": {
+    "ms": 28.32789799958846,
+    "vm_ops_upper_bound": 375200,
+    "total": 1
+  },
+  "queue_source_sha256": "2c8631aa5a797623ba832dfcc49b4d09fc0bf733880c1132b5527de034b5ef4e"
+}

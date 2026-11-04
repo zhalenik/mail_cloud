@@ -14,6 +14,7 @@ services:
     environment:
       MAILRU_ALLOWED_HOSTS: "${MAILRU_ALLOWED_HOSTS:?Set MAILRU_ALLOWED_HOSTS in .env}"
       MAILRU_PUBLIC_ORIGIN: "${MAILRU_PUBLIC_ORIGIN:-}"
+      MAILRU_TIMEZONE: "${MAILRU_TIMEZONE:-Europe/Moscow}"
     volumes:
       - type: bind
         source: "${STATE_DIRECTORY:?Set STATE_DIRECTORY to an existing local state directory in .env}"
@@ -23,6 +24,7 @@ services:
       - type: bind
         source: "${PHOTO_LIBRARY:?Set PHOTO_LIBRARY to an existing absolute photo directory in .env}"
         target: /photos
+        # Set false only to enable explicitly confirmed deletion of originals.
         read_only: true
         bind:
           create_host_path: false

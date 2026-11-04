@@ -415,7 +415,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(saved["server_error_code"], 3)
         self.assertNotIn("DO-NOT-LEAK", json.dumps(saved))
 
-    def test_new_login_requires_new_probe_without_losing_queue_or_upload_history(self):
+    def test_new_login_preserves_queue_upload_history_and_legacy_metadata(self):
         self.init()
         self.photo("already_uploaded.jpg")
         self.photo("waiting.jpg")
@@ -440,8 +440,7 @@ class CLITests(unittest.TestCase):
             factory.return_value.login.return_value = tokens
             self.success("login", "--email", "owner@example.test")
         with Queue(self.db, destination="/Archive") as queue:
-            self.assertEqual(queue.get_metadata("probe")["result"], "invalidated")
-            self.assertEqual(queue.get_metadata("probe")["reason"], "new_login")
+            self.assertEqual(queue.get_metadata("probe")["result"], "provisional_pass")
             self.assertEqual(queue.get_metadata("probe")["fixture"], "preserve-evidence")
             self.assertEqual(queue.list_jobs(), original_jobs)
             self.assertEqual(queue.roots(), original_roots)
@@ -450,6 +449,59 @@ class CLITests(unittest.TestCase):
             self.assertEqual(queue.get_metadata("last_auth")["result"], "success")
             self.assertEqual(queue.stats()["uploaded"], 1)
             self.assertEqual(queue.stats()["pending"], 1)
+
+    def test_run_options_have_conservative_defaults_without_a_probe_command(self):
+        args = cli.parser().parse_args(["run"])
+        self.assertEqual(args.regular_policy, "skip")
+        self.assertEqual(args.unexpected_unlimited_action, "trash")
+        self.assertIsNone(args.job_id)
+        self.assertNotIn("probe", cli.parser().format_help())
+
+    def test_run_refuses_busy_queue_before_loading_tokens(self):
+        self.init()
+        with Queue(self.db, destination="/Archive") as owner, owner.exclusive_run(), \
+             mock.patch.object(cli, "TokenManager") as manager:
+            code, _, _ = self.invoke("run")
+        self.assertEqual(code, 2)
+        manager.assert_not_called()
+
+    def test_single_task_resumes_only_selected_task_and_forwards_storage_policy(self):
+        self.init()
+        self.photo("one.jpg")
+        self.photo("two.jpg")
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.success("scan")
+        with Queue(self.db, destination="/Archive") as queue:
+            tasks = queue.list_jobs()
+            selected, other = tasks[0]["id"], tasks[1]["id"]
+            queue.request_control(selected, "pause")
+            queue.request_control(other, "pause")
+        def upload(queue, api, **kwargs):
+            self.assertEqual(kwargs["job_id"], selected)
+            self.assertEqual(kwargs["regular_policy"], "upload")
+            self.assertEqual(kwargs["unexpected_unlimited_action"], "keep")
+            self.assertFalse(queue.get_job(selected)["paused"])
+            self.assertTrue(queue.get_job(other)["paused"])
+            job = queue.claim(job_id=selected)
+            queue.mark_uploaded(job, remote_hash="A" * 40,
+                                verified_metadata={"is_unlim_upload": True})
+            return {"stopped": False, "stats": queue.stats(), "job_id": selected}
+        with mock.patch.object(cli, "TokenManager"), mock.patch.object(cli, "CloudAPI"), \
+             mock.patch.object(cli, "run", side_effect=upload):
+            self.success("run", "--job-id", selected, "--regular-policy", "upload",
+                         "--unexpected-unlimited-action", "keep")
+        with Queue(self.db, destination="/Archive") as queue:
+            self.assertEqual(queue.get_job(selected)["status"], "uploaded")
+            self.assertEqual(queue.get_job(other)["status"], "pending")
+            self.assertTrue(queue.get_job(other)["paused"])
+
+    def test_run_rejects_invalid_single_task_id_before_loading_tokens(self):
+        self.init()
+        with mock.patch.object(cli, "TokenManager") as manager:
+            code, _, err = self.invoke("run", "--job-id", "0")
+        self.assertEqual(code, 2)
+        self.assertIn("--job-id", err)
+        manager.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,25 @@
+{
+  "checked_at": "2026-11-04",
+  "phase": "before_0.7.0_release",
+  "method": "Anonymous GHCR manifest and image config reads; no NAS access",
+  "images": [
+    {
+      "tag": "v0.4.4",
+      "digest": "sha256:76223b84e538dab988ea55236a945816232ab0b25bc7fba46e991a488800c74f",
+      "version": "0.4.4",
+      "revision": "07c47a639680f1a56d70ad8fe0a1e8a09d134835"
+    },
+    {
+      "tag": "v0.6.0",
+      "digest": "sha256:0d89f88a3e3e9c085071422bff2f786a6004dd97e098a0ca21e48967829fa216",
+      "version": "0.6.0",
+      "revision": "87e9e48c1f4c54f9d49e0d0fa2d0944112acb052"
+    },
+    {
+      "tag": "stable",
+      "digest": "sha256:0d89f88a3e3e9c085071422bff2f786a6004dd97e098a0ca21e48967829fa216",
+      "version": "0.6.0",
+      "revision": "87e9e48c1f4c54f9d49e0d0fa2d0944112acb052"
+    }
+  ]
+}

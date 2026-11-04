@@ -62,7 +62,8 @@ class VirtualSources:
 
     def relative(self, number):
         parent = 'moved' if number <= self.moved else 'original'
-        return f'{parent}/{number % 1000:04d}/media_{number:06d}.jpg'
+        extension = 'm4v' if number % 10 == 0 else 'jpg'
+        return f'{parent}/{number % 1000:04d}/media_{number:06d}.{extension}'
 
     def identity(self, number):
         return 1024 * (1 + number % 4096), 1700000000000000000 + number, 123, 1000000 + number
@@ -76,7 +77,7 @@ class VirtualSources:
         value = os.path.abspath(os.fspath(path))
         if not value.startswith(str(self.root) + os.sep):
             return None
-        match = re.search(r'media_(\d+)\.jpg$', value)
+        match = re.search(r'media_(\d+)\.(?:jpg|m4v)$', value)
         if not match:
             return None
         number = int(match.group(1))
@@ -120,7 +121,7 @@ def main():
         parser.error('--count must be at least 1000')
     sys.path.insert(0, str(args.repo.resolve()))
     from mailru_photos import queue as module
-    from mailru_photos.queue import Queue, UNLIMITED_MAX_BYTES
+    from mailru_photos.queue import Queue
 
     temporary = tempfile.TemporaryDirectory(prefix='mail-cloud-benchmark-') if args.workdir is None else None
     folder = Path(temporary.name) if temporary else args.workdir.resolve()
@@ -139,7 +140,9 @@ def main():
                         'queue_source_sha256': hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()},
         'scope': {'real_sqlite': True, 'journal_mode': 'WAL', 'synchronous': 'FULL',
                   'virtual_source_enumeration': True, 'virtual_stat': True, 'patched_snapshot': True,
-                  'network_uploads': False, 'bulk_prefixes_are_sql_fixtures': True},
+                  'network_uploads': False, 'bulk_prefixes_are_sql_fixtures': True,
+                  'virtual_jpeg_files': args.count - args.count // 10,
+                  'virtual_m4v_files': args.count // 10},
         'baseline_rss_mb': rss_mb(), 'measurements': {}, 'plans': {}, 'assertions': [],
     }
     started = time.perf_counter()
@@ -226,22 +229,43 @@ def main():
         assert initial.added == args.count and queue.stats()['total'] == args.count
         initial_rss = rss_mb()
         latency('stats_initial', queue.stats, samples=3)
-        for offset in (0, args.count // 2, args.count - 100):
-            rows = latency(f'list_offset_{offset}', lambda offset=offset: queue.list_jobs(limit=100, offset=offset, summary=True))
-            assert len(rows) == 100
+        for sort in ('asc', 'desc'):
+            for offset in (0, args.count // 2, args.count - 100):
+                rows = latency(f'list_{sort}_offset_{offset}',
+                               lambda offset=offset, sort=sort: queue.list_jobs(limit=100, offset=offset,
+                                                                              summary=True, sort=sort))
+                assert len(rows) == 100
+                ordering = [(row['created_at'], row['id']) for row in rows]
+                assert ordering == sorted(ordering, reverse=sort == 'desc')
         for after in (0, args.count // 2, args.count - 500):
             rows = latency(f'candidate_after_{after}', lambda after=after: queue.reconcile_candidates(after_id=after, limit=500))
             assert len(rows) == 500
         claims('claim_first', 1)
+        claims('claim_first_unlimited', 1, mode='unlimited')
+        claims('claim_first_regular', 10, mode='regular')
         uploaded = 100
         for _ in range(uploaded):
             job = queue.claim()
             queue.mark_uploaded(job, remote_hash=f'{job.id:040X}',
-                                verified_metadata={'benchmark_fixture': True, 'path': job.remote_path})
+                                verified_metadata={'benchmark_fixture': True, 'path': job.remote_path,
+                                                   'storage_mode': job.planned_mode,
+                                                   'is_unlim_upload': job.planned_mode == 'unlimited'})
         for row in queue.reconcile_candidates(limit=25):
             assert queue.mark_remote_existing(row, remote_hash=f'{row["id"]:040X}')
         report['scope']['fixture_verified_completions'] = uploaded
         report['scope']['fixture_existing_observations'] = 25
+        expected_filter_ids = {
+            'uploaded_unlimited': [number for number in range(1, 101) if number % 10],
+            'uploaded_regular': list(range(10, 101, 10)),
+            'uploaded_unknown': list(range(101, 126)),
+        }
+        for status, numbers in expected_filter_ids.items():
+            totals = latency(f'filter_totals_{status}', lambda status=status: queue.jobs_summary(status), samples=3)
+            assert totals == {'total': len(numbers), 'total_bytes': sum(world.identity(number)[0] for number in numbers)}
+            report['measurements'][f'filter_totals_{status}']['result'] = totals
+        all_totals = latency('filter_totals_all', queue.jobs_summary, samples=3)
+        assert all_totals['total'] == args.count
+        report['measurements']['filter_totals_all']['result'] = all_totals
         with queue._transaction():
             queue._db.execute("UPDATE jobs SET status='skipped',skip_reason='benchmark_fixture',next_attempt=NULL "
                               'WHERE id>125 AND id<?', (args.count,))
@@ -289,6 +313,9 @@ def main():
             f'{world.dropped} absent sources excluded from current totals and retained in history',
             'paused prefix has remaining=0 and no claimable task',
             'first/last/paused-prefix claims stay below 10000 SQLite VM operations',
+            'planned unlimited and regular claims use their respective partitions',
+            'both creation-time sort directions preserve stable task order',
+            'observed-storage filter totals cover all matching tasks independently of pagination',
         ])
         sql = {
             'pending_claim': ("SELECT * FROM jobs INDEXED BY jobs_pending WHERE status='pending' AND present=1 "
@@ -296,10 +323,19 @@ def main():
             'retry_claim': ("SELECT * FROM jobs INDEXED BY jobs_retry WHERE status='failed' AND present=1 "
                             'AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND next_attempt<=? '
                             'AND (? IS NULL OR attempts<?) ORDER BY next_attempt,id LIMIT 1', (time.time(), None, None)),
-            'task_list': ('SELECT id,local_path,remote_path,status FROM jobs WHERE present=1 ORDER BY id LIMIT ? OFFSET ?', (100, args.count // 2)),
+            'pending_claim_unlimited': ("SELECT * FROM jobs INDEXED BY jobs_pending_unlimited "
+                                       "WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 "
+                                       "AND planned_mode='unlimited' AND (? IS NULL OR attempts<?) ORDER BY id LIMIT 1", (None, None)),
+            'pending_claim_regular': ("SELECT * FROM jobs INDEXED BY jobs_pending_regular "
+                                     "WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 "
+                                     "AND planned_mode='regular' AND (? IS NULL OR attempts<?) ORDER BY id LIMIT 1", (None, None)),
+            'task_list_asc': ('SELECT id,local_path,remote_path,status FROM jobs WHERE present=1 '
+                              'ORDER BY created_at asc,id asc LIMIT ? OFFSET ?', (100, args.count // 2)),
+            'task_list_desc': ('SELECT id,local_path,remote_path,status FROM jobs WHERE present=1 '
+                               'ORDER BY created_at desc,id desc LIMIT ? OFFSET ?', (100, args.count // 2)),
             'reconcile_candidates': ("SELECT id,local_path FROM jobs INDEXED BY jobs_reconcile WHERE id>? AND present=1 "
                                      'AND paused=0 AND remove_requested=0 '
-                                     f"AND status IN ('pending','failed') AND size>0 AND size<={UNLIMITED_MAX_BYTES} "
+                                     "AND status IN ('pending','failed') AND cloud_present=0 AND size>0 "
                                      'AND NOT EXISTS(SELECT 1 FROM commit_intents WHERE job_id=jobs.id) ORDER BY id LIMIT ?', (args.count // 2, 500)),
         }
         for name, (statement, parameters) in sql.items():
