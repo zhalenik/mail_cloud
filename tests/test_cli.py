@@ -12,9 +12,55 @@ import unittest
 from unittest import mock
 
 from mailru_photos import cli
-from mailru_photos.api import ProtocolError
+from mailru_photos.api import ProtocolError, cloud_hash
 from mailru_photos.auth import AuthError, Tokens, TokenStore
 from mailru_photos.queue import MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, Queue, QueueBusyError
+from mailru_photos.transport import Cancelled, TransportError
+
+
+class ListingAPI:
+    """An offline personal tree; mutations and per-source stat are forbidden."""
+    def __init__(self, objects=None, *, page_hook=None, failure=None):
+        self.objects = {} if objects is None else objects
+        self.page_hook, self.failure = page_hook, failure
+        self.list_calls, self.account_calls, self.close_calls = [], [], 0
+
+    def require_account(self, expected):
+        self.account_calls.append(expected)
+        if expected not in (None, "owner@example.test"):
+            raise AuthError("Offline fixture account mismatch")
+        return SimpleNamespace(email="owner@example.test")
+
+    def close_thread(self):
+        self.close_calls += 1
+
+    def list_folder(self, path, *, offset=0, limit=500):
+        self.list_calls.append((path, offset, limit))
+        if self.failure is not None:
+            raise self.failure
+        entries, prefix = {}, path.rstrip("/") + "/"
+        for home, data in self.objects.items():
+            if not home.startswith(prefix):
+                continue
+            tail = home[len(prefix):]
+            if "/" in tail:
+                child = prefix + tail.split("/", 1)[0]
+                entries[child] = {"kind": "folder", "path": child}
+            else:
+                entries[home] = {"kind": "file", "path": home, **data}
+        ordered = sorted(entries.values(), key=lambda item: item["path"])
+        items = ordered[offset:offset + limit]
+        following = offset + len(items)
+        result = {"path": path, "items": items, "listed_paths": [item["path"] for item in items],
+                  "total": len(ordered), "listed": len(items), "excluded": 0,
+                  "next_offset": following if following < len(ordered) else None,
+                  "revision": {"tree": "offline-fixture", "rev": 1}}
+        return self.page_hook(path, offset, result) if self.page_hook else result
+
+    def stat(self, *args, **kwargs):
+        raise AssertionError("CLI scan must use the inventory, not per-file network stat")
+
+    upload_photo = upload_regular = ensure_parent = trash_file = stat
 
 
 class CLITests(unittest.TestCase):
@@ -51,6 +97,225 @@ class CLITests(unittest.TestCase):
         path.write_bytes(contents)
         return path
 
+    def fixture_auth(self):
+        (self.state / "auth.dat").write_bytes(b"OFFLINE-SAVED-AUTH-FIXTURE")
+
+    def cloud_objects(self):
+        with Queue(self.db, destination="/Archive") as queue:
+            result = {}
+            for row in queue.list_jobs():
+                digest, identity = cloud_hash(row["local_path"])
+                result[row["remote_path"]] = {"hash": digest, "size": identity.size, "is_unlim_upload": True}
+            return result
+
+    def test_local_only_never_reads_auth_and_rebuilds_uploaded_and_running_tasks(self):
+        self.init()
+        self.photo("uploaded.jpg", contents=b"uploaded fixture")
+        self.photo("interrupted.jpg", contents=b"interrupted fixture")
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.success("scan", "--local-only")
+        with Queue(self.db, destination="/Archive") as queue:
+            queue.bind_account("owner@example.test")
+            old_ids = {row["id"] for row in queue.list_jobs()}
+            first = queue.claim()
+            queue.mark_uploaded(first, remote_hash=cloud_hash(first.local_path)[0],
+                                verified_metadata={"is_unlim_upload": True})
+            self.assertIsNotNone(queue.claim())
+        self.fixture_auth()
+        with mock.patch.object(cli, "TokenStore", side_effect=AssertionError("offline scan read auth")), \
+             mock.patch.object(cli, "TokenManager", side_effect=AssertionError("offline scan read tokens")), \
+             mock.patch.object(cli, "CloudAPI", side_effect=AssertionError("offline scan used network")):
+            self.success("scan", "--local-only")
+        with Queue(self.db, destination="/Archive") as queue:
+            self.assertTrue(old_ids.isdisjoint({row["id"] for row in queue.list_jobs()}))
+            self.assertEqual((queue.stats()["uploaded"], queue.stats()["running"], queue.stats()["pending"]), (0, 0, 2))
+            self.assertEqual(queue._db.execute("SELECT COUNT(*) FROM upload_results").fetchone()[0], 1)
+            saved = queue.get_metadata("last_scan")
+            self.assertTrue(saved["complete"] and saved["local_complete"] and saved["local_only"])
+            self.assertFalse(saved["cloud_checked"] or saved["cloud_pending"] or saved["warning_allowed"])
+
+    def test_authenticated_fresh_scan_finds_current_cloud_content_and_its_new_path(self):
+        self.init()
+        self.photo("deleted.jpg", contents=b"distinct deleted fixture" * 10)
+        self.photo("moved.jpg", contents=b"distinct moved fixture" * 10)
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.success("scan", "--local-only")
+        objects = self.cloud_objects()
+        with Queue(self.db, destination="/Archive") as queue:
+            queue.bind_account("owner@example.test")
+            old_ids = {row["id"] for row in queue.list_jobs()}
+            job = queue.claim()
+            queue.mark_uploaded(job, remote_hash=cloud_hash(job.local_path)[0],
+                                verified_metadata={"is_unlim_upload": True})
+        self.fixture_auth()
+        api = ListingAPI(objects)
+        with mock.patch.object(cli, "TokenManager"), mock.patch.object(cli, "CloudAPI", return_value=api):
+            self.success("scan")
+            with Queue(self.db, destination="/Archive") as queue:
+                self.assertEqual(queue.stats()["existing"], 2)
+                self.assertEqual(queue.stats()["uploaded"], 0)
+                self.assertTrue(old_ids.isdisjoint({row["id"] for row in queue.list_jobs()}))
+            moved = api.objects.pop("/Archive/camera/moved.jpg")
+            api.objects.pop("/Archive/camera/deleted.jpg")
+            api.objects["/Другая папка/перенесённое.jpg"] = {**moved, "is_unlim_upload": False}
+            calls_before = len(api.list_calls)
+            self.success("scan")
+        self.assertEqual(api.list_calls[calls_before], ("/", 0, 500))
+        self.assertEqual(api.close_calls, 2)
+        with Queue(self.db, destination="/Archive") as queue:
+            rows = {row["relative_path"]: row for row in queue.list_jobs()}
+            self.assertEqual(rows["deleted.jpg"]["status"], "pending")
+            self.assertFalse(rows["deleted.jpg"]["cloud_present"])
+            self.assertEqual(rows["moved.jpg"]["cloud_path"], "/Другая папка/перенесённое.jpg")
+            self.assertEqual(rows["moved.jpg"]["observed_mode"], "regular")
+            saved = queue.get_metadata("last_scan")
+            self.assertTrue(saved["complete"] and saved["local_complete"] and saved["cloud_checked"])
+            self.assertFalse(saved["cloud_pending"] or saved["warning_allowed"])
+            self.assertEqual(saved["reconcile"]["matched_elsewhere"], 1)
+
+    def test_incomplete_cloud_listing_cannot_reuse_prior_success(self):
+        self.init()
+        self.photo()
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.success("scan", "--local-only")
+        objects = self.cloud_objects()
+        self.fixture_auth()
+        api = ListingAPI(objects)
+        with mock.patch.object(cli, "TokenManager"), mock.patch.object(cli, "CloudAPI", return_value=api):
+            self.success("scan")
+            def partial(path, offset, result):
+                if path == "/Archive/camera":
+                    result.update(total=2, next_offset=1 if offset == 0 else None)
+                return result
+            api.page_hook = partial
+            code, _, error = self.invoke("scan")
+        self.assertEqual(code, 2)
+        self.assertIn("не полностью", error)
+        with Queue(self.db, destination="/Archive") as queue:
+            saved = queue.get_metadata("last_scan")
+            self.assertFalse(saved["complete"] or saved["cloud_checked"])
+            self.assertTrue(saved["local_complete"] and saved["cloud_pending"])
+            self.assertEqual((saved["reconcile"]["checked"], saved["reconcile"]["matched"]), (0, 0))
+            self.assertEqual((queue.stats()["existing"], queue.stats()["pending"]), (0, 1))
+
+    def test_cloud_error_or_cancellation_sets_incomplete_metadata_and_correct_exit_code(self):
+        self.init()
+        self.photo()
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.fixture_auth()
+        for failure, expected in ((TransportError("offline fixture"), 2),
+                                  (ProtocolError("malformed fixture"), 2),
+                                  (Cancelled("fixture cancellation"), 130),
+                                  (KeyboardInterrupt(), 130)):
+            with self.subTest(error=type(failure).__name__):
+                api = ListingAPI(failure=failure)
+                with mock.patch.object(cli, "TokenManager"), mock.patch.object(cli, "CloudAPI", return_value=api):
+                    code, _, _ = self.invoke("scan")
+                self.assertEqual(code, expected)
+                self.assertEqual(api.close_calls, 1)
+                with Queue(self.db, destination="/Archive") as queue:
+                    saved = queue.get_metadata("last_scan")
+                    self.assertFalse(saved["complete"] or saved["cloud_checked"])
+                    self.assertTrue(saved["local_complete"] and saved["cloud_pending"])
+                    self.assertEqual(queue.stats()["pending"], 1)
+
+    def test_scan_token_failure_is_not_a_successful_local_fallback(self):
+        self.init()
+        self.photo()
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.fixture_auth()
+        with mock.patch.object(cli, "TokenManager", side_effect=AuthError("fixture expired")), \
+             mock.patch.object(cli, "CloudAPI") as factory:
+            code, _, _ = self.invoke("scan")
+        self.assertEqual(code, 2)
+        factory.assert_not_called()
+        with Queue(self.db, destination="/Archive") as queue:
+            self.assertFalse(queue.get_metadata("last_scan")["complete"])
+            self.assertTrue(queue.get_metadata("last_scan")["local_complete"])
+            self.assertFalse(queue.get_metadata("last_reconcile")["complete"])
+
+    def test_incomplete_local_scan_never_loads_saved_auth(self):
+        self.init()
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.source.rmdir()
+        self.fixture_auth()
+        with mock.patch.object(cli, "TokenManager") as manager, mock.patch.object(cli, "CloudAPI") as factory:
+            code, _, _ = self.invoke("scan")
+        self.assertEqual(code, 2)
+        manager.assert_not_called()
+        factory.assert_not_called()
+        with Queue(self.db, destination="/Archive") as queue:
+            self.assertFalse(queue.get_metadata("last_scan")["local_complete"])
+
+    def test_local_scanner_cancelled_result_returns_130_without_starting_cloud_read(self):
+        self.init()
+        self.photo()
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.fixture_auth()
+        scan = Queue.scan
+        def cancelled_scan(queue, *args, **kwargs):
+            kwargs["stop"].set()
+            return scan(queue, *args, **kwargs)
+        with mock.patch.object(Queue, "scan", new=cancelled_scan), \
+             mock.patch.object(cli, "TokenManager") as manager, mock.patch.object(cli, "CloudAPI") as factory:
+            code, _, _ = self.invoke("scan")
+        self.assertEqual(code, 130)
+        manager.assert_not_called()
+        factory.assert_not_called()
+        with Queue(self.db, destination="/Archive") as queue:
+            saved = queue.get_metadata("last_scan")
+            self.assertFalse(saved["complete"] or saved["local_complete"] or saved["cloud_checked"])
+            self.assertTrue(saved["cancelled"] and saved["cloud_pending"])
+
+    def test_scan_keeps_run_lock_through_token_load_account_check_listing_and_close(self):
+        self.init()
+        self.photo()
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.fixture_auth()
+        checked = []
+        def lock_held(stage):
+            with Queue(self.db, destination="/Archive") as contender:
+                with self.assertRaises(QueueBusyError), contender.exclusive_run():
+                    pass
+            checked.append(stage)
+        api = ListingAPI()
+        require, close = api.require_account, api.close_thread
+        def check_account(expected):
+            lock_held("account")
+            return require(expected)
+        def check_close():
+            lock_held("close")
+            close()
+        def page_hook(path, offset, result):
+            lock_held("listing")
+            return result
+        api.require_account, api.close_thread, api.page_hook = check_account, check_close, page_hook
+        def load_tokens(store):
+            lock_held("tokens")
+            return object()
+        with mock.patch.object(cli, "TokenManager", side_effect=load_tokens), \
+             mock.patch.object(cli, "CloudAPI", return_value=api):
+            self.success("scan")
+        self.assertEqual(checked, ["tokens", "account", "listing", "close"])
+        with Queue(self.db, destination="/Archive") as queue:
+            self.assertEqual(queue.account_id, "owner@example.test")
+
+    def test_scan_refuses_busy_queue_before_auth_or_task_reset(self):
+        self.init()
+        self.photo()
+        self.success("add-folder", self.source, "--alias", "camera")
+        self.success("scan", "--local-only")
+        self.fixture_auth()
+        with Queue(self.db, destination="/Archive") as owner, owner.exclusive_run(), \
+             mock.patch.object(cli, "TokenManager") as manager, mock.patch.object(cli, "CloudAPI") as factory:
+            before = owner.list_jobs()
+            code, _, _ = self.invoke("scan")
+            self.assertEqual(code, 2)
+            self.assertEqual(owner.list_jobs(), before)
+            self.assertTrue(owner.get_metadata("last_scan")["complete"])
+        manager.assert_not_called()
+        factory.assert_not_called()
+
     def test_local_workflow_scan_report_and_recover_without_authentication(self):
         first = self.photo("2020/one.JPG")
         second = self.photo("2021/two.png", contents=b"another-photo")
@@ -63,6 +328,10 @@ class CLITests(unittest.TestCase):
             self.success("scan")
             status = json.loads(self.success("status"))
             self.assertTrue(status["last_scan"]["complete"])
+            self.assertTrue(status["last_scan"]["local_complete"])
+            self.assertTrue(status["last_scan"]["cloud_pending"])
+            self.assertFalse(status["last_scan"]["cloud_checked"])
+            self.assertFalse(status["last_scan"]["warning_allowed"])
             self.assertEqual(status["stats"]["pending"], 2)
             self.assertEqual(status["stats"]["total_bytes"], sum(map(len, before.values())))
             self.assertIsNone(status["account"])
@@ -127,10 +396,11 @@ class CLITests(unittest.TestCase):
         with mock.patch.object(Queue, "scan", side_effect=KeyboardInterrupt):
             code, _, err = self.invoke("scan")
         self.assertEqual(code, 130)
-        self.assertIn("recover", err)
+        self.assertIn("scan", err)
         status = json.loads(self.success("status"))
         self.assertFalse(status["last_scan"]["complete"])
-        self.assertEqual(status["last_scan"]["reason"], "scan_started")
+        self.assertEqual(status["last_scan"]["reason"], "scan_cancelled")
+        self.assertTrue(status["last_scan"]["cancelled"])
 
     def test_custom_extensions_and_rescan_do_not_duplicate_jobs(self):
         self.init()
@@ -139,11 +409,15 @@ class CLITests(unittest.TestCase):
         self.photo("third.heic")
         self.success("add-folder", self.source, "--alias", "camera")
         self.success("scan", "--extensions", "jpg, .PNG")
+        with Queue(self.db, destination="/Archive") as queue:
+            previous_ids = {row["id"] for row in queue.list_jobs()}
         self.success("scan", "--extensions", "jpg, .PNG")
         status = json.loads(self.success("status"))
         self.assertEqual(status["stats"]["total"], 2)
-        self.assertEqual(status["last_scan"]["added"], 0)
-        self.assertEqual(status["last_scan"]["unchanged"], 2)
+        self.assertEqual(status["last_scan"]["added"], 2)
+        self.assertEqual(status["last_scan"]["unchanged"], 0)
+        with Queue(self.db, destination="/Archive") as queue:
+            self.assertTrue(previous_ids.isdisjoint({row["id"] for row in queue.list_jobs()}))
 
     def test_default_scan_includes_video_and_upgrades_legacy_default(self):
         self.init()
@@ -159,7 +433,8 @@ class CLITests(unittest.TestCase):
             self.assertEqual(queue.stats()['pending'], 3)
             self.assertEqual(set(queue.get_metadata('extensions')), MEDIA_EXTENSIONS)
         self.success('scan')
-        self.assertEqual(json.loads(self.success('status'))['last_scan']['unchanged'], 3)
+        self.assertEqual(json.loads(self.success('status'))['last_scan']['added'], 3)
+        self.assertEqual(json.loads(self.success('status'))['last_scan']['unchanged'], 0)
 
     def test_explicit_photo_only_filter_survives_interrupted_scan_and_restart(self):
         self.init()
@@ -186,7 +461,8 @@ class CLITests(unittest.TestCase):
         self.success("scan", "--extensions", "jpg,cr3")
         self.success("scan")
         status = json.loads(self.success("status"))
-        self.assertEqual(status["last_scan"]["unchanged"], 2)
+        self.assertEqual(status["last_scan"]["added"], 2)
+        self.assertEqual(status["last_scan"]["unchanged"], 0)
         self.assertEqual(status["stats"]["pending"], 2)
         self.assertEqual(status["stats"]["skipped"], 0)
         with Queue(self.db, destination="/Archive") as queue:

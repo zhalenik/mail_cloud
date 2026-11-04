@@ -17,6 +17,7 @@ from . import __version__
 from .api import CloudAPI, ProtocolError
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .queue import Queue, QueueError
+from .reconcile import reconcile
 from .runner import run
 from .transport import Cancelled, TransportError
 
@@ -98,8 +99,9 @@ def parser() -> argparse.ArgumentParser:
     update_folder.add_argument("--alias", help="новое уникальное имя источника")
     remove_folder = commands.add_parser("remove-folder", help="убрать источник и его задачи, сохранив файлы")
     remove_folder.add_argument("id", type=int, help="идентификатор источника из status")
-    scan = commands.add_parser("scan", help="обойти все источники и обновить очередь")
+    scan = commands.add_parser("scan", help="заново собрать очередь и проверить текущее содержимое Облака")
     scan.add_argument("--extensions", help="расширения через запятую; по умолчанию фото и видео, например jpg,png,heic,mp4,mov")
+    scan.add_argument("--local-only", action="store_true", help="только локальный обход: без чтения авторизации и запросов к Облаку")
     commands.add_parser("status", help="показать состояние очереди без сети")
     upload = commands.add_parser("run", help="загрузить очередь; повторный запуск продолжает работу")
     upload.add_argument("--workers", type=int, default=4)
@@ -173,6 +175,86 @@ def _account_login(queue: Queue, directory: Path, email: str) -> None:
         api.close_thread()
 
 
+def _scan(queue: Queue, directory: Path, args) -> int:
+    """Rebuild the current task snapshot; remote history never proves presence."""
+    stop = threading.Event()
+    value = {"complete": False, "local_complete": False, "reason": "scan_started",
+             "root_ids": None, "trigger": "cli", "warning_allowed": False,
+             "cloud_checked": False, "cloud_pending": not args.local_only,
+             "local_only": args.local_only}
+    result_code = 2
+    with queue.exclusive_run():
+        try:
+            queue.recover_running()
+            queue.set_metadata("last_scan", value)
+            extensions = (queue.discovery_extensions() if args.extensions is None else
+                          [item.strip() for item in args.extensions.split(",") if item.strip()])
+            extensions = queue.set_discovery_extensions(
+                extensions, custom=True if args.extensions is not None else None,
+            )
+            queue.reset_for_scan()
+            # reset_for_scan invalidates its old snapshot too; preserve the
+            # CLI-specific intent before a potentially interrupted local walk.
+            queue.set_metadata("last_scan", value)
+            print("Заново обходим исходные папки. Фото и видео не декодируются и не копируются…", flush=True)
+            result = queue.scan(extensions, stop=stop)
+            value.update(dataclasses.asdict(result), local_complete=result.complete,
+                         complete=False, reason="local_scan_incomplete")
+            queue.set_metadata("last_scan", value)
+            if result.cancelled or stop.is_set():
+                raise Cancelled("Локальное сканирование остановлено.")
+            if result.complete:
+                if args.local_only or not (directory / "auth.dat").exists():
+                    value.update(complete=True, reason="local_only" if args.local_only else "login_required")
+                    result_code = 0
+                else:
+                    value["reason"] = "cloud_scan_started"
+                    queue.set_metadata("last_scan", value)
+                    queue.set_metadata("last_reconcile", {"at": time.time(), "complete": False,
+                                                           "stage": "listing", "reason": "scan_started"})
+                    # Loading auth.dat may rotate its refresh token. Keep it
+                    # under the same process lock as login/run and the scan.
+                    tokens = TokenManager(TokenStore(directory / "auth.dat"))
+                    api = CloudAPI(tokens, stop=stop)
+                    try:
+                        account = api.require_account(queue.account_id)
+                        queue.bind_account(account.email)
+                        print("Читаем текущий список файлов Облака и сравниваем содержимое…", flush=True)
+                        report = reconcile(queue, api, stop=stop)
+                        queue.set_metadata("last_reconcile", {"at": time.time(), **report})
+                        checked = report.get("complete") is True
+                        value.update(complete=checked, cloud_checked=checked, cloud_pending=not checked,
+                                     reason="complete" if checked else "cloud_scan_incomplete",
+                                     reconcile=report)
+                        result_code = 0 if checked else 130 if report.get("cancelled") else 2
+                        if result_code:
+                            if result_code == 130:
+                                value.update(reason="scan_cancelled", cancelled=True)
+                                print("Сверка остановлена. Повторите scan для полной проверки Облака.", file=sys.stderr)
+                            else:
+                                message = (report.get("error_samples") or [{}])[0].get("message")
+                                print("Ошибка: содержимое Облака проверено не полностью. Повторите scan. "
+                                      + (message or ""), file=sys.stderr)
+                    finally:
+                        api.close_thread()
+            queue.set_metadata("last_scan", value)
+        except (Cancelled, KeyboardInterrupt):
+            stop.set()
+            value.update(complete=False, cloud_checked=False, cloud_pending=not args.local_only,
+                         reason="scan_cancelled", cancelled=True)
+            queue.set_metadata("last_scan", value)
+            print("Сканирование остановлено. Новая очередь сохранена; повторите scan перед загрузкой.", file=sys.stderr)
+            result_code = 130
+        except Exception:
+            value.update(complete=False, cloud_checked=False, cloud_pending=not args.local_only,
+                         reason="scan_failed")
+            queue.set_metadata("last_scan", value)
+            raise
+        pretty(value)
+        pretty(queue.stats())
+    return result_code
+
+
 def dispatch(args) -> int:
     directory = args.state.expanduser().resolve()
     if args.command == "init":
@@ -202,22 +284,7 @@ def dispatch(args) -> int:
             pretty({"removed_tasks": queue.remove_root(args.id)})
             return 0
         if args.command == "scan":
-            with queue.exclusive_run():
-                queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started"})
-                if args.extensions is None:
-                    extensions = queue.discovery_extensions()
-                else:
-                    extensions = [item.strip() for item in args.extensions.split(",") if item.strip()]
-                extensions = queue.set_discovery_extensions(
-                    extensions, custom=True if args.extensions is not None else None,
-                )
-                print("Обход исходных папок. Фото и видео не декодируются и не копируются…", flush=True)
-                result = queue.scan(extensions)
-                value = dataclasses.asdict(result)
-                queue.set_metadata("last_scan", value)
-            pretty(value)
-            pretty(queue.stats())
-            return 0 if result.complete else 2
+            return _scan(queue, directory, args)
         if args.command == "status":
             pretty({"destination": queue.destination, "account": queue.account_id,
                     "sources": [dataclasses.asdict(item) for item in queue.roots()],
