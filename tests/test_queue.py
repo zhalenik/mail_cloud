@@ -15,7 +15,7 @@ from unittest.mock import patch
 from mailru_photos.media import UNLIMITED_MAX_BYTES
 from mailru_photos.queue import (
     FileChangedError, Queue, QueueBusyError, QueueConfigurationError, QueueError,
-    MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, ScanCollisionError, SourceUnavailableError, StaleClaimError,
+    MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, SCHEMA_VERSION, ScanCollisionError, SourceUnavailableError, StaleClaimError,
 )
 
 
@@ -224,7 +224,7 @@ class QueueTests(unittest.TestCase):
         self.queue._db.execute("PRAGMA user_version=1")
         with Queue(self.db, destination="/Archive", account_id="test-account") as upgraded:
             self.assertEqual(upgraded.stats()["pending"], 1)
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             names = {row[0] for row in upgraded._db.execute("SELECT name FROM sqlite_master")}
             self.assertIn("jobs_status", names)
             self.assertIn("commit_intents", names)
@@ -348,7 +348,7 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(self.queue._db.execute("SELECT 1 FROM sqlite_master WHERE name='upload_results_migration'").fetchone())
         self.assertEqual([dict(row) for row in self.queue._db.execute("SELECT * FROM upload_results")], before)
         with Queue(self.db, destination="/Archive") as recovered:
-            self.assertEqual(recovered._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(recovered._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(recovered.upload_history(job.id)[0]["remote_hash"], "preserve-this-proof")
 
     def test_schema_zero_can_migrate_legacy_ledger_with_malformed_optional_evidence(self):
@@ -362,7 +362,7 @@ class QueueTests(unittest.TestCase):
             row = upgraded._db.execute("SELECT * FROM upload_results").fetchone()
             self.assertEqual(row["verified_metadata"], "invalid legacy JSON")
             self.assertEqual(row["remote_path"], job.remote_path)
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
     def test_explicit_source_destination_is_exact_and_idempotent(self):
         other = self.base / "other"
@@ -991,7 +991,7 @@ class QueueTests(unittest.TestCase):
     def schema_two_controls_fixture(self):
         self.queue._db.execute("DROP TABLE commit_evidence")
         for name in ("jobs_pending", "jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry",
-                     "jobs_retry_unlimited", "jobs_retry_regular", "jobs_paused", "jobs_reconcile"):
+                     "jobs_retry_unlimited", "jobs_retry_regular", "jobs_paused", "jobs_paused_created", "jobs_reconcile"):
             self.queue._db.execute(f"DROP INDEX {name}")
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN paused")
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN remove_requested")
@@ -1016,7 +1016,7 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(self.queue._db.execute("SELECT 1 FROM sqlite_master WHERE name='commit_evidence'").fetchone())
         self.assertEqual(dict(self.queue._db.execute("SELECT * FROM commit_intents").fetchone()), before)
         with Queue(self.db, destination="/Archive") as upgraded:
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertIs(upgraded.get_job(job.id)["paused"], False)
             self.assertEqual(dict(upgraded._db.execute("SELECT * FROM commit_intents").fetchone()), before)
             self.assertEqual(upgraded.request_control(job.id, "pause")["paused"], True)
@@ -1201,7 +1201,7 @@ class QueueTests(unittest.TestCase):
         self.queue.scan()
         self.queue._db.execute("DROP INDEX jobs_reconcile")
         with Queue(self.db, destination="/Archive") as upgraded:
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(len(upgraded.reconcile_candidates()), 1)
             version = upgraded._db.execute("PRAGMA data_version").fetchone()[0]
             with Queue(self.db, destination="/Archive") as reopened:
@@ -1764,7 +1764,7 @@ class QueueTests(unittest.TestCase):
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN storage_mode")
         self.queue._db.execute("PRAGMA user_version=1")
         with Queue(self.db, destination="/Archive", account_id="test-account") as upgraded:
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertIsNone(upgraded.list_jobs(summary=True)[0]["storage_mode"])
             resumed = upgraded.claim(storage_mode="unlimited")
             self.assertIsNone(resumed.storage_mode)
@@ -2071,6 +2071,350 @@ class QueueTests(unittest.TestCase):
         for row in self.queue.list_jobs():
             self.assertEqual(row["attempts"], 0 if row["status"] == "pending" else 4)
 
+    def test_scan_classifies_small_formats_and_oversized_files_before_upload(self):
+        self.photo("Фото/снимок.JPG", b"photo")
+        self.photo("Видео/ролик.MOV", b"video")
+        self.photo("Видео/старый.M4V", b"unsupported")
+        self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.assertTrue(self.queue.scan().complete)
+        rows = {row["relative_path"]: row for row in self.queue.list_jobs(summary=True)}
+        self.assertEqual(rows["Фото/снимок.JPG"]["planned_mode"], "unlimited")
+        self.assertEqual(rows["Видео/ролик.MOV"]["planned_reason"], "account_confirmed_mov")
+        self.assertEqual(rows["Видео/старый.M4V"]["planned_mode"], "regular")
+        self.assertEqual(rows["large.mp4"]["planned_reason"], "size_limit")
+        stats = self.queue.stats()
+        self.assertEqual((stats["planned_unlimited_count"], stats["planned_unlimited_bytes"]), (2, 10))
+        self.assertEqual((stats["planned_regular_count"], stats["planned_regular_bytes"]),
+                         (2, UNLIMITED_MAX_BYTES + 1 + len(b"unsupported")))
+        self.assertEqual(stats["uploaded_total_count"], 0)
+        ordinary = self.queue.claim(storage_mode="regular")
+        self.assertEqual(ordinary.planned_mode, "regular")
+        self.queue.release(ordinary)
+        self.assertEqual(self.queue.stats(storage_mode="regular")["total"], 2)
+
+    def test_regular_policy_is_reversible_and_preserves_pause_errors_and_receipts(self):
+        for name in ("ready.m4v", "paused.m4v", "retry.m4v", "permanent.m4v", "observed.m4v", "running.m4v"):
+            self.photo(name)
+        self.sparse_media("large.mp4", UNLIMITED_MAX_BYTES + 1)
+        self.queue.scan()
+        ids = {row["relative_path"]: row["id"] for row in self.queue.list_jobs()}
+        self.queue.request_control(ids["paused.m4v"], "pause")
+        retry = self.queue.claim(job_id=ids["retry.m4v"])
+        self.queue.save_commit_intent(retry, "retry-hash", storage_mode="regular")
+        self.queue.mark_failed(retry, "temporary", retry_delay=60)
+        permanent = self.queue.claim(job_id=ids["permanent.m4v"])
+        self.queue.mark_failed(permanent, "permanent", retry_delay=None)
+        observed = self.queue.claim(job_id=ids["observed.m4v"])
+        self.queue.record_cloud_observation(observed, mode="regular", remote_hash="remote-hash",
+                                            metadata={"is_unlim_upload": False})
+        self.queue.mark_failed(observed, "verification failure", retry_delay=60)
+        running = self.queue.claim(job_id=ids["running.m4v"])
+        self.assertEqual(self.queue.apply_regular_policy(False), {"skipped": 4, "resumed": 0})
+        self.assertEqual(self.queue.get_job(ids["ready.m4v"])["skip_reason"], "regular_format_disabled")
+        self.assertEqual(self.queue.get_job(ids["large.mp4"])["skip_reason"], "regular_size_disabled")
+        self.assertTrue(self.queue.get_job(ids["paused.m4v"])["paused"])
+        self.assertEqual(self.queue.get_job(permanent.id)["last_error"], "permanent")
+        self.assertEqual(self.queue.get_job(observed.id)["status"], "failed")
+        self.assertEqual(self.queue.get_job(running.id)["status"], "running")
+        self.assertEqual(self.queue.stats()["planned_regular_count"], 6)
+        self.assertEqual(self.queue.apply_regular_policy(False), {"skipped": 0, "resumed": 0})
+        self.assertEqual(self.queue.apply_regular_policy(True), {"skipped": 0, "resumed": 4})
+        self.assertTrue(self.queue.get_job(ids["paused.m4v"])["paused"])
+        resumed = self.queue.claim(job_id=retry.id, storage_mode="regular")
+        self.assertEqual(self.queue.get_commit_intent(resumed)["cloud_hash"], "retry-hash")
+        self.queue.release(resumed)
+        self.queue.release(running)
+
+    def test_false_server_flag_is_a_quota_observation_and_an_error_not_a_success(self):
+        self.photo(contents=b"unexpected quota")
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "A" * 40)
+        self.queue.record_cloud_observation(
+            job, mode="regular", remote_hash="A" * 40,
+            metadata={"is_unlim_upload": False, "verified": False, "size": job.size},
+        )
+        self.assertEqual(self.queue.get_job(job.id)["status"], "running")
+        self.assertEqual(self.queue.upload_history(job.id), [])
+        self.queue.mark_failed(job, "server returned false", retry_delay=None)
+        self.assertEqual([row["id"] for row in self.queue.list_jobs("uploaded_regular")], [job.id])
+        self.assertEqual([row["id"] for row in self.queue.list_jobs("failed")], [job.id])
+        self.assertEqual(self.queue.list_jobs("uploaded"), [])
+        self.assertEqual(self.queue.jobs_summary("uploaded_regular"), {"total": 1, "total_bytes": job.size})
+        stats = self.queue.stats()
+        self.assertEqual(stats["planned_unlimited_count"], 0)
+        self.assertEqual(stats["uploaded_regular_bytes"], job.size)
+        self.assertEqual(stats["uploaded_total_bytes"], job.size)
+        self.assertEqual(stats["uploaded_bytes"], 0)
+        with Queue(self.db, destination="/Archive") as reopened:
+            reopened.request_control(job.id, "start")
+            resumed = reopened.claim(job_id=job.id)
+            receipt = reopened.get_commit_intent(resumed)["storage_observation"]
+            self.assertEqual(receipt["mode"], "regular")
+            self.assertIs(receipt["is_unlim_upload"], False)
+            self.assertFalse(receipt["verified"])
+            self.assertEqual(receipt["path"], job.remote_path)
+            reopened.release(resumed)
+
+    def test_absent_server_flag_stays_unknown_through_retry_and_filtering(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "A" * 40)
+        self.queue.record_cloud_observation(job, mode="unknown", remote_hash="A" * 40)
+        self.queue.mark_failed(job, "missing flag", retry_delay=None)
+        stats = self.queue.stats()
+        self.assertEqual((stats["uploaded_unknown_count"], stats["uploaded_regular_count"]), (1, 0))
+        self.assertEqual(self.queue.jobs_summary("uploaded_regular")["total"], 0)
+        self.assertEqual(self.queue.jobs_summary("uploaded_unknown")["total"], 1)
+        self.queue.request_control(job.id, "start")
+        resumed = self.queue.claim(job_id=job.id)
+        self.assertEqual(self.queue.get_commit_intent(resumed)["storage_observation"]["mode"], "unknown")
+        self.assertNotIn("is_unlim_upload", self.queue.get_commit_intent(resumed)["storage_observation"])
+        with self.assertRaises(QueueError):
+            self.queue.record_cloud_observation(resumed, mode="regular", remote_hash="A" * 40,
+                                                metadata={"is_unlim_upload": True})
+        self.queue.release(resumed)
+
+    def test_cloud_delete_checks_object_identity_and_preserves_false_flag_history(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "A" * 40)
+        self.queue.record_cloud_observation(job, mode="regular", remote_hash="A" * 40,
+                                            metadata={"is_unlim_upload": False, "verified": True})
+        self.queue.mark_failed(job, "unexpected quota", retry_delay=None)
+        self.assertFalse(self.queue.mark_cloud_deleted(job.id, expected_hash="B" * 40))
+        self.assertFalse(self.queue.mark_cloud_deleted(job.id, expected_hash="A" * 40, expected_path="/different"))
+        self.assertEqual(self.queue.stats()["uploaded_regular_count"], 1)
+        self.assertTrue(self.queue.mark_cloud_deleted(job.id, expected_hash="a" * 40, expected_path=job.remote_path))
+        self.assertTrue(self.queue.mark_cloud_deleted(job.id, expected_hash="a" * 40, expected_path=job.remote_path))
+        self.assertEqual([row["event"] for row in self.queue.cloud_history(job.id)], ["deleted", "stored"])
+        self.assertEqual(self.queue.get_job(job.id)["status"], "failed")
+        self.assertEqual(self.queue.list_jobs("uploaded_regular"), [])
+        self.assertEqual(self.queue.stats()["planned_unlimited_count"], 1)
+        self.queue.request_control(job.id, "start")
+        resumed = self.queue.claim(job_id=job.id)
+        self.assertNotIn("storage_observation", self.queue.get_commit_intent(resumed))
+        self.queue.release(resumed)
+        self.assertTrue(self.queue.delete_task_final(job.id))
+        self.assertEqual(len(self.queue.cloud_history(None)), 2)
+        self.assertEqual(len(self.queue.cloud_history(job.id)), 2)
+        self.assertTrue(all(row["job_id"] is None for row in self.queue.cloud_history(job.id)))
+        self.queue.scan()
+        self.assertGreater(self.queue.list_jobs()[0]["id"], job.id)
+
+    def test_completed_uploads_have_verified_observations_without_changing_legacy_history(self):
+        self.photo("photo.jpg", b"photo")
+        self.photo("video.m4v", b"video")
+        self.queue.scan()
+        unlimited = self.queue.claim(storage_mode="unlimited")
+        self.queue.mark_uploaded(unlimited, remote_hash="A" * 40,
+                                 verified_metadata={"storage_mode": "unlimited", "is_unlim_upload": True})
+        regular = self.queue.claim(storage_mode="regular")
+        self.queue.mark_uploaded(regular, remote_hash="B" * 40,
+                                 verified_metadata={"storage_mode": "regular", "is_unlim_upload": False})
+        stats = self.queue.stats()
+        self.assertEqual((stats["uploaded_unlimited_count"], stats["uploaded_regular_count"]), (1, 1))
+        self.assertEqual((stats["uploaded_total_bytes"], stats["uploaded_bytes"]), (10, 10))
+        self.assertEqual((stats["planned_unlimited_bytes"], stats["planned_regular_bytes"]), (0, 0))
+        self.assertTrue(self.queue.get_job(unlimited.id)["cloud_verified"])
+        self.assertTrue(self.queue.get_job(regular.id)["cloud_verified"])
+        self.assertEqual(len(self.queue.upload_history(unlimited.id)), 1)
+        self.assertEqual(len(self.queue.upload_history(regular.id)), 1)
+
+    def test_observed_failed_cloud_path_survives_source_move_and_retarget_without_intent(self):
+        source = self.photo("before.jpg")
+        self.photo("pending.jpg")
+        self.queue.scan()
+        rows = {row["relative_path"]: row for row in self.queue.list_jobs()}
+        job = self.queue.claim(job_id=rows["before.jpg"]["id"])
+        self.queue.record_cloud_observation(job, mode="regular", remote_hash="A" * 40)
+        self.queue.mark_failed(job, "unexpected quota", retry_delay=None)
+        self.queue.update_root(1, "/Новая папка")
+        self.assertEqual(self.queue.get_job(job.id)["remote_path"], job.remote_path)
+        moved = source.with_name("после.jpg")
+        source.rename(moved)
+        self.assertEqual(self.queue.scan().moved, 1)
+        row = self.queue.get_job(job.id)
+        self.assertEqual(row["relative_path"], "после.jpg")
+        self.assertEqual(row["cloud_path"], job.remote_path)
+        self.assertEqual(row["remote_path"], job.remote_path)
+        self.assertEqual(self.queue.get_job(rows["pending.jpg"]["id"])["remote_path"], "/Новая папка/pending.jpg")
+
+    def test_changed_source_resets_current_observation_but_keeps_original_receipt(self):
+        source = self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.record_cloud_observation(job, mode="regular", remote_hash="A" * 40)
+        self.queue.mark_failed(job, "unexpected quota", retry_delay=None)
+        source.write_bytes(b"new source contents, with another size")
+        self.assertEqual(self.queue.scan().changed, 1)
+        row = self.queue.get_job(job.id)
+        self.assertFalse(row["cloud_present"])
+        self.assertIsNone(row["observed_mode"])
+        self.assertEqual(self.queue.cloud_history(job.id)[0]["source_size"], job.size)
+        self.assertEqual(self.queue.stats()["uploaded_regular_count"], 0)
+        self.assertEqual(self.queue.stats()["planned_unlimited_bytes"], source.stat().st_size)
+
+    def test_single_claim_never_falls_through_to_another_task(self):
+        missing = self.photo("missing.jpg")
+        changed = self.photo("changed.jpg")
+        self.photo("untouched.jpg")
+        self.queue.scan()
+        ids = {row["relative_path"]: row["id"] for row in self.queue.list_jobs()}
+        missing.unlink()
+        self.assertIsNone(self.queue.claim(job_id=ids["missing.jpg"]))
+        changed.write_bytes(b"new contents with different size")
+        self.assertIsNone(self.queue.claim(job_id=ids["changed.jpg"]))
+        self.assertEqual(self.queue.get_job(ids["changed.jpg"])["status"], "failed")
+        untouched = self.queue.get_job(ids["untouched.jpg"])
+        self.assertEqual((untouched["status"], untouched["attempts"]), ("pending", 0))
+        self.assertIsNone(self.queue.claim(job_id=999999))
+        self.queue.request_control(ids["changed.jpg"], "start")
+        resumed = self.queue.claim(job_id=ids["changed.jpg"])
+        self.assertEqual(resumed.id, ids["changed.jpg"])
+        self.assertEqual(resumed.size, changed.stat().st_size)
+        self.queue.release(resumed)
+
+    def test_filtered_summary_and_created_sort_are_stable_across_pages(self):
+        for index in range(5):
+            self.photo(f"{index}.jpg", bytes(index + 1))
+        self.queue.scan()
+        rows = self.queue.list_jobs()
+        first_id = rows[0]["id"]
+        self.queue._db.execute("UPDATE jobs SET created_at=100")
+        self.queue._db.execute("UPDATE jobs SET created_at=200 WHERE id=?", (first_id,))
+        expected = [row["id"] for row in rows[1:]] + [first_id]
+        self.assertEqual([row["id"] for row in self.queue.list_jobs(sort="asc")], expected)
+        self.assertEqual([row["id"] for row in self.queue.list_jobs(sort="desc")], expected[::-1])
+        self.assertEqual([row["id"] for row in self.queue.list_jobs(sort="desc", limit=2, offset=1)], expected[::-1][1:3])
+        for row in rows[:2]:
+            self.queue.request_control(row["id"], "pause")
+        paused = rows[:2]
+        self.assertEqual(self.queue.jobs_summary("paused"),
+                         {"total": 2, "total_bytes": sum(row["size"] for row in paused)})
+        self.assertEqual(self.queue.jobs_summary(), {"total": 5, "total_bytes": 15})
+        self.assertIn("created_at", self.queue.list_jobs(summary=True)[0])
+        for method in (self.queue.list_jobs, self.queue.jobs_summary):
+            with self.assertRaises(ValueError):
+                method("unrecognized-filter")
+
+    def test_keyset_task_pages_include_missing_for_deletion_and_refuse_live_claim(self):
+        missing = self.photo("missing.jpg")
+        self.photo("next.jpg")
+        self.photo("last.jpg")
+        self.queue.scan()
+        missing_id = next(row["id"] for row in self.queue.list_jobs() if row["relative_path"] == "missing.jpg")
+        missing.unlink()
+        self.queue.scan()
+        all_rows = self.queue.iter_tasks()
+        self.assertEqual(len(all_rows), 3)
+        self.assertIn(missing_id, [row["id"] for row in all_rows])
+        self.assertEqual(len(self.queue.iter_tasks(include_missing=False)), 2)
+        first = self.queue.iter_tasks(limit=1)[0]
+        self.assertTrue(self.queue.delete_task_final(first["id"]))
+        second_page = self.queue.iter_tasks(after_id=first["id"], limit=1)
+        self.assertEqual(second_page[0]["id"], all_rows[1]["id"])
+        running = self.queue.claim()
+        with self.assertRaises(QueueBusyError):
+            self.queue.delete_task_final(running.id)
+        self.queue.release(running)
+        self.assertTrue(self.queue.delete_task_final(running.id))
+        self.assertFalse(self.queue.delete_task_final(running.id))
+
+    def test_partial_deletion_error_keeps_idle_task_and_all_cloud_evidence(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "A" * 40)
+        self.queue.record_cloud_observation(job, mode="regular", remote_hash="A" * 40,
+                                            metadata={"is_unlim_upload": False, "verified": True})
+        with self.assertRaises(QueueBusyError):
+            self.queue.record_task_error(job.id, "cannot delete while running")
+        self.queue.release(job)
+        self.queue.request_control(job.id, "pause")
+        self.queue._db.execute("UPDATE jobs SET remove_requested=1 WHERE id=?", (job.id,))
+        receipt = self.queue.cloud_history(job.id)
+        result = self.queue.record_task_error(job.id, "Не удалось переместить файл в корзину")
+        self.assertEqual(result["status"], "failed")
+        self.assertIsNone(result["next_attempt"])
+        self.assertTrue(result["cloud_present"])
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["remove_requested"])
+        self.assertEqual(self.queue.cloud_history(job.id), receipt)
+        self.assertEqual(self.queue.jobs_summary("failed")["total"], 1)
+        self.assertEqual(self.queue.jobs_summary("uploaded_regular")["total"], 1)
+        self.queue.request_control(job.id, "start")
+        resumed = self.queue.claim(job_id=job.id)
+        self.assertEqual(self.queue.get_commit_intent(resumed)["storage_observation"]["mode"], "regular")
+        self.queue.release(resumed)
+
+    def schema_three_policy_fixture(self):
+        self.queue._db.execute("DROP TABLE cloud_observations")
+        for name in ("jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry_unlimited", "jobs_retry_regular",
+                     "jobs_reconcile", "jobs_current_created", "jobs_current_status_created", "jobs_paused_created",
+                     "jobs_observed_created"):
+            self.queue._db.execute(f"DROP INDEX {name}")
+        for column in ("planned_mode", "planned_reason", "observed_mode", "cloud_present", "cloud_path", "cloud_hash",
+                       "cloud_size", "cloud_verified", "cloud_observed_at", "cloud_deleted_at"):
+            self.queue._db.execute(f"ALTER TABLE jobs DROP COLUMN {column}")
+        self.queue._db.execute("DELETE FROM metadata WHERE key='_media_policy_version'")
+        self.queue._db.execute("PRAGMA user_version=3")
+
+    def test_schema_three_migration_classifies_without_fabricating_acceptance_from_intent(self):
+        for name in ("unlimited.jpg", "ordinary.m4v", "unknown.jpg", "pending.m4v", "failed.jpg", "existing.jpg"):
+            self.photo(name)
+        self.queue.scan()
+        ids = {row["relative_path"]: row["id"] for row in self.queue.list_jobs()}
+        for name, mode, flag in (("unlimited.jpg", "unlimited", True), ("ordinary.m4v", "regular", False)):
+            job = self.queue.claim(job_id=ids[name])
+            self.queue.mark_uploaded(job, remote_hash="A" * 40,
+                                     verified_metadata={"storage_mode": mode, "is_unlim_upload": flag})
+        self.queue._db.execute("UPDATE jobs SET status='uploaded',storage_mode=NULL,verified_metadata='invalid json' WHERE id=?",
+                               (ids["unknown.jpg"],))
+        self.queue._db.execute("UPDATE jobs SET storage_mode='regular' WHERE id=?", (ids["pending.m4v"],))
+        self.queue._db.execute("UPDATE jobs SET status='failed',next_attempt=NULL,storage_mode='unlimited' WHERE id=?",
+                               (ids["failed.jpg"],))
+        self.queue._db.execute("UPDATE jobs SET status='skipped',skip_reason='remote_exists',remote_hash=? WHERE id=?",
+                               ("B" * 40, ids["existing.jpg"]))
+        self.schema_three_policy_fixture()
+        with Queue(self.db, destination="/Archive") as upgraded:
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(upgraded.get_job(ids["ordinary.m4v"])["planned_mode"], "regular")
+            self.assertFalse(upgraded.get_job(ids["pending.m4v"])["cloud_present"])
+            self.assertFalse(upgraded.get_job(ids["failed.jpg"])["cloud_present"])
+            self.assertEqual(upgraded.get_job(ids["unlimited.jpg"])["observed_mode"], "unlimited")
+            self.assertEqual(upgraded.get_job(ids["ordinary.m4v"])["observed_mode"], "regular")
+            self.assertEqual(upgraded.get_job(ids["unknown.jpg"])["observed_mode"], "unknown")
+            self.assertEqual(upgraded.get_job(ids["existing.jpg"])["observed_mode"], "unknown")
+            count = upgraded._db.execute("SELECT COUNT(*) FROM cloud_observations").fetchone()[0]
+            self.assertEqual(count, 4)
+            version = upgraded._db.execute("PRAGMA data_version").fetchone()[0]
+            with Queue(self.db, destination="/Archive") as reopened:
+                self.assertEqual(reopened._db.total_changes, 0)
+                self.assertEqual(reopened._db.execute("SELECT COUNT(*) FROM cloud_observations").fetchone()[0], count)
+            self.assertEqual(upgraded._db.execute("PRAGMA data_version").fetchone()[0], version)
+
+    def test_schema_three_policy_migration_rolls_back_all_new_fields_and_receipts(self):
+        self.photo()
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash="A" * 40)
+        self.schema_three_policy_fixture()
+        original = Queue._record_cloud_observation_row
+        def interrupted(queue, *args, **kwargs):
+            original(queue, *args, **kwargs)
+            raise OSError("migration interrupted")
+        with patch.object(Queue, "_record_cloud_observation_row", interrupted), self.assertRaises(OSError):
+            Queue(self.db, destination="/Archive")
+        self.assertEqual(self.queue._db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertNotIn("cloud_present", {row["name"] for row in self.queue._db.execute("PRAGMA table_info(jobs)")})
+        self.assertIsNone(self.queue._db.execute("SELECT 1 FROM sqlite_master WHERE name='cloud_observations'").fetchone())
+        with Queue(self.db, destination="/Archive") as upgraded:
+            self.assertEqual(upgraded.stats()["uploaded_unlimited_count"], 1)
+            self.assertEqual(len(upgraded.cloud_history(job.id)), 1)
+
     def test_partitioned_claim_cost_does_not_scan_an_unrelated_30000_job_prefix(self):
         target = self.photo("target.mp4")
         self.queue.scan()
@@ -2090,6 +2434,7 @@ class QueueTests(unittest.TestCase):
         for mode in ("unlimited", "regular"):
             target_size = 32 if mode == "unlimited" else UNLIMITED_MAX_BYTES + 1
             other_size = UNLIMITED_MAX_BYTES + 1 if mode == "unlimited" else 32
+            other_mode = "regular" if mode == "unlimited" else "unlimited"
             with target.open("r+b") as stream:
                 stream.truncate(target_size)
             snapshot = target.stat()
@@ -2097,13 +2442,13 @@ class QueueTests(unittest.TestCase):
                 with self.subTest(mode=mode, state=state):
                     with self.queue._transaction():
                         self.queue._db.execute(
-                            "UPDATE jobs SET size=?,status=?,claim_token=NULL,attempts=0,next_attempt=0 WHERE id<?",
-                            (other_size, state, target_id),
+                            "UPDATE jobs SET size=?,planned_mode=?,status=?,claim_token=NULL,attempts=0,next_attempt=0 WHERE id<?",
+                            (other_size, other_mode, state, target_id),
                         )
                         self.queue._db.execute(
                             "UPDATE jobs SET size=?,mtime_ns=?,device=?,inode=?,status=?,claim_token=NULL,"
-                            "attempts=0,next_attempt=0 WHERE id=?",
-                            (snapshot.st_size, snapshot.st_mtime_ns, snapshot.st_dev, str(snapshot.st_ino), state, target_id),
+                            "attempts=0,next_attempt=0,planned_mode=? WHERE id=?",
+                            (snapshot.st_size, snapshot.st_mtime_ns, snapshot.st_dev, str(snapshot.st_ino), state, mode, target_id),
                         )
                     steps = 0
                     def count_steps():

@@ -16,6 +16,7 @@ import dataclasses
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -26,26 +27,19 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 import unicodedata
 import uuid
 
-from .media import UNLIMITED_MAX_BYTES
+from .media import (
+    UNLIMITED_MAX_BYTES, MEDIA_POLICY_VERSION, MEDIA_EXTENSIONS, PHOTO_EXTENSIONS,
+    VIDEO_EXTENSIONS, LEGACY_PHOTO_EXTENSIONS, LEGACY_MEDIA_EXTENSIONS, classify_media,
+)
 
 
-# Discovery, not an assertion that every extension is eligible for unlimited
-# storage. A transport can pass a narrower, server-supported set to scan(). The
-# video list follows the mobile client's videoExtensions/MIME classification;
-# the server's per-file response remains the authority on storage eligibility.
-PHOTO_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif"})
-VIDEO_EXTENSIONS = frozenset({
-    ".mp4", ".3gp", ".3g2", ".3gpp", ".3gpp2", ".avi", ".vob", ".mov",
-    ".mkv", ".m2t", ".m2ts", ".ts", ".mts", ".f4v", ".flv", ".wmv", ".m4v",
-    ".mpg", ".ogv", ".webm", ".hevc",
-})
-MEDIA_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 STATES = ("pending", "running", "uploaded", "failed", "skipped")
-SCHEMA_VERSION = 3
+TASK_FILTERS = (*STATES, "paused", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown")
+SCHEMA_VERSION = 4
 _SCHEMA_OBJECTS = frozenset({
     ("table", "metadata"), ("table", "roots"), ("table", "scans"),
     ("table", "jobs"), ("table", "upload_results"), ("table", "commit_intents"),
-    ("table", "commit_evidence"),
+    ("table", "commit_evidence"), ("table", "cloud_observations"),
     ("index", "jobs_ready"), ("index", "jobs_pending"),
     ("index", "jobs_pending_unlimited"), ("index", "jobs_pending_regular"),
     ("index", "jobs_retry_unlimited"), ("index", "jobs_retry_regular"),
@@ -57,33 +51,50 @@ _SCHEMA_OBJECTS = frozenset({
     ("index", "commit_evidence_job"),
     ("index", "upload_results_origin"), ("index", "commit_evidence_origin"),
     ("index", "jobs_reconcile"),
+    ("index", "jobs_current_created"), ("index", "jobs_current_status_created"),
+    ("index", "jobs_paused_created"), ("index", "jobs_observed_created"),
+    ("index", "cloud_observations_job"), ("index", "cloud_observations_origin"),
 })
 _JOB_SUMMARY_COLUMNS = (
     "id,root_id,relative_path,local_path,remote_path,status,size,attempts,present,"
-    "last_error,skip_reason,next_attempt,uploaded_at,storage_mode,paused,remove_requested"
+    "last_error,skip_reason,next_attempt,uploaded_at,storage_mode,paused,remove_requested,created_at,"
+    "planned_mode,planned_reason,observed_mode,cloud_present,cloud_path,cloud_hash,cloud_size,"
+    "cloud_verified,cloud_observed_at,cloud_deleted_at"
 )
+_POLICY_COLUMNS = {
+    "planned_mode": "TEXT NOT NULL DEFAULT 'unlimited' CHECK(planned_mode IN ('unlimited','regular'))",
+    "planned_reason": "TEXT NOT NULL DEFAULT 'documented_format'",
+    "observed_mode": "TEXT CHECK(observed_mode IN ('unlimited','regular','unknown'))",
+    "cloud_present": "INTEGER NOT NULL DEFAULT 0 CHECK(cloud_present IN (0,1))",
+    "cloud_path": "TEXT", "cloud_hash": "TEXT", "cloud_size": "INTEGER",
+    "cloud_verified": "INTEGER NOT NULL DEFAULT 0 CHECK(cloud_verified IN (0,1))",
+    "cloud_observed_at": "REAL", "cloud_deleted_at": "REAL",
+}
 _UPLOAD_RESULT_COLUMNS = frozenset({
     "id", "job_id", "origin_job_id", "account_id", "local_path", "local_key", "remote_path",
     "source_size", "source_mtime_ns", "source_device", "source_inode",
     "remote_hash", "remote_id", "verified_metadata", "uploaded_at",
 })
 _STORAGE_MODES = ("unlimited", "regular")
+_OBSERVED_MODES = (*_STORAGE_MODES, "unknown")
 _SIZE_PARTITIONS = {
     "unlimited": f"size<={UNLIMITED_MAX_BYTES}",
     "regular": f"size>{UNLIMITED_MAX_BYTES}",
 }
 _LEGACY_LARGE_FILE_ERROR = "Файл больше 2 ГБ; он не отправлен обычной загрузкой."
 _LARGE_FILES_DISABLED_REASON = "Файл больше 2 ГБ: этот размер не поддерживается автозагрузкой."
+_REGULAR_SKIP_CODES = ("regular_size_disabled", "regular_format_disabled", "large_files_disabled")
 
 
 def _size_partition(storage_mode: str | None) -> str:
+    """A planned route, separate from observed storage or an old intent."""
     if storage_mode is None:
         return "1"
     if storage_mode not in _STORAGE_MODES:
         raise ValueError("storage_mode must be 'unlimited', 'regular', or None")
     # Literal predicates match the partial indexes. A parameterized threshold
     # cannot let SQLite prove that a partial index covers the entire query.
-    return _SIZE_PARTITIONS[storage_mode]
+    return "planned_mode='" + storage_mode + "'"
 
 
 def _normalize_extensions(values: Iterable[str]) -> frozenset[str]:
@@ -156,6 +167,8 @@ class Job:
     attempts: int
     claim_token: str
     storage_mode: str | None = None
+    planned_mode: str = "unlimited"
+    planned_reason: str = "documented_format"
 
 
 @dataclasses.dataclass(slots=True)
@@ -288,13 +301,14 @@ class Queue:
 
     def _initialize(self, account_id: str | None) -> None:
         schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        if schema_version not in (0, 1, 2, SCHEMA_VERSION):
+        if schema_version not in (0, 1, 2, 3, SCHEMA_VERSION):
             raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
         objects = {(row["type"], row["name"]) for row in self._db.execute(
             "SELECT type,name FROM sqlite_master WHERE type IN ('table','index')"
         )}
         job_columns = {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}
-        has_schema = (_SCHEMA_OBJECTS.issubset(objects) and {"storage_mode", "paused", "remove_requested"}.issubset(job_columns)
+        has_schema = (_SCHEMA_OBJECTS.issubset(objects)
+                      and {"storage_mode", "paused", "remove_requested", *_POLICY_COLUMNS}.issubset(job_columns)
                       and self._has_detached_upload_results())
         if ("table", "metadata") in objects:
             existing = self._get_meta("_destination")
@@ -302,12 +316,13 @@ class Queue:
             needs_account = account_id is not None and self._account_needs_binding(account_id)
             # Polling/read connections must neither take the writer lock nor
             # commit metadata. Schema inspection above is entirely read-only.
-            if has_schema and schema_version == SCHEMA_VERSION and existing is not None and not needs_account:
+            if (has_schema and schema_version == SCHEMA_VERSION and existing is not None and not needs_account
+                    and self._get_meta("_media_policy_version") == MEDIA_POLICY_VERSION):
                 return
         with self._transaction():
             # A second first-opener may have migrated while this one waited.
             schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-            if schema_version not in (0, 1, 2, SCHEMA_VERSION):
+            if schema_version not in (0, 1, 2, 3, SCHEMA_VERSION):
                 raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
             self._create_core_schema()
             existing = self._get_meta("_destination")
@@ -323,6 +338,11 @@ class Queue:
             for flag in ("paused", "remove_requested"):
                 if flag not in job_columns:
                     self._db.execute(f"ALTER TABLE jobs ADD COLUMN {flag} INTEGER NOT NULL DEFAULT 0 CHECK({flag} IN (0,1))")
+            added_policy_columns = False
+            for column, definition in _POLICY_COLUMNS.items():
+                if column not in job_columns:
+                    self._db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
+                    added_policy_columns = True
             for table in ("upload_results", "commit_evidence"):
                 columns = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
                 if "origin_job_id" not in columns:
@@ -339,6 +359,14 @@ class Queue:
                              "jobs_retry_unlimited", "jobs_retry_regular"):
                     self._db.execute(f"DROP INDEX IF EXISTS {name}")
                 self._preserve_job_ids()
+            if (added_policy_columns or self._get_meta("_media_policy_version") != MEDIA_POLICY_VERSION):
+                self._migrate_storage_policy()
+            if schema_version < 4 or added_policy_columns:
+                # These same names previously partitioned only by size. The
+                # new route also includes unsupported/unlisted extensions.
+                for name in ("jobs_pending_unlimited", "jobs_pending_regular",
+                             "jobs_retry_unlimited", "jobs_retry_regular", "jobs_reconcile"):
+                    self._db.execute(f"DROP INDEX IF EXISTS {name}")
             self._create_queue_indexes()
             if schema_version != SCHEMA_VERSION:
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -391,6 +419,18 @@ class Queue:
                 source_device INTEGER NOT NULL, source_inode TEXT NOT NULL,
                 cloud_hash TEXT NOT NULL, created_at REAL NOT NULL, recorded_at REAL NOT NULL,
                 intent_json TEXT NOT NULL, UNIQUE(intent_id,stage)
+            )""",
+            """CREATE TABLE IF NOT EXISTS cloud_observations (
+                id INTEGER PRIMARY KEY,
+                job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL, origin_job_id INTEGER,
+                event TEXT NOT NULL CHECK(event IN ('stored','deleted')),
+                account_id TEXT, local_path TEXT,
+                source_size INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL,
+                source_device INTEGER, source_inode TEXT,
+                remote_path TEXT NOT NULL, cloud_hash TEXT, cloud_size INTEGER NOT NULL,
+                remote_id TEXT, mode TEXT NOT NULL CHECK(mode IN ('unlimited','regular','unknown')),
+                verified INTEGER NOT NULL CHECK(verified IN (0,1)),
+                receipt_json TEXT NOT NULL, received_at REAL NOT NULL
             )""",
         )
         for statement in statements:
@@ -471,32 +511,86 @@ class Queue:
         self._db.execute("DROP TABLE upload_results")
         self._db.execute("ALTER TABLE upload_results_migration RENAME TO upload_results")
 
+    def _migrate_storage_policy(self) -> None:
+        """Classify legacy rows in bounded batches without inventing billing.
+
+        Only completed uploads or exact-content observations establish a
+        remote object's existence. A stored intent on a pending/failed task
+        proves neither acceptance nor a storage mode.
+        """
+        cursor = self._db.execute("SELECT * FROM jobs ORDER BY id")
+        while rows := cursor.fetchmany(500):
+            plans = []
+            for row in rows:
+                plan = classify_media(row["local_path"], row["size"])
+                plans.append((plan["mode"], plan["reason"], row["id"]))
+                if row["cloud_present"] or row["observed_mode"] is not None:
+                    continue
+                completed = row["status"] == "uploaded"
+                existing = row["status"] == "skipped" and row["skip_reason"] == "remote_exists"
+                if not completed and not existing:
+                    continue
+                try:
+                    evidence = json.loads(row["verified_metadata"] or "{}")
+                except (TypeError, ValueError):
+                    evidence = {}
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                mode = "unknown"
+                if completed:
+                    if evidence.get("is_unlim_upload") is True:
+                        mode = "unlimited"
+                    elif evidence.get("is_unlim_upload") is False:
+                        mode = "regular"
+                    elif row["storage_mode"] in _STORAGE_MODES:
+                        mode = row["storage_mode"]
+                    elif evidence.get("storage_mode") in _STORAGE_MODES:
+                        mode = evidence["storage_mode"]
+                receipt = {"migrated_from_completed_task": True, "verified": True,
+                           "previous_evidence": evidence}
+                when = row["uploaded_at"] if completed else evidence.get("observed_at")
+                if type(when) not in (int, float) or not math.isfinite(when) or when < 0:
+                    when = row["updated_at"]
+                self._record_cloud_observation_row(
+                    row, mode=mode, remote_hash=row["remote_hash"], remote_id=row["remote_id"],
+                    metadata=receipt, received_at=when,
+                )
+            self._db.executemany("UPDATE jobs SET planned_mode=?,planned_reason=? WHERE id=?", plans)
+        cursor.close()
+        self._put_meta("_media_policy_version", MEDIA_POLICY_VERSION)
+
     def _create_queue_indexes(self) -> None:
         statements = (
             "CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,present,next_attempt,id)",
             "CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0",
-            f"CREATE INDEX IF NOT EXISTS jobs_pending_unlimited ON jobs(id) "
-            f"WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 AND size<={UNLIMITED_MAX_BYTES}",
-            f"CREATE INDEX IF NOT EXISTS jobs_pending_regular ON jobs(id) "
-            f"WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 AND size>{UNLIMITED_MAX_BYTES}",
+            "CREATE INDEX IF NOT EXISTS jobs_pending_unlimited ON jobs(id) "
+            "WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 AND planned_mode='unlimited'",
+            "CREATE INDEX IF NOT EXISTS jobs_pending_regular ON jobs(id) "
+            "WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0 AND planned_mode='regular'",
             "CREATE INDEX IF NOT EXISTS jobs_retry ON jobs(next_attempt,id) "
             "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL",
-            f"CREATE INDEX IF NOT EXISTS jobs_retry_unlimited ON jobs(next_attempt,id) "
-            f"WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND size<={UNLIMITED_MAX_BYTES}",
-            f"CREATE INDEX IF NOT EXISTS jobs_retry_regular ON jobs(next_attempt,id) "
-            f"WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND size>{UNLIMITED_MAX_BYTES}",
+            "CREATE INDEX IF NOT EXISTS jobs_retry_unlimited ON jobs(next_attempt,id) "
+            "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND planned_mode='unlimited'",
+            "CREATE INDEX IF NOT EXISTS jobs_retry_regular ON jobs(next_attempt,id) "
+            "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND planned_mode='regular'",
             "CREATE INDEX IF NOT EXISTS jobs_root_scan ON jobs(root_id,seen_scan)",
             "CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,id)",
             "CREATE INDEX IF NOT EXISTS jobs_current ON jobs(id) WHERE present=1",
             "CREATE INDEX IF NOT EXISTS jobs_current_status ON jobs(status,id) WHERE present=1",
+            "CREATE INDEX IF NOT EXISTS jobs_current_created ON jobs(created_at,id) WHERE present=1",
+            "CREATE INDEX IF NOT EXISTS jobs_current_status_created ON jobs(status,created_at,id) WHERE present=1",
+            "CREATE INDEX IF NOT EXISTS jobs_paused_created ON jobs(created_at,id) WHERE present=1 AND paused=1",
+            "CREATE INDEX IF NOT EXISTS jobs_observed_created ON jobs(observed_mode,created_at,id) WHERE present=1 AND cloud_present=1",
             "CREATE INDEX IF NOT EXISTS jobs_source_identity ON jobs(root_id,device,inode,size,mtime_ns)",
             "CREATE INDEX IF NOT EXISTS jobs_paused ON jobs(id) WHERE present=1 AND paused=1",
             "CREATE INDEX IF NOT EXISTS upload_results_job ON upload_results(job_id)",
             "CREATE INDEX IF NOT EXISTS commit_evidence_job ON commit_evidence(job_id)",
             "CREATE INDEX IF NOT EXISTS upload_results_origin ON upload_results(origin_job_id)",
             "CREATE INDEX IF NOT EXISTS commit_evidence_origin ON commit_evidence(origin_job_id)",
+            "CREATE INDEX IF NOT EXISTS cloud_observations_job ON cloud_observations(job_id)",
+            "CREATE INDEX IF NOT EXISTS cloud_observations_origin ON cloud_observations(origin_job_id)",
             "CREATE INDEX IF NOT EXISTS jobs_reconcile ON jobs(id) WHERE present=1 AND paused=0 AND remove_requested=0 "
-            f"AND status IN ('pending','failed') AND size>0 AND size<={UNLIMITED_MAX_BYTES}",
+            "AND status IN ('pending','failed') AND cloud_present=0 AND size>0",
         )
         for statement in statements:
             self._db.execute(statement)
@@ -606,7 +700,8 @@ class Queue:
         """
         with self._mutex:
             stored = self._stored_discovery_extensions()
-            if stored is None or (stored == PHOTO_EXTENSIONS and self._get_meta("extensions_custom") is not True):
+            if stored is None or (stored in (PHOTO_EXTENSIONS, LEGACY_PHOTO_EXTENSIONS, LEGACY_MEDIA_EXTENSIONS)
+                                  and self._get_meta("extensions_custom") is not True):
                 return MEDIA_EXTENSIONS
             return stored
 
@@ -632,7 +727,7 @@ class Queue:
                 return False
             stored = self._stored_discovery_extensions()
             if stored is not None:
-                return stored == PHOTO_EXTENSIONS
+                return stored in (PHOTO_EXTENSIONS, LEGACY_PHOTO_EXTENSIONS, LEGACY_MEDIA_EXTENSIONS)
             last_scan = self._get_meta("last_scan")
             return isinstance(last_scan, dict) and last_scan.get("complete") is True
 
@@ -763,8 +858,8 @@ class Queue:
     @staticmethod
     def _task_dict(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
-        item["paused"] = bool(item["paused"])
-        item["remove_requested"] = bool(item["remove_requested"])
+        for field in ("paused", "remove_requested", "cloud_present", "cloud_verified"):
+            item[field] = bool(item[field])
         return item
 
     def request_control(self, job_id: int, action: str) -> dict[str, Any] | None:
@@ -774,8 +869,8 @@ class Queue:
         This short transaction can run from another thread/connection while
         the worker owns the run lock. Task removal never invalidates last_scan.
         """
-        if action not in ("pause", "resume", "remove"):
-            raise ValueError("Task action must be pause, resume, or remove")
+        if action not in ("pause", "resume", "start", "remove"):
+            raise ValueError("Task action must be pause, resume, start, or remove")
         with self._transaction():
             if self._get_meta("_scan_token"):
                 raise QueueBusyError("Wait for scanning to finish before changing tasks.")
@@ -800,6 +895,46 @@ class Queue:
                     "UPDATE jobs SET paused=0,status='pending',attempts=0,next_attempt=0,claim_token=NULL,"
                     "last_error=NULL,skip_reason=NULL,updated_at=? WHERE id=?", (time.time(), job_id),
                 )
+            return self._task_dict(self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+
+    def delete_task_final(self, job_id: int) -> bool:
+        """Remove one drained task, preserving every remote receipt.
+
+        File deletion belongs to the controller's explicit deletion operation.
+        This final queue step never touches local or remote files.
+        """
+        if type(job_id) is not int or job_id < 1:
+            raise ValueError("job_id must be a positive integer")
+        with self._transaction():
+            if self._get_meta("_scan_token"):
+                raise QueueBusyError("Wait for scanning to finish before deleting tasks.")
+            row = self._db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return False
+            if row["status"] == "running":
+                raise QueueBusyError("Stop this task and wait for its worker before deleting it.")
+            return bool(self._delete_tasks("jobs.id=?", (job_id,)))
+
+    def record_task_error(self, job_id: int, message: str) -> dict[str, Any]:
+        """Keep an idle task after an incomplete management/deletion action.
+
+        This is not a worker completion and must not fabricate a claim. The
+        cloud receipts, local presence, pause and source identity stay intact.
+        """
+        if type(job_id) is not int or job_id < 1:
+            raise ValueError("job_id must be a positive integer")
+        with self._transaction():
+            if self._get_meta("_scan_token"):
+                raise QueueBusyError("Wait for scanning to finish before changing tasks.")
+            row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                raise QueueConfigurationError(f"Unknown task: {job_id}")
+            if row["status"] == "running":
+                raise QueueBusyError("Stop this task and wait for its worker before recording an action error.")
+            self._db.execute(
+                "UPDATE jobs SET status='failed',next_attempt=NULL,claim_token=NULL,skip_reason=NULL,"
+                "remove_requested=0,last_error=?,updated_at=? WHERE id=?", (str(message)[:16384], time.time(), job_id),
+            )
             return self._task_dict(self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def task_control(self, job: Job) -> str | None:
@@ -875,7 +1010,7 @@ class Queue:
             now = time.time()
             try:
                 if selected_prefix != root["remote_prefix"]:
-                    mutable = ("root_id=? AND status<>'uploaded' AND NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists') AND NOT EXISTS "
+                    mutable = ("root_id=? AND cloud_present=0 AND status<>'uploaded' AND NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists') AND NOT EXISTS "
                                "(SELECT 1 FROM commit_intents WHERE job_id=jobs.id)")
                     # Temporarily free old keys inside this transaction. This
                     # permits a destination below the old prefix without false
@@ -1083,19 +1218,20 @@ class Queue:
         return row
 
     def _update_unchanged_source(self, row: sqlite3.Row, values: tuple, scan_id: int, now: float) -> None:
-        frozen = (row["status"] == "uploaded" or (row["status"] == "skipped" and row["skip_reason"] == "remote_exists") or self._db.execute(
+        frozen = (row["cloud_present"] or row["status"] == "uploaded" or (row["status"] == "skipped" and row["skip_reason"] == "remote_exists") or self._db.execute(
             "SELECT 1 FROM commit_intents WHERE job_id=?", (row["id"],)).fetchone() is not None)
         remote_path = row["remote_path"] if frozen else values[4]
         remote_key = row["remote_key"] if frozen else values[5]
+        plan = classify_media(values[2], values[6])
         self._db.execute(
             "UPDATE jobs SET relative_path=?,local_path=?,local_key=?,remote_path=?,remote_key=?,"
-            "seen_scan=?,present=1,updated_at=?,"
+            "seen_scan=?,present=1,updated_at=?,planned_mode=?,planned_reason=?,"
             "status=CASE WHEN (status='skipped' AND skip_reason='missing') OR "
             "(status='failed' AND skip_reason='source_changed') THEN 'pending' ELSE status END,"
             "next_attempt=CASE WHEN skip_reason IN ('missing','source_changed') THEN 0 ELSE next_attempt END,"
             "last_error=CASE WHEN skip_reason IN ('missing','source_changed') THEN NULL ELSE last_error END,"
             "skip_reason=CASE WHEN skip_reason IN ('missing','source_changed') THEN NULL ELSE skip_reason END WHERE id=?",
-            values[1:4] + (remote_path, remote_key, scan_id, now, row["id"]),
+            values[1:4] + (remote_path, remote_key, scan_id, now, plan["mode"], plan["reason"], row["id"]),
         )
 
     def _ingest(self, batch: list[tuple], result: ScanResult) -> None:
@@ -1105,6 +1241,7 @@ class Queue:
             next_id = highest_id + 1
             for values in batch:
                 result.seen += 1
+                plan = classify_media(values[2], values[6])
                 # A name collision must not leave half an update behind, such
                 # as removing an intent before a later UNIQUE check fails.
                 self._db.execute("SAVEPOINT ingest_task")
@@ -1118,9 +1255,9 @@ class Queue:
                         else:
                             self._db.execute(
                                 "INSERT INTO jobs(id,root_id,relative_path,local_path,local_key,remote_path,remote_key,"
-                                "size,mtime_ns,device,inode,created_at,updated_at,seen_scan,next_attempt) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                                (next_id,) + values + (now, now, result.scan_id),
+                                "size,mtime_ns,device,inode,created_at,updated_at,seen_scan,planned_mode,planned_reason,next_attempt) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                                (next_id,) + values + (now, now, result.scan_id, plan["mode"], plan["reason"]),
                             )
                             next_id += 1
                             result.added += 1
@@ -1135,8 +1272,10 @@ class Queue:
                                 "size=?,mtime_ns=?,device=?,inode=?,status='pending',attempts=0,"
                                 "next_attempt=0,claim_token=NULL,last_error='Source changed since previous scan',"
                                 "skip_reason=NULL,remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,"
+                                "observed_mode=NULL,cloud_present=0,cloud_path=NULL,cloud_hash=NULL,cloud_size=NULL,"
+                                "cloud_verified=0,cloud_observed_at=NULL,cloud_deleted_at=NULL,planned_mode=?,planned_reason=?,"
                                 "seen_scan=?,present=1,updated_at=? WHERE id=?",
-                                values[1:10] + (result.scan_id, now, row["id"]),
+                                values[1:10] + (plan["mode"], plan["reason"], result.scan_id, now, row["id"]),
                             )
                             result.changed += 1
                         else:
@@ -1155,11 +1294,12 @@ class Queue:
         return Job(
             row["id"], row["root_id"], row["local_path"], row["remote_path"], row["relative_path"],
             row["size"], row["mtime_ns"], row["device"], int(row["inode"]), attempts, token,
-            row["storage_mode"],
+            row["storage_mode"], row["planned_mode"], row["planned_reason"],
         )
 
     def claim(self, *, now: float | None = None, max_attempts: int | None = None,
-              storage_mode: str | None = None, stop: threading.Event | None = None) -> Job | None:
+              storage_mode: str | None = None, stop: threading.Event | None = None,
+              job_id: int | None = None) -> Job | None:
         """Claim one ready file and validate the local snapshot before returning.
 
         None means no work is *currently* ready or the supplied stop is set,
@@ -1168,6 +1308,8 @@ class Queue:
         """
         if max_attempts is not None and max_attempts < 1:
             raise ValueError("max_attempts must be positive")
+        if job_id is not None and (type(job_id) is not int or job_id < 1):
+            raise ValueError("job_id must be a positive integer or None")
         partition = _size_partition(storage_mode)
         pending_index = "jobs_pending" if storage_mode is None else f"jobs_pending_{storage_mode}"
         retry_index = " INDEXED BY jobs_retry" if storage_mode is None else f" INDEXED BY jobs_retry_{storage_mode}"
@@ -1184,20 +1326,30 @@ class Queue:
                 # Separate indexed LIMIT queries are intentional.  One OR
                 # query plus ORDER BY id makes SQLite sort the entire ready
                 # queue on *every* claim (quadratic at 300,000 photographs).
-                row = self._db.execute(
-                    f"SELECT * FROM jobs{retry_index} WHERE status='failed' AND present=1 "
-                    "AND paused=0 AND remove_requested=0 "
-                    "AND next_attempt IS NOT NULL AND next_attempt<=? "
-                    f"AND {partition} AND (? IS NULL OR attempts<?) ORDER BY next_attempt,id LIMIT 1",
-                    (current, max_attempts, max_attempts),
-                ).fetchone()
-                if row is None:
+                if job_id is not None:
+                    # The PRIMARY KEY lookup is independent of queue length.
+                    # An invalid target must never fall through to neighbours.
                     row = self._db.execute(
-                        f"SELECT * FROM jobs INDEXED BY {pending_index} WHERE status='pending' AND present=1 "
-                        "AND paused=0 AND remove_requested=0 "
-                        f"AND {partition} AND (? IS NULL OR attempts<?) ORDER BY id LIMIT 1",
-                        (max_attempts, max_attempts),
+                        "SELECT * FROM jobs WHERE id=? AND present=1 AND paused=0 AND remove_requested=0 "
+                        "AND (status='pending' OR (status='failed' AND next_attempt IS NOT NULL AND next_attempt<=?)) "
+                        f"AND {partition} AND (? IS NULL OR attempts<?)",
+                        (job_id, current, max_attempts, max_attempts),
                     ).fetchone()
+                else:
+                    row = self._db.execute(
+                        f"SELECT * FROM jobs{retry_index} WHERE status='failed' AND present=1 "
+                        "AND paused=0 AND remove_requested=0 "
+                        "AND next_attempt IS NOT NULL AND next_attempt<=? "
+                        f"AND {partition} AND (? IS NULL OR attempts<?) ORDER BY next_attempt,id LIMIT 1",
+                        (current, max_attempts, max_attempts),
+                    ).fetchone()
+                    if row is None:
+                        row = self._db.execute(
+                            f"SELECT * FROM jobs INDEXED BY {pending_index} WHERE status='pending' AND present=1 "
+                            "AND paused=0 AND remove_requested=0 "
+                            f"AND {partition} AND (? IS NULL OR attempts<?) ORDER BY id LIMIT 1",
+                            (max_attempts, max_attempts),
+                        ).fetchone()
                 if row is None:
                     return None
                 token = uuid.uuid4().hex
@@ -1210,12 +1362,18 @@ class Queue:
             try:
                 snapshot = self._inspect_source(job)
             except SourceUnavailableError:
+                if job_id is not None:
+                    return None
                 continue
             if snapshot is None:
                 self._invalidate_claim(job, None)
+                if job_id is not None:
+                    return None
                 continue
             if snapshot != _job_snapshot(job):
-                self._invalidate_claim(job, snapshot, retry=job.id not in refreshed)
+                self._invalidate_claim(job, snapshot, retry=job_id is None and job.id not in refreshed)
+                if job_id is not None:
+                    return None
                 refreshed.add(job.id)
                 continue
             return job
@@ -1276,14 +1434,18 @@ class Queue:
                     self._finalize_control(job.id)
                     return
                 self._drop_intent(job.id)
+                plan = classify_media(job.local_path, snapshot[0])
                 self._db.execute(
                     "UPDATE jobs SET size=?,mtime_ns=?,device=?,inode=?,status=?,attempts=0,next_attempt=?,"
                     "claim_token=NULL,last_error='Source changed; any remote partial result must be reconciled',"
                     "remote_hash=NULL,remote_id=NULL,verified_metadata=NULL,uploaded_at=NULL,storage_mode=NULL,skip_reason=?,updated_at=?,"
-                    "remote_path=?,remote_key=? "
+                    "remote_path=?,remote_key=?,planned_mode=?,planned_reason=?,"
+                    "observed_mode=NULL,cloud_present=0,cloud_path=NULL,cloud_hash=NULL,cloud_size=NULL,"
+                    "cloud_verified=0,cloud_observed_at=NULL,cloud_deleted_at=NULL "
                     "WHERE id=?",
                     snapshot[:3] + (str(snapshot[3]), "pending" if retry else "failed", 0 if retry else None,
-                                    None if retry else "source_changed", time.time(), remote, _remote_key(remote), job.id),
+                                    None if retry else "source_changed", time.time(), remote, _remote_key(remote),
+                                    plan["mode"], plan["reason"], job.id),
                 )
             self._finalize_control(job.id)
 
@@ -1344,7 +1506,7 @@ class Queue:
     def get_commit_intent(self, job: Job) -> dict[str, Any] | None:
         """Return only an intent matching this current claim's account/source."""
         with self._transaction():
-            self._require_claim(job)
+            claimed = self._require_claim(job)
             row = self._db.execute("SELECT * FROM commit_intents WHERE job_id=?", (job.id,)).fetchone()
             if row is None:
                 return None
@@ -1362,7 +1524,33 @@ class Queue:
                 return None
             # Schema-1 clients before regular uploads only wrote unlimited
             # intents. Normalize them in memory without making every read write.
-            return {"storage_mode": "unlimited", **intent}
+            result = {"storage_mode": "unlimited", **intent}
+            # A negative or missing server flag must survive retry/restart.
+            # Do not expose receipts for an object already sent to the bin;
+            # its next add attempt needs a fresh server response.
+            result.pop("storage_observation", None)
+            if (claimed["cloud_present"] and claimed["cloud_hash"]
+                    and claimed["cloud_hash"].casefold() == row["cloud_hash"].casefold()):
+                result["storage_observation"] = {
+                    "mode": claimed["observed_mode"], "hash": claimed["cloud_hash"],
+                    "size": claimed["cloud_size"], "path": claimed["cloud_path"],
+                    "verified": bool(claimed["cloud_verified"]), "received_at": claimed["cloud_observed_at"],
+                }
+                receipt_row = self._db.execute(
+                    "SELECT receipt_json,remote_id FROM cloud_observations WHERE job_id=? AND event='stored' "
+                    "AND cloud_hash=? AND remote_path=? ORDER BY id DESC LIMIT 1",
+                    (job.id, claimed["cloud_hash"], claimed["cloud_path"]),
+                ).fetchone()
+                if receipt_row is not None:
+                    receipt = json.loads(receipt_row["receipt_json"])
+                    if type(receipt.get("is_unlim_upload")) is bool:
+                        result["storage_observation"]["is_unlim_upload"] = receipt["is_unlim_upload"]
+                    if receipt.get("commit_accepted") is True:
+                        result["storage_observation"]["commit_accepted"] = True
+                    node_id = receipt.get("nodeid", receipt_row["remote_id"])
+                    if isinstance(node_id, str) and node_id:
+                        result["storage_observation"]["nodeid"] = node_id
+            return result
 
     def confirm_unlimited_commit(self, job: Job, cloud_hash: str) -> None:
         """Persist the server's explicit unlimited confirmation before stat.
@@ -1423,6 +1611,105 @@ class Queue:
             self._invalidate_claim(job, snapshot)
             raise FileChangedError(f"Source changed after saving {storage_mode} confirmation: {job.local_path}")
 
+    def _record_cloud_observation_row(
+        self, row: sqlite3.Row, *, mode: str, remote_hash: str | None,
+        remote_id: str | None = None, metadata: Mapping[str, Any] | None = None,
+        received_at: float | None = None,
+    ) -> None:
+        """Append a receipt and update the current projection, in a transaction.
+
+        This is separate from upload_results. The response may be durable
+        before stat/hash validation and may contradict the planned route.
+        The optional hash supports incomplete finished legacy records; new
+        public observations require a real hash.
+        """
+        if mode not in _OBSERVED_MODES:
+            raise ValueError("mode must be unlimited, regular, or unknown")
+        receipt = dict(metadata or {})
+        verified = receipt.get("verified") is True
+        remote_path = _destination(receipt.get("path", receipt.get("remote_path", row["remote_path"])))
+        cloud_size = receipt.get("size", row["size"])
+        if type(cloud_size) is not int or cloud_size < 0:
+            raise ValueError("Observed cloud size must be a nonnegative integer")
+        now = time.time() if received_at is None else received_at
+        encoded = json.dumps(receipt, ensure_ascii=False, allow_nan=False)
+        cloud_hash = remote_hash.upper() if isinstance(remote_hash, str) else None
+        self._db.execute(
+            "INSERT INTO cloud_observations(job_id,origin_job_id,event,account_id,local_path,"
+            "source_size,source_mtime_ns,source_device,source_inode,remote_path,cloud_hash,cloud_size,"
+            "remote_id,mode,verified,receipt_json,received_at) VALUES(?,?,'stored',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (row["id"], row["id"], self._get_meta("_account_id"), row["local_path"],
+             row["size"], row["mtime_ns"], row["device"], row["inode"], remote_path, cloud_hash,
+             cloud_size, remote_id, mode, int(verified), encoded, now),
+        )
+        self._db.execute(
+            "UPDATE jobs SET observed_mode=?,cloud_present=1,cloud_path=?,cloud_hash=?,cloud_size=?,"
+            "cloud_verified=?,cloud_observed_at=?,cloud_deleted_at=NULL WHERE id=?",
+            (mode, remote_path, cloud_hash, cloud_size, int(verified), now, row["id"]),
+        )
+
+    def record_cloud_observation(
+        self, job: Job, *, mode: str, remote_hash: str,
+        remote_id: str | None = None, metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Persist the server's add response immediately, before final stat.
+
+        mode describes the actual response, not the route requested by the
+        client. An absent boolean flag is unknown. This method neither marks
+        the task successful nor alters its claim or commit confirmation.
+        """
+        if mode not in _OBSERVED_MODES:
+            raise ValueError("mode must be unlimited, regular, or unknown")
+        if (not isinstance(remote_hash, str) or not remote_hash
+                or any(char in remote_hash for char in ("\x00", "\n", "\r"))):
+            raise ValueError("remote_hash must be a nonempty hash string")
+        receipt = dict(metadata or {})
+        flag = receipt.get("is_unlim_upload")
+        if type(flag) is bool and mode != ("unlimited" if flag else "regular"):
+            raise QueueError("Observed storage mode contradicts the server's boolean flag.")
+        with self._transaction():
+            row = self._require_claim(job)
+            if not self._get_meta("_account_id"):
+                raise QueueConfigurationError("Bind the authenticated account before recording a cloud response.")
+            self._record_cloud_observation_row(
+                row, mode=mode, remote_hash=remote_hash, remote_id=remote_id, metadata=receipt,
+            )
+
+    def mark_cloud_deleted(self, job_id: int, *, expected_hash: str,
+                           expected_path: str | None = None) -> bool:
+        """Record confirmed removal of precisely the observed cloud object.
+
+        A mismatched or superseded observation is not cleared. The caller
+        performs and validates the remote recycle-bin operation first.
+        """
+        if not isinstance(expected_hash, str) or not expected_hash:
+            raise ValueError("expected_hash must be a nonempty hash string")
+        if expected_path is not None:
+            expected_path = _destination(expected_path)
+        with self._transaction():
+            row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if (row is None or not row["cloud_hash"]
+                    or row["cloud_hash"].casefold() != expected_hash.casefold()
+                    or (expected_path is not None and row["cloud_path"] != expected_path)):
+                return False
+            if not row["cloud_present"]:
+                return row["cloud_deleted_at"] is not None
+            now = time.time()
+            receipt = json.dumps({"recycle_bin_confirmed": True, "path": row["cloud_path"],
+                                  "hash": row["cloud_hash"]}, ensure_ascii=False, allow_nan=False)
+            self._db.execute(
+                "INSERT INTO cloud_observations(job_id,origin_job_id,event,account_id,local_path,"
+                "source_size,source_mtime_ns,source_device,source_inode,remote_path,cloud_hash,cloud_size,"
+                "remote_id,mode,verified,receipt_json,received_at) VALUES(?,?,'deleted',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, job_id, self._get_meta("_account_id"), row["local_path"], row["size"],
+                 row["mtime_ns"], row["device"], row["inode"], row["cloud_path"], row["cloud_hash"],
+                 row["cloud_size"], row["remote_id"], row["observed_mode"], row["cloud_verified"], receipt, now),
+            )
+            self._db.execute(
+                "UPDATE jobs SET cloud_present=0,cloud_deleted_at=?,updated_at=? WHERE id=?", (now, now, job_id),
+            )
+            return True
+
     def mark_uploaded(
         self,
         job: Job,
@@ -1443,12 +1730,18 @@ class Queue:
             raise ValueError("verified_metadata.storage_mode must be 'unlimited' or 'regular'")
         if storage_mode == "regular" and metadata.get("is_unlim_upload") is True:
             raise QueueError("A regular upload cannot carry an unlimited confirmation.")
+        if storage_mode == "unlimited" and metadata.get("is_unlim_upload") is False:
+            raise QueueError("An unlimited upload cannot carry a negative unlimited confirmation.")
         evidence = json.dumps(metadata, ensure_ascii=False, allow_nan=False)
         now = time.time()
         with self._transaction():
             claimed = self._require_claim(job)
             if claimed["storage_mode"] not in (None, storage_mode):
                 raise QueueError("Verified storage mode does not match the saved commit intent.")
+            self._record_cloud_observation_row(
+                claimed, mode=storage_mode, remote_hash=remote_hash, remote_id=remote_id,
+                metadata={**metadata, "verified": True}, received_at=now,
+            )
             self._db.execute(
                 "INSERT INTO upload_results(job_id,origin_job_id,account_id,local_path,local_key,remote_path,"
                 "source_size,source_mtime_ns,source_device,source_inode,remote_hash,remote_id,verified_metadata,uploaded_at) "
@@ -1489,13 +1782,47 @@ class Queue:
             raise ValueError("A nonempty skip code is required")
         with self._transaction():
             self._require_claim(job)
-            if code != "large_files_disabled":
+            if code not in _REGULAR_SKIP_CODES:
                 self._drop_intent(job.id)
             self._db.execute(
                 "UPDATE jobs SET status='skipped',skip_reason=?,claim_token=NULL,last_error=?,"
                 "next_attempt=NULL,updated_at=? WHERE id=?", (code, str(reason)[:16384], time.time(), job.id),
             )
             self._finalize_control(job.id)
+
+    def apply_regular_policy(self, upload: bool) -> dict[str, int]:
+        """Reversibly park files planned for quota storage when it is disabled.
+
+        Completed work, live workers, permanent errors, existing cloud
+        observations and their receipts are untouched. A policy change never
+        needs a filesystem rescan and preserves individual pause flags.
+        """
+        if type(upload) is not bool:
+            raise ValueError("upload must be a boolean")
+        codes = "('regular_size_disabled','regular_format_disabled','large_files_disabled')"
+        now = time.time()
+        with self._transaction():
+            resumed = self._db.execute(
+                "UPDATE jobs SET status='pending',attempts=0,next_attempt=0,claim_token=NULL,"
+                "last_error=NULL,skip_reason=NULL,updated_at=? WHERE present=1 AND remove_requested=0 "
+                "AND cloud_present=0 AND status='skipped' "
+                f"AND (skip_reason IN {codes} OR (skip_reason='manual' AND last_error=?)) "
+                "AND (? OR planned_mode='unlimited')",
+                (now, _LEGACY_LARGE_FILE_ERROR, int(upload)),
+            ).rowcount
+            skipped = 0
+            if not upload:
+                skipped = self._db.execute(
+                    "UPDATE jobs SET status='skipped',claim_token=NULL,next_attempt=NULL,updated_at=?,"
+                    "skip_reason=CASE WHEN planned_reason='size_limit' THEN 'regular_size_disabled' "
+                    "ELSE 'regular_format_disabled' END,"
+                    "last_error=CASE WHEN planned_reason='size_limit' THEN ? ELSE ? END "
+                    "WHERE present=1 AND remove_requested=0 AND cloud_present=0 AND planned_mode='regular' "
+                    "AND (status='pending' OR (status='failed' AND next_attempt IS NOT NULL))",
+                    (now, "Файл больше 2 ГБ; загрузка в хранилище с квотой отключена.",
+                     "Формат не входит в подтверждённый клиентом список; загрузка в хранилище с квотой отключена."),
+                ).rowcount
+            return {"skipped": skipped, "resumed": resumed}
 
     def skip_large_disabled(self) -> int:
         """Park oversized ready/retryable files without losing commit evidence.
@@ -1507,7 +1834,7 @@ class Queue:
             return self._db.execute(
                 "UPDATE jobs SET status='skipped',skip_reason='large_files_disabled',claim_token=NULL,"
                 "last_error=?,next_attempt=NULL,updated_at=? "
-                f"WHERE present=1 AND paused=0 AND remove_requested=0 AND {_SIZE_PARTITIONS['regular']} AND "
+                f"WHERE present=1 AND paused=0 AND remove_requested=0 AND cloud_present=0 AND {_SIZE_PARTITIONS['regular']} AND "
                 "(status='pending' OR (status='failed' AND next_attempt IS NOT NULL))",
                 (_LARGE_FILES_DISABLED_REASON, time.time()),
             ).rowcount
@@ -1522,7 +1849,7 @@ class Queue:
             return self._db.execute(
                 "UPDATE jobs SET status='pending',attempts=0,next_attempt=0,claim_token=NULL,"
                 "last_error=NULL,skip_reason=NULL,updated_at=? "
-                f"WHERE present=1 AND paused=0 AND remove_requested=0 AND {_SIZE_PARTITIONS['regular']} AND status='skipped' AND "
+                f"WHERE present=1 AND paused=0 AND remove_requested=0 AND cloud_present=0 AND {_SIZE_PARTITIONS['regular']} AND status='skipped' AND "
                 "(skip_reason='large_files_disabled' OR (skip_reason='manual' AND last_error=?))",
                 (time.time(), _LEGACY_LARGE_FILE_ERROR),
             ).rowcount
@@ -1582,7 +1909,7 @@ class Queue:
             return [dict(row) for row in self._db.execute(
                 "SELECT id,root_id,relative_path,local_path,remote_path,size,mtime_ns,device,inode "
                 "FROM jobs INDEXED BY jobs_reconcile WHERE id>? AND present=1 AND paused=0 AND remove_requested=0 "
-                f"AND status IN ('pending','failed') AND size>0 AND size<={UNLIMITED_MAX_BYTES} "
+                "AND status IN ('pending','failed') AND cloud_present=0 AND size>0 "
                 "AND NOT EXISTS (SELECT 1 FROM commit_intents WHERE job_id=jobs.id) ORDER BY id LIMIT ?",
                 (after_id, limit),
             )]
@@ -1598,7 +1925,7 @@ class Queue:
                 or any(char not in "0123456789abcdefABCDEF" for char in remote_hash)):
             raise ValueError("A valid Mail Cloud hash is required")
         expected = (candidate["size"], candidate["mtime_ns"], candidate["device"], int(candidate["inode"]))
-        if not 0 < expected[0] <= UNLIMITED_MAX_BYTES:
+        if expected[0] <= 0:
             return False
         with self._transaction():
             account = self._get_meta("_account_id")
@@ -1607,7 +1934,7 @@ class Queue:
             if self._get_meta("_scan_token"):
                 raise QueueBusyError("Wait for scanning to finish before comparing cloud files.")
             row = self._db.execute("SELECT * FROM jobs WHERE id=?", (candidate["id"],)).fetchone()
-            if (row is None or not row["present"] or row["paused"] or row["remove_requested"]
+            if (row is None or not row["present"] or row["paused"] or row["remove_requested"] or row["cloud_present"]
                     or row["status"] not in ("pending", "failed")
                     or any(row[key] != candidate[key] for key in ("root_id", "relative_path", "local_path", "remote_path"))
                     or (row["size"], row["mtime_ns"], row["device"], int(row["inode"])) != expected
@@ -1621,8 +1948,12 @@ class Queue:
             observation = {
                 "remote_exists": True, "account_id": account, "path": row["remote_path"],
                 "hash": remote_hash.upper(), "size": row["size"], "observed_at": time.time(),
-                "quota_status": "unknown",
+                "quota_status": "unknown", "verified": True,
             }
+            self._record_cloud_observation_row(
+                row, mode="unknown", remote_hash=remote_hash, metadata=observation,
+                received_at=observation["observed_at"],
+            )
             self._db.execute(
                 "UPDATE jobs SET status='skipped',skip_reason='remote_exists',claim_token=NULL,"
                 "next_attempt=NULL,last_error=NULL,remote_hash=?,remote_id=NULL,verified_metadata=?,"
@@ -1669,6 +2000,30 @@ class Queue:
                 "COALESCE(SUM(CASE WHEN status IN ('uploaded','skipped') OR "
                 f"(status='failed' AND next_attempt IS NULL) THEN size ELSE 0 END),0) AS processed_bytes FROM jobs WHERE {selected}"
             ).fetchone()
+            # Planned bytes represent transfers still to do. A failed task
+            # with an accepted cloud object belongs only to observed totals,
+            # including an explicit false flag that consumed quota.
+            planned = ("cloud_present=0 AND (status IN ('pending','running','failed') OR "
+                       "(status='skipped' AND skip_reason IN "
+                       "('regular_size_disabled','regular_format_disabled','large_files_disabled')))")
+            expressions = []
+            for mode in _STORAGE_MODES:
+                for suffix, amount in (("count", "1"), ("bytes", "size")):
+                    expressions.append(
+                        f"COALESCE(SUM(CASE WHEN planned_mode='{mode}' AND ({planned}) "
+                        f"THEN {amount} ELSE 0 END),0) AS planned_{mode}_{suffix}"
+                    )
+            for mode in _OBSERVED_MODES:
+                for suffix, amount in (("count", "1"), ("bytes", "COALESCE(cloud_size,size)")):
+                    expressions.append(
+                        f"COALESCE(SUM(CASE WHEN cloud_present=1 AND observed_mode='{mode}' "
+                        f"THEN {amount} ELSE 0 END),0) AS uploaded_{mode}_{suffix}"
+                    )
+            storage = dict(self._db.execute(
+                "SELECT " + ",".join(expressions) + f" FROM jobs WHERE {selected}",
+            ).fetchone())
+            for suffix in ("count", "bytes"):
+                storage[f"uploaded_total_{suffix}"] = sum(storage[f"uploaded_{mode}_{suffix}"] for mode in _OBSERVED_MODES)
             return {
                 **counts, "total": sum(counts.values()), "total_bytes": sum(sizes.values()),
                 "uploaded_bytes": sizes["uploaded"], "bytes_by_status": sizes,
@@ -1676,32 +2031,65 @@ class Queue:
                 "existing": existing,
                 "scan_active": bool(self._get_meta("_scan_token")),
                 "roots": self._db.execute("SELECT COUNT(*) FROM roots").fetchone()[0],
-                **dict(controls),
+                **dict(controls), **storage,
             }
 
-    def list_jobs(self, status: str | None = None, *, limit: int = 100, offset: int = 0,
-                  summary: bool = False, include_missing: bool = False) -> list[dict[str, Any]]:
-        if status is not None and status not in (*STATES, "paused"):
+    @staticmethod
+    def _task_filter(status: str | None, *, include_missing: bool) -> tuple[str, list[Any]]:
+        if status is not None and status not in TASK_FILTERS:
             raise ValueError(f"Unknown status: {status}")
-        if not 1 <= limit <= 10000 or offset < 0:
+        conditions = [] if include_missing else ["present=1"]
+        parameters: list[Any] = []
+        if status == "paused":
+            conditions.append("paused=1")
+        elif status in ("uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
+            conditions.extend(("cloud_present=1", "observed_mode=?"))
+            parameters.append(status.removeprefix("uploaded_"))
+        elif status is not None:
+            conditions.append("status=?")
+            parameters.append(status)
+        return " AND ".join(conditions) or "1", parameters
+
+    def list_jobs(self, status: str | None = None, *, limit: int = 100, offset: int = 0,
+                  summary: bool = False, include_missing: bool = False,
+                  sort: str = "asc") -> list[dict[str, Any]]:
+        if type(limit) is not int or type(offset) is not int or not 1 <= limit <= 10000 or offset < 0:
             raise ValueError("limit must be in 1..10000 and offset nonnegative")
+        if sort not in ("asc", "desc"):
+            raise ValueError("sort must be asc or desc")
         # A fixed projection keeps persisted verification evidence out of UI
         # polling. The default retains the complete records used by the CLI.
         columns = _JOB_SUMMARY_COLUMNS if summary else "*"
-        conditions = [] if include_missing else ["present=1"]
-        parameters = []
-        if status is not None:
-            if status == "paused":
-                conditions.append("paused=1")
-            else:
-                conditions.append("status=?")
-                parameters.append(status)
-        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        where, parameters = self._task_filter(status, include_missing=include_missing)
         parameters.extend((limit, offset))
         with self._mutex:
             return [self._task_dict(row) for row in self._db.execute(
-                f"SELECT {columns} FROM jobs{where} ORDER BY id LIMIT ? OFFSET ?",
+                f"SELECT {columns} FROM jobs WHERE {where} ORDER BY created_at {sort},id {sort} LIMIT ? OFFSET ?",
                 parameters,
+            )]
+
+    def jobs_summary(self, status: str | None = None, *, include_missing: bool = False) -> dict[str, int]:
+        """Totals for the complete selected tab, independent of pagination."""
+        where, parameters = self._task_filter(status, include_missing=include_missing)
+        with self._mutex:
+            return dict(self._db.execute(
+                f"SELECT COUNT(*) AS total,COALESCE(SUM(size),0) AS total_bytes FROM jobs WHERE {where}", parameters,
+            ).fetchone())
+
+    def iter_tasks(self, *, after_id: int = 0, limit: int = 500, status: str | None = None,
+                   include_missing: bool = True) -> list[dict[str, Any]]:
+        """One bounded keyset page for deletion/snapshot operations.
+
+        Unlike UI sorting this always follows the stable primary key. Rows
+        disappear safely while an operation advances through the snapshot;
+        task IDs are never reused.
+        """
+        if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("after_id must be nonnegative and limit must be in 1..500")
+        where, parameters = self._task_filter(status, include_missing=include_missing)
+        with self._mutex:
+            return [self._task_dict(row) for row in self._db.execute(
+                f"SELECT * FROM jobs WHERE id>? AND ({where}) ORDER BY id LIMIT ?", (after_id, *parameters, limit),
             )]
 
     def get_job(self, job_id: int, *, include_missing: bool = False) -> dict[str, Any] | None:
@@ -1720,6 +2108,21 @@ class Queue:
             return [dict(row) for row in self._db.execute(
                 f"SELECT * FROM commit_evidence WHERE {column} IS ? ORDER BY id DESC LIMIT ?", (job_id, limit),
             )]
+
+    def cloud_history(self, job_id: int | None, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Immutable add/deletion observations, including detached task history."""
+        if type(limit) is not int or not 1 <= limit <= 10000:
+            raise ValueError("limit must be in 1..10000")
+        with self._mutex:
+            column = "job_id" if job_id is None else "origin_job_id"
+            result = []
+            for row in self._db.execute(
+                f"SELECT * FROM cloud_observations WHERE {column} IS ? ORDER BY id DESC LIMIT ?", (job_id, limit),
+            ):
+                item = dict(row)
+                item["verified"] = bool(item["verified"])
+                result.append(item)
+            return result
 
     def upload_history(self, job_id: int | None) -> list[dict[str, Any]]:
         with self._mutex:
