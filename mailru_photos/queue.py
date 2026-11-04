@@ -36,7 +36,9 @@ from .media import (
 
 STATES = ("pending", "running", "uploaded", "failed", "skipped")
 TASK_FILTERS = (*STATES, "paused", "existing", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+_MAX_SOURCE_MEMBERS = 50000
+_PROCESS_NONCE = uuid.uuid4().hex
 _PROGRESS_ORDER = (
     "CASE WHEN status='uploaded' OR (status='skipped' AND skip_reason='remote_exists') THEN 100.0 "
     "WHEN size>0 THEN MIN(100.0,100.0*progress_bytes/size) ELSE 0.0 END"
@@ -56,8 +58,12 @@ _NEW_SORT_INDEX_NAMES = frozenset(
     f"jobs_{group}_{field}" for group in ("sort", "filter", "paused", "observed")
     for field in _SORT_EXPRESSIONS if field != "created_at" or group == "filter"
 )
+_GROUP_SORT_INDEX_NAMES = frozenset(
+    f"jobs_group_{category}_{field}" for category in ("sort", "filter", "paused", "observed")
+    for field in _SORT_EXPRESSIONS
+)
 _SCHEMA_OBJECTS = frozenset({
-    ("table", "metadata"), ("table", "roots"), ("table", "scans"),
+    ("table", "metadata"), ("table", "roots"), ("table", "source_groups"), ("table", "scans"),
     ("table", "jobs"), ("table", "upload_results"), ("table", "commit_intents"),
     ("table", "commit_evidence"), ("table", "cloud_observations"), ("table", "rescan_intents"),
     ("index", "jobs_ready"), ("index", "jobs_pending"),
@@ -75,9 +81,14 @@ _SCHEMA_OBJECTS = frozenset({
     ("index", "jobs_paused_created"), ("index", "jobs_observed_created"),
     ("index", "cloud_observations_job"), ("index", "cloud_observations_origin"),
     ("index", "jobs_pending_root"), ("index", "jobs_retry_root"), ("index", "jobs_reconcile_root"),
-} | {("index", name) for name in _NEW_SORT_INDEX_NAMES})
+    ("index", "roots_group"), ("index", "jobs_group"),
+    ("index", "jobs_pending_group"), ("index", "jobs_retry_group"), ("index", "jobs_reconcile_group"),
+    ("index", "cloud_observations_batch"), ("index", "cloud_observations_path"),
+    ("index", "upload_results_batch"),
+    ("trigger", "jobs_source_group_insert"), ("trigger", "jobs_source_group_update"),
+} | {("index", name) for name in _NEW_SORT_INDEX_NAMES | _GROUP_SORT_INDEX_NAMES})
 _JOB_SUMMARY_COLUMNS = (
-    "id,root_id,relative_path,local_path,remote_path,status,size,attempts,present,"
+    "id,root_id,source_group_id,relative_path,local_path,remote_path,status,size,attempts,present,"
     "last_error,skip_reason,next_attempt,uploaded_at,storage_mode,paused,remove_requested,created_at,"
     "planned_mode,planned_reason,observed_mode,cloud_present,cloud_path,cloud_hash,cloud_size,"
     "cloud_verified,cloud_observed_at,cloud_deleted_at,completed_at,progress_bytes"
@@ -110,6 +121,24 @@ _SIZE_PARTITIONS = {
 _LEGACY_LARGE_FILE_ERROR = "Файл больше 2 ГБ; он не отправлен обычной загрузкой."
 _LARGE_FILES_DISABLED_REASON = "Файл больше 2 ГБ: этот размер не поддерживается автозагрузкой."
 _REGULAR_SKIP_CODES = ("regular_size_disabled", "regular_format_disabled", "large_files_disabled")
+
+
+class _RootScope(tuple):
+    """Immutable validated IDs with a compact, reusable query plan.
+
+    A scheduled party may contain thousands of physical directories. Keeping
+    the complete-group compression with the immutable selection avoids both
+    revalidating every ID and opening one SQL cursor per directory per file.
+    Source mutations invalidate it through the persisted generation number.
+    """
+
+    def __new__(cls, values, *, database, generation, groups, partial):
+        result = super().__new__(cls, values)
+        result.database = database
+        result.generation = generation
+        result.groups = tuple(groups)
+        result.partial = tuple(partial)
+        return result
 
 
 def _size_partition(storage_mode: str | None) -> str:
@@ -311,6 +340,7 @@ class Queue:
         self._mutex = threading.RLock()
         self._runner_lock_depth = 0
         self._runner_lock_owner: int | None = None
+        self._scope_cache: dict[tuple[int, ...], _RootScope] = {}
         self._closed = False
         self._db = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -322,6 +352,12 @@ class Queue:
             # network commit is attempted. NORMAL is insufficient for that promise.
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute("PRAGMA foreign_keys=ON")
+            # JSON1 is bundled with supported Python/container SQLite builds.
+            # It prevents large source selections from hitting bind limits.
+            try:
+                self._db.execute("SELECT value FROM json_each('[1]')").fetchone()
+            except sqlite3.Error as exc:
+                raise QueueConfigurationError("SQLite JSON support is required for large source groups.") from exc
             self._initialize(account_id)
         except BaseException:
             self._db.close()
@@ -329,14 +365,26 @@ class Queue:
 
     def _initialize(self, account_id: str | None) -> None:
         schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        if schema_version not in (0, 1, 2, 3, 4, SCHEMA_VERSION):
+        if schema_version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION):
             raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
+        # The hot path returns one SQLite result instead of iterating schema
+        # rows in Python. sqlite_step releases the GIL for each row: several
+        # dashboard readers otherwise amplify every constructor into hundreds
+        # of handoffs and can starve concurrent upload workers.
+        if schema_version == SCHEMA_VERSION and self._has_current_schema():
+            existing = self._get_meta("_destination")
+            self._check_destination(existing)
+            needs_account = account_id is not None and self._account_needs_binding(account_id)
+            if (existing is not None and not needs_account
+                    and self._get_meta("_media_policy_version") == MEDIA_POLICY_VERSION):
+                return
         objects = {(row["type"], row["name"]) for row in self._db.execute(
-            "SELECT type,name FROM sqlite_master WHERE type IN ('table','index')"
+            "SELECT type,name FROM sqlite_master WHERE type IN ('table','index','trigger')"
         )}
         job_columns = {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}
         has_schema = (_SCHEMA_OBJECTS.issubset(objects)
-                      and {"storage_mode", "paused", "remove_requested", *_POLICY_COLUMNS, *_TASK_COLUMNS}.issubset(job_columns)
+                      and {"source_group_id", "storage_mode", "paused", "remove_requested", *_POLICY_COLUMNS, *_TASK_COLUMNS}.issubset(job_columns)
+                      and self._has_group_schema()
                       and self._has_detached_upload_results())
         if ("table", "metadata") in objects:
             existing = self._get_meta("_destination")
@@ -350,7 +398,7 @@ class Queue:
         with self._schema_upgrade_backup(schema_version, has_jobs=("table", "jobs") in objects), self._transaction():
             # A second first-opener may have migrated while this one waited.
             schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
-            if schema_version not in (0, 1, 2, 3, 4, SCHEMA_VERSION):
+            if schema_version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION):
                 raise QueueConfigurationError(f"Unsupported queue schema {schema_version}; expected {SCHEMA_VERSION}.")
             self._create_core_schema()
             existing = self._get_meta("_destination")
@@ -385,6 +433,7 @@ class Queue:
                     self._db.execute(f"UPDATE {table} SET origin_job_id=job_id WHERE job_id IS NOT NULL")
             if not self._has_detached_upload_results():
                 self._migrate_upload_results()
+            self._migrate_source_groups()
             if schema_version < 3:
                 # Schema-2 claim indexes included paused rows. Rebuild once
                 # so a large paused prefix does not make each claim linear.
@@ -405,6 +454,28 @@ class Queue:
             self._create_queue_indexes()
             if schema_version != SCHEMA_VERSION:
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _has_current_schema(self) -> bool:
+        """Read-only structural validation, with no process cache to go stale."""
+        jobs = {"source_group_id", "storage_mode", "paused", "remove_requested", *_POLICY_COLUMNS, *_TASK_COLUMNS}
+        roots = {"group_id", "recursive", "exclusions_json", "remote_subdir"}
+        results = _UPLOAD_RESULT_COLUMNS | {"batch_id"}
+        query = """SELECT
+            (SELECT COUNT(*) FROM json_each(?) wanted JOIN sqlite_master actual
+                ON actual.type=json_extract(wanted.value,'$[0]') AND actual.name=json_extract(wanted.value,'$[1]'))=?
+            AND (SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name IN (SELECT value FROM json_each(?)))=?
+            AND (SELECT COUNT(*) FROM pragma_table_info('roots') WHERE name IN (SELECT value FROM json_each(?)))=?
+            AND (SELECT COUNT(*) FROM pragma_table_info('upload_results') WHERE name IN (SELECT value FROM json_each(?)))=?
+            AND EXISTS(SELECT 1 FROM pragma_table_info('upload_results') WHERE name='job_id' AND "notnull"=0)
+            AND EXISTS(SELECT 1 FROM pragma_table_info('cloud_observations') WHERE name='batch_id')
+            AND EXISTS(SELECT 1 FROM pragma_foreign_key_list('upload_results')
+                WHERE "table"='jobs' AND "from"='job_id' AND "to"='id' AND on_delete='SET NULL')
+        """
+        return bool(self._db.execute(query, (
+            json.dumps(sorted(_SCHEMA_OBJECTS)), len(_SCHEMA_OBJECTS),
+            json.dumps(sorted(jobs)), len(jobs), json.dumps(sorted(roots)), len(roots),
+            json.dumps(sorted(results)), len(results),
+        )).fetchone()[0])
 
     @contextlib.contextmanager
     def _schema_upgrade_backup(self, version: int, *, has_jobs: bool) -> Iterator[None]:
@@ -465,6 +536,11 @@ class Queue:
         statements = (
             """CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_groups (
+                id INTEGER PRIMARY KEY, alias TEXT NOT NULL, alias_key TEXT NOT NULL UNIQUE,
+                remote_prefix TEXT NOT NULL, owner_key TEXT UNIQUE, definition_hash TEXT NOT NULL,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
             )""",
             """CREATE TABLE IF NOT EXISTS roots (
                 id INTEGER PRIMARY KEY, path TEXT NOT NULL, path_key TEXT NOT NULL UNIQUE,
@@ -534,6 +610,55 @@ class Queue:
             self._db.execute(statement)
         if not self._db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='upload_results'").fetchone():
             self._create_upload_results("upload_results")
+
+    def _has_group_schema(self) -> bool:
+        required = {"group_id", "recursive", "exclusions_json", "remote_subdir"}
+        return (required.issubset({row["name"] for row in self._db.execute("PRAGMA table_info(roots)")})
+                and all("batch_id" in {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+                        for table in ("upload_results", "cloud_observations")))
+
+    def _migrate_source_groups(self) -> None:
+        """Preserve all legacy physical/source IDs and detached upload proof."""
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_info(roots)")}
+        definitions = {
+            "group_id": "INTEGER REFERENCES source_groups(id)",
+            "recursive": "INTEGER NOT NULL DEFAULT 1 CHECK(recursive IN (0,1))",
+            "exclusions_json": "TEXT NOT NULL DEFAULT '[]'",
+            "remote_subdir": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in definitions.items():
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE roots ADD COLUMN {name} {definition}")
+        now = time.time()
+        cursor = self._db.execute("SELECT * FROM roots WHERE group_id IS NULL ORDER BY id")
+        try:
+            while rows := cursor.fetchmany(500):
+                for row in rows:
+                    member = {"path": row["path"], "remote_subdir": "", "recursive": True, "excluded_paths": []}
+                    self._db.execute(
+                        "INSERT INTO source_groups(id,alias,alias_key,remote_prefix,definition_hash,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (row["id"], row["alias"], row["alias_key"], row["remote_prefix"],
+                         self._group_definition(row["alias"], row["remote_prefix"], [member]), now, now),
+                    )
+                    self._db.execute("UPDATE roots SET group_id=? WHERE id=?", (row["id"], row["id"]))
+        finally:
+            cursor.close()
+        job_columns = {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}
+        if "source_group_id" not in job_columns:
+            self._db.execute("ALTER TABLE jobs ADD COLUMN source_group_id INTEGER REFERENCES source_groups(id)")
+            self._db.execute("UPDATE jobs SET source_group_id=(SELECT group_id FROM roots WHERE id=jobs.root_id)")
+        for table in ("upload_results", "cloud_observations"):
+            if "batch_id" not in {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN batch_id TEXT")
+        # Old importers and tests may still INSERT only the original columns.
+        # Normal scanning supplies source_group_id and avoids this extra write.
+        self._db.execute("CREATE TRIGGER IF NOT EXISTS jobs_source_group_insert AFTER INSERT ON jobs "
+                         "WHEN NEW.source_group_id IS NULL BEGIN UPDATE jobs SET source_group_id="
+                         "(SELECT group_id FROM roots WHERE id=NEW.root_id) WHERE id=NEW.id; END")
+        self._db.execute("CREATE TRIGGER IF NOT EXISTS jobs_source_group_update AFTER UPDATE OF root_id ON jobs "
+                         "WHEN NEW.root_id<>OLD.root_id BEGIN UPDATE jobs SET source_group_id="
+                         "(SELECT group_id FROM roots WHERE id=NEW.root_id) WHERE id=NEW.id; END")
 
     def _create_upload_results(self, table: str) -> None:
         # Both callers pass internal literal table names, never user input.
@@ -675,6 +800,17 @@ class Queue:
 
     def _create_queue_indexes(self) -> None:
         statements = (
+            "CREATE INDEX IF NOT EXISTS roots_group ON roots(group_id,id)",
+            "CREATE INDEX IF NOT EXISTS jobs_group ON jobs(source_group_id,id)",
+            "CREATE INDEX IF NOT EXISTS jobs_pending_group ON jobs(source_group_id,planned_mode,id) "
+            "WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0",
+            "CREATE INDEX IF NOT EXISTS jobs_retry_group ON jobs(source_group_id,planned_mode,next_attempt,id) "
+            "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS jobs_reconcile_group ON jobs(source_group_id,id) WHERE present=1 AND paused=0 AND remove_requested=0 "
+            "AND status IN ('pending','failed') AND cloud_present=0 AND size>0",
+            "CREATE INDEX IF NOT EXISTS cloud_observations_batch ON cloud_observations(batch_id,id)",
+            "CREATE INDEX IF NOT EXISTS cloud_observations_path ON cloud_observations(account_id,remote_path,id)",
+            "CREATE INDEX IF NOT EXISTS upload_results_batch ON upload_results(batch_id,id)",
             "CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,present,next_attempt,id)",
             "CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(id) WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0",
             "CREATE INDEX IF NOT EXISTS jobs_pending_unlimited ON jobs(id) "
@@ -717,6 +853,12 @@ class Queue:
         # Match each allowed ORDER BY for the full queue and filtered tabs.
         # An uncommon filter must not scan a 300k-row unrelated sort prefix.
         for field, expression in _SORT_EXPRESSIONS.items():
+            # A source-scoped UI must neither sort its entire 300k-row group
+            # for each page nor walk another group's matching status prefix.
+            self._db.execute(f"CREATE INDEX IF NOT EXISTS jobs_group_sort_{field} ON jobs(source_group_id,({expression}),id) WHERE present=1")
+            self._db.execute(f"CREATE INDEX IF NOT EXISTS jobs_group_filter_{field} ON jobs(source_group_id,({_FILTER_STATE}),({expression}),id) WHERE present=1")
+            self._db.execute(f"CREATE INDEX IF NOT EXISTS jobs_group_paused_{field} ON jobs(source_group_id,({expression}),id) WHERE present=1 AND paused=1")
+            self._db.execute(f"CREATE INDEX IF NOT EXISTS jobs_group_observed_{field} ON jobs(source_group_id,observed_mode,({expression}),id) WHERE present=1 AND cloud_present=1")
             # Remote-existing tasks have their own category. A few manual
             # skips must not walk hundreds of thousands of adopted objects.
             self._db.execute(f"CREATE INDEX IF NOT EXISTS jobs_filter_{field} ON jobs(({_FILTER_STATE}),({expression}),id) WHERE present=1")
@@ -1117,14 +1259,16 @@ class Queue:
             row = self._require_claim(job)
             return "remove" if row["remove_requested"] else "pause" if row["paused"] else None
 
-    def clear_tasks(self, scope: str = "all") -> int:
+    def clear_tasks(self, scope: str = "all", *, root_ids: Sequence[int] | None = None) -> int:
         """Clear idle queue tasks; source registrations and physical files stay."""
         if scope not in ("all", "finished"):
             raise ValueError("Task clear scope must be all or finished")
         where = "1" if scope == "all" else "(status IN ('uploaded','skipped') OR (status='failed' AND next_attempt IS NULL))"
+        selected = self._selected_root_ids(root_ids)
+        root_filter, parameters = self._root_filter(selected)
         with self.exclusive_run(), self._transaction():
             self._require_idle_sources()
-            return self._delete_tasks(where)
+            return self._delete_tasks(f"({where}) AND {root_filter}", parameters)
 
     def reset_for_scan(self, root_ids: Sequence[int] | None = None) -> int:
         """Start a new task snapshot without erasing uncertain upload evidence.
@@ -1216,139 +1360,512 @@ class Queue:
             self._db.execute("DELETE FROM rescan_intents WHERE local_key=?", (current["local_key"],))
             return dataclasses.replace(job, storage_mode=intent.get("storage_mode", "unlimited"))
 
-    def add_root(self, path: str | os.PathLike[str], alias: str, remote_prefix: str | None = None) -> Root:
-        """Register a source with an exact optional cloud destination.
+    @staticmethod
+    def _group_definition(alias: str, remote_prefix: str, members: Sequence[Mapping[str, Any]]) -> str:
+        canonical = [{"path": item["path"], "remote_subdir": item["remote_subdir"],
+                      "recursive": bool(item["recursive"]), "excluded_paths": list(item["excluded_paths"])}
+                     for item in members]
+        canonical.sort(key=lambda item: item["path"])
+        encoded = json.dumps([alias, remote_prefix, canonical], ensure_ascii=False,
+                             sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
-        Omitting remote_prefix preserves the legacy destination/alias mapping.
-        Re-adding the same source never silently changes an existing mapping.
-        """
-        root_path = _path_key(Path(path).expanduser())
-        if not os.path.isdir(root_path):
-            raise QueueConfigurationError(f"Source root is not an accessible directory: {root_path}")
-        alias = _alias(alias)
-        selected_prefix = (_destination(remote_prefix) if remote_prefix is not None
-                           else self.destination.rstrip("/") + "/" + alias)
-        with self.exclusive_run(), self._transaction():
-            self._require_idle_sources()
-            for row in self._db.execute("SELECT * FROM roots"):
-                if row["path_key"] == root_path:
-                    if row["alias"] != alias or (remote_prefix is not None and row["remote_prefix"] != selected_prefix):
-                        raise QueueConfigurationError("Use update_root to change an existing source mapping.")
-                    return self._root(row)
-                if row["alias_key"] == _remote_key(alias):
-                    raise ScanCollisionError(f"Root alias {alias!r} is already used by another source directory.")
-                try:
-                    common = os.path.commonpath((row["path_key"], root_path))
-                except ValueError:  # Separate drives on Windows.
-                    common = ""
-                if common in (row["path_key"], root_path):
-                    raise QueueConfigurationError("Source roots cannot overlap; choose the parent root or separate children.")
-            root_id = self._root_id_high_water() + 1
-            self._db.execute(
-                "INSERT INTO roots(id,path,path_key,alias,alias_key,remote_prefix) VALUES(?,?,?,?,?,?)",
-                (root_id, root_path, root_path, alias, _remote_key(alias), selected_prefix),
-            )
-            self._put_meta("_root_id_high_water", root_id)
-            self._put_meta("last_scan", {"complete": False, "reason": "source_added"})
-            return Root(root_id, root_path, alias, selected_prefix)
+    @staticmethod
+    def _relative_directory(value: Any, *, allow_empty: bool = False) -> str:
+        if (not isinstance(value, str) or "\x00" in value or "\\" in value or value.startswith("/")
+                or any(part in (".", "..") for part in value.split("/"))):
+            raise QueueConfigurationError("Directory selections must be relative POSIX paths without '.' or '..'.")
+        result = "/".join(part for part in value.split("/") if part)
+        if not result and not allow_empty:
+            raise QueueConfigurationError("An excluded directory must be below its source.")
+        return result
 
-    def update_root(self, root_id: int, remote_prefix: str, alias: str | None = None) -> Root:
-        """Retarget work that has not been sent; keep actual uploaded paths.
-
-        Already uploaded tasks and tasks with a durable commit intent retain
-        their remote path. No server-side move, delete, or upload occurs here.
-        """
-        selected_prefix = _destination(remote_prefix)
-        selected_alias = _alias(alias) if alias is not None else None
-        with self.exclusive_run(), self._transaction():
-            self._require_idle_sources()
-            root = self._db.execute("SELECT * FROM roots WHERE id=?", (root_id,)).fetchone()
-            if root is None:
-                raise QueueConfigurationError(f"Unknown source root: {root_id}")
-            selected_alias = root["alias"] if selected_alias is None else selected_alias
-            if self._db.execute("SELECT 1 FROM roots WHERE alias_key=? AND id<>?",
-                                (_remote_key(selected_alias), root_id)).fetchone():
-                raise ScanCollisionError(f"Root alias {selected_alias!r} is already used by another source directory.")
-            if selected_prefix == root["remote_prefix"] and selected_alias == root["alias"]:
-                return self._root(root)
-            now = time.time()
+    def _normalize_members(self, members: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        if (not isinstance(members, Sequence) or isinstance(members, (str, bytes))
+                or not 1 <= len(members) <= _MAX_SOURCE_MEMBERS):
+            raise QueueConfigurationError(f"A source needs 1..{_MAX_SOURCE_MEMBERS} directories.")
+        result = []
+        seen = set()
+        for supplied in members:
+            if not isinstance(supplied, Mapping):
+                raise QueueConfigurationError("Each source directory must be an object.")
             try:
-                if selected_prefix != root["remote_prefix"]:
-                    mutable = ("root_id=? AND cloud_present=0 AND status<>'uploaded' AND NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists') AND NOT EXISTS "
-                               "(SELECT 1 FROM commit_intents WHERE job_id=jobs.id)")
-                    # Temporarily free old keys inside this transaction. This
-                    # permits a destination below the old prefix without false
-                    # collisions against another task that is also moving.
-                    # Valid cloud keys always begin with '/', unlike this key.
-                    temporary_key = "remap:" + uuid.uuid4().hex + ":"
-                    self._db.execute(f"UPDATE jobs SET remote_key=?||id WHERE {mutable}",
-                                     (temporary_key, root_id))
-                    cursor = self._db.execute(f"SELECT id,relative_path FROM jobs WHERE {mutable} ORDER BY id", (root_id,))
-                    while rows := cursor.fetchmany(500):
-                        updates = []
-                        for row in rows:
-                            remote = selected_prefix.rstrip("/") + "/" + row["relative_path"]
-                            updates.append((remote, _remote_key(remote), now, row["id"]))
-                        self._db.executemany("UPDATE jobs SET remote_path=?,remote_key=?,updated_at=? WHERE id=?", updates)
-                    cursor.close()
-                self._db.execute("UPDATE roots SET alias=?,alias_key=?,remote_prefix=? WHERE id=?",
-                                 (selected_alias, _remote_key(selected_alias), selected_prefix, root_id))
+                path = _path_key(Path(supplied["path"]).expanduser())
+            except (KeyError, TypeError, ValueError, OSError):
+                raise QueueConfigurationError("A valid local source path is required.") from None
+            if not os.path.isdir(path):
+                raise QueueConfigurationError(f"Source root is not an accessible directory: {path}")
+            if path in seen:
+                raise QueueConfigurationError(f"A directory appears twice in this source: {path}")
+            seen.add(path)
+            recursive = supplied.get("recursive", True)
+            if type(recursive) is not bool:
+                raise QueueConfigurationError("recursive must be true or false.")
+            subdir = self._relative_directory(supplied.get("remote_subdir", ""), allow_empty=True)
+            excluded = supplied.get("excluded_paths", [])
+            if (not isinstance(excluded, Sequence) or isinstance(excluded, (str, bytes))
+                    or len(excluded) > _MAX_SOURCE_MEMBERS):
+                raise QueueConfigurationError("excluded_paths must be a bounded list of relative directory paths.")
+            # Descendants of an already excluded directory add no new rule.
+            compact = []
+            ordered_exclusions = sorted(
+                {os.path.normcase(self._relative_directory(item)).replace(os.sep, "/") for item in excluded},
+                key=lambda value: value.split("/"),
+            )
+            for relative in ordered_exclusions:
+                if not compact or not (relative == compact[-1] or relative.startswith(compact[-1] + "/")):
+                    compact.append(relative)
+            if not recursive and compact:
+                raise QueueConfigurationError("A direct-files source cannot also contain excluded subdirectories.")
+            result.append({"path": path, "remote_subdir": unicodedata.normalize("NFC", subdir),
+                           "recursive": recursive, "excluded_paths": compact})
+        return result
+
+    @staticmethod
+    def _member_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {"id": row["id"], "path": row["path"], "remote_subdir": row["remote_subdir"],
+                "remote_prefix": row["remote_prefix"], "recursive": bool(row["recursive"]),
+                "excluded_paths": json.loads(row["exclusions_json"])}
+
+    @staticmethod
+    def _member_summary(row: sqlite3.Row) -> dict[str, Any]:
+        """Bounded presentation, even for a directory with 50k exclusions."""
+        # SQL computes the count/preview; state reads never deserialize the
+        # complete exclusion document for each displayed source directory.
+        return {"id": row["id"], "path": row["path"], "remote_subdir": row["remote_subdir"],
+                "remote_prefix": row["remote_prefix"], "recursive": bool(row["recursive"]),
+                "excluded_count": row["excluded_count"],
+                "excluded_preview": [value for value in (row["excluded_0"], row["excluded_1"], row["excluded_2"]) if value is not None]}
+
+    @staticmethod
+    def _member_summary_columns() -> str:
+        return ("id,path,remote_subdir,remote_prefix,recursive,json_array_length(exclusions_json) AS excluded_count,"
+                "json_extract(exclusions_json,'$[0]') AS excluded_0,json_extract(exclusions_json,'$[1]') AS excluded_1,"
+                "json_extract(exclusions_json,'$[2]') AS excluded_2")
+
+    @staticmethod
+    def _covers_descendant(member: Mapping[str, Any], descendant: str) -> bool:
+        if member["path"] == descendant:
+            return True
+        if not member["recursive"]:
+            return False
+        relative = Path(descendant).relative_to(member["path"]).as_posix()
+        return not any(relative == path or relative.startswith(path + "/") for path in member["excluded_paths"])
+
+    def _validate_member_overlaps(self, members: Sequence[Mapping[str, Any]], *, ignore_group: int | None = None) -> None:
+        """Check ancestors/descendants via paths, without an all-pairs scan."""
+        stack: list[Mapping[str, Any]] = []
+        for item in sorted(members, key=lambda member: Path(member["path"]).parts):
+            while stack:
+                try:
+                    inside = os.path.commonpath((stack[-1]["path"], item["path"])) == stack[-1]["path"]
+                except ValueError:
+                    inside = False
+                if inside:
+                    break
+                stack.pop()
+            if any(self._covers_descendant(parent, item["path"]) for parent in stack):
+                raise QueueConfigurationError("Source directories overlap; exclude the child or choose direct files only.")
+            stack.append(item)
+            ancestors = [str(path) for path in (Path(item["path"]), *Path(item["path"]).parents)]
+            ancestor_where = ",".join("?" for _ in ancestors)
+            for row in self._db.execute(
+                f"SELECT * FROM roots WHERE path_key IN ({ancestor_where}) AND (? IS NULL OR group_id<>?)",
+                (*ancestors, ignore_group, ignore_group),
+            ):
+                if self._covers_descendant(self._member_from_row(row), item["path"]):
+                    raise QueueConfigurationError(f"Source directory overlaps an existing source: {row['path']}")
+            if not item["recursive"]:
+                continue
+            prefix = item["path"].rstrip(os.sep) + os.sep
+            upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+            for row in self._db.execute(
+                "SELECT path FROM roots WHERE path_key>=? AND path_key<? AND (? IS NULL OR group_id<>?)",
+                (prefix, upper, ignore_group, ignore_group),
+            ):
+                if self._covers_descendant(item, row["path"]):
+                    raise QueueConfigurationError(f"Source directory overlaps an existing source: {row['path']}")
+
+    def _sources_changed(self, reason: str) -> None:
+        self._put_meta("_sources_generation", self._get_meta("_sources_generation", 0) + 1)
+        self._scope_cache.clear()
+        self._put_meta("last_scan", {"complete": False, "reason": reason})
+
+    def _source_id_high_water(self) -> int:
+        return max(self._root_id_high_water(), self._db.execute("SELECT COALESCE(MAX(id),0) FROM source_groups").fetchone()[0])
+
+    def _insert_group_member(self, group_id: int, root_id: int, alias: str, prefix: str,
+                             member: Mapping[str, Any]) -> None:
+        remote = prefix.rstrip("/") + "/" + member["remote_subdir"] if member["remote_subdir"] else prefix
+        self._db.execute(
+            "INSERT INTO roots(id,path,path_key,alias,alias_key,remote_prefix,group_id,recursive,exclusions_json,remote_subdir) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (root_id, member["path"], member["path"], alias, "\x00member:" + str(root_id), remote,
+             group_id, int(member["recursive"]), json.dumps(member["excluded_paths"], ensure_ascii=False), member["remote_subdir"]),
+        )
+
+    def add_source_group(self, members: Sequence[Mapping[str, Any]], alias: str,
+                         remote_prefix: str | None = None, owner_key: str | None = None) -> dict[str, Any]:
+        """Atomically create a logical source containing selected directories.
+
+        owner_key makes planner activation safe to repeat after a crash. Only
+        the exact original normalized definition can reuse an existing key.
+        """
+        alias = _alias(alias)
+        prefix = _destination(remote_prefix) if remote_prefix is not None else self.destination.rstrip("/") + "/" + alias
+        normalized = self._normalize_members(members)
+        if owner_key is not None and (not isinstance(owner_key, str) or not 1 <= len(owner_key) <= 200
+                                      or any(ord(char) < 32 for char in owner_key)):
+            raise QueueConfigurationError("Invalid source owner key.")
+        definition = self._group_definition(alias, prefix, normalized)
+        with self.exclusive_run(), self._transaction():
+            self._require_idle_sources()
+            if owner_key is not None:
+                existing = self._db.execute("SELECT * FROM source_groups WHERE owner_key=?", (owner_key,)).fetchone()
+                if existing is not None:
+                    if existing["definition_hash"] != definition:
+                        raise QueueConfigurationError("This source owner already has a different directory selection.")
+                    return self.source_group(existing["id"])
+            if self._db.execute("SELECT 1 FROM source_groups WHERE alias_key=?", (_remote_key(alias),)).fetchone():
+                raise ScanCollisionError(f"Root alias {alias!r} is already used by another source directory.")
+            self._validate_member_overlaps(normalized)
+            group_id = self._source_id_high_water() + 1
+            now = time.time()
+            self._db.execute(
+                "INSERT INTO source_groups(id,alias,alias_key,remote_prefix,owner_key,definition_hash,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)", (group_id, alias, _remote_key(alias), prefix, owner_key, definition, now, now),
+            )
+            for index, member in enumerate(normalized):
+                self._insert_group_member(group_id, group_id + index, alias, prefix, member)
+            self._put_meta("_root_id_high_water", group_id + len(normalized) - 1)
+            self._sources_changed("source_added")
+            return self.source_group(group_id)
+
+    def source_groups(self, *, include_members: bool = False) -> list[dict[str, Any]]:
+        with self._mutex:
+            return [self._source_group_dict(row, include_members=include_members)
+                    for row in self._db.execute("SELECT * FROM source_groups ORDER BY id")]
+
+    def source_groups_page(self, *, limit: int = 50, offset: int = 0, kind: str = "all", q: str = "") -> dict[str, Any]:
+        """Bound the number of logical sources in dashboard/management reads."""
+        if (type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0
+                or kind not in ("all", "manual") or not isinstance(q, str) or len(q) > 256 or "\x00" in q):
+            raise ValueError("limit must be in 1..200, offset nonnegative, kind all or manual, and q at most 256 characters")
+        condition = "1" if kind == "all" else "owner_key IS NULL"
+        parameters: tuple[Any, ...] = ()
+        if q:
+            # instr() is literal: %, _, quotes and backslashes never become
+            # wildcard/SQL syntax. Paths follow host filesystem case rules.
+            condition += (" AND (instr(alias_key,?)>0 OR EXISTS (SELECT 1 FROM roots INDEXED BY roots_group "
+                          "WHERE group_id=source_groups.id AND instr(path,?)>0))")
+            parameters = (_remote_key(q), os.path.normcase(q))
+        with self._mutex:
+            total = self._db.execute(f"SELECT COUNT(*) FROM source_groups WHERE {condition}", parameters).fetchone()[0]
+            rows = self._db.execute(
+                f"SELECT * FROM source_groups WHERE {condition} ORDER BY id LIMIT ? OFFSET ?", (*parameters, limit, offset),
+            )
+            return {"sources": [self._source_group_dict(row, include_members=False) for row in rows],
+                    "total": total, "offset": offset, "limit": limit}
+
+    def source_group_counts(self) -> dict[str, int]:
+        """Small counters for state; no source/member dictionaries are built."""
+        with self._mutex:
+            return dict(self._db.execute(
+                "SELECT COUNT(*) AS total,COALESCE(SUM(owner_key IS NULL),0) AS manual FROM source_groups",
+            ).fetchone())
+
+    def source_group(self, group_id: int, *, include_members: bool = False) -> dict[str, Any]:
+        with self._mutex:
+            row = self._db.execute("SELECT * FROM source_groups WHERE id=?", (group_id,)).fetchone()
+            if row is None:
+                raise QueueConfigurationError(f"Unknown source group: {group_id}")
+            return self._source_group_dict(row, include_members=include_members)
+
+    def _source_group_dict(self, row: sqlite3.Row, *, include_members: bool) -> dict[str, Any]:
+        result = {key: row[key] for key in ("id", "alias", "remote_prefix", "owner_key", "created_at", "updated_at")}
+        result["member_count"] = self._db.execute("SELECT COUNT(*) FROM roots WHERE group_id=?", (row["id"],)).fetchone()[0]
+        result["members_preview"] = [self._member_summary(member) for member in self._db.execute(
+            "SELECT " + self._member_summary_columns() + " FROM roots WHERE group_id=? ORDER BY id LIMIT 3", (row["id"],),
+        )]
+        result["path"] = result["members_preview"][0]["path"] if result["member_count"] == 1 else None
+        if include_members:
+            result["members"] = [self._member_summary(member) for member in self._db.execute(
+                "SELECT " + self._member_summary_columns() + " FROM roots WHERE group_id=? ORDER BY id", (row["id"],),
+            )]
+        return result
+
+    def source_group_members(self, group_id: int, *, limit: int = 200, offset: int = 0) -> dict[str, Any]:
+        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
+            raise ValueError("limit must be in 1..200 and offset nonnegative")
+        with self._mutex:
+            group = self.source_group(group_id)
+            return {"members": [self._member_summary(row) for row in self._db.execute(
+                "SELECT " + self._member_summary_columns() + " FROM roots WHERE group_id=? ORDER BY id LIMIT ? OFFSET ?", (group_id, limit, offset),
+            )], "total": group["member_count"], "offset": offset, "limit": limit}
+
+    def group_root_ids(self, group_ids: Sequence[int]) -> tuple[int, ...]:
+        if (not isinstance(group_ids, Sequence) or isinstance(group_ids, (str, bytes)) or not group_ids
+                or len(group_ids) > _MAX_SOURCE_MEMBERS
+                or any(type(value) is not int or not 0 < value < 2**63 for value in group_ids)):
+            raise ValueError("group_ids must be a bounded nonempty sequence of positive IDs")
+        groups = tuple(sorted(set(group_ids)))
+        with self._mutex:
+            where, parameters = self._ids_filter("id", groups)
+            if self._db.execute(f"SELECT COUNT(*) FROM source_groups WHERE {where}", parameters).fetchone()[0] != len(groups):
+                raise QueueConfigurationError("Unknown source group in selection.")
+            where, parameters = self._ids_filter("group_id", groups)
+            ids = tuple(row[0] for row in self._db.execute(f"SELECT id FROM roots WHERE {where} ORDER BY id", parameters))
+            return self._selected_root_ids(ids)
+
+    def root_group_id(self, root_id: int) -> int:
+        """Resolve a physical worker/CLI source ID to its logical source."""
+        if type(root_id) is not int or not 0 < root_id < 2**63:
+            raise ValueError("root_id must be a positive source ID")
+        with self._mutex:
+            row = self._db.execute("SELECT group_id FROM roots WHERE id=?", (root_id,)).fetchone()
+            if row is None:
+                raise QueueConfigurationError(f"Unknown source root: {root_id}")
+            return row[0]
+
+    def _retarget_root(self, root_id: int, prefix: str, *, now: float) -> None:
+        mutable = ("root_id=? AND cloud_present=0 AND status<>'uploaded' "
+                   "AND NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists') "
+                   "AND NOT EXISTS (SELECT 1 FROM commit_intents WHERE job_id=jobs.id)")
+        cursor = self._db.execute(f"SELECT id,relative_path FROM jobs WHERE {mutable} ORDER BY id", (root_id,))
+        try:
+            while rows := cursor.fetchmany(500):
+                updates = []
+                for row in rows:
+                    remote = prefix.rstrip("/") + "/" + row["relative_path"]
+                    updates.append((remote, _remote_key(remote), now, row["id"]))
+                self._db.executemany("UPDATE jobs SET remote_path=?,remote_key=?,updated_at=? WHERE id=?", updates)
+        finally:
+            cursor.close()
+
+    def update_source_group(self, group_id: int, remote_prefix: str, alias: str | None = None,
+                            members: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+        prefix = _destination(remote_prefix)
+        normalized = None if members is None else self._normalize_members(members)
+        with self.exclusive_run(), self._transaction():
+            self._require_idle_sources()
+            group = self.source_group(group_id)
+            selected_alias = group["alias"] if alias is None else _alias(alias)
+            if self._db.execute("SELECT 1 FROM source_groups WHERE alias_key=? AND id<>?", (_remote_key(selected_alias), group_id)).fetchone():
+                raise ScanCollisionError(f"Root alias {selected_alias!r} is already used by another source directory.")
+            previous = {row["path"]: row for row in self._db.execute("SELECT * FROM roots WHERE group_id=?", (group_id,))}
+            if normalized is None:
+                normalized = [self._member_from_row(row) for row in previous.values()]
+            self._validate_member_overlaps(normalized, ignore_group=group_id)
+            definition = self._group_definition(selected_alias, prefix, normalized)
+            if self._db.execute("SELECT definition_hash FROM source_groups WHERE id=?", (group_id,)).fetchone()[0] == definition:
+                return group
+            now = time.time()
+            highest = self._source_id_high_water()
+            wanted = {item["path"] for item in normalized}
+            for path, row in previous.items():
+                if path not in wanted:
+                    self._delete_tasks("root_id=?", (row["id"],))
+                    self._db.execute("DELETE FROM roots WHERE id=?", (row["id"],))
+            try:
+                # Release every changing destination together, so swapping two
+                # member mappings does not collide with a member not visited
+                # yet. Frozen uploaded/accepted objects keep their real keys.
+                changing = []
+                for member in normalized:
+                    row = previous.get(member["path"])
+                    remote = prefix.rstrip("/") + "/" + member["remote_subdir"] if member["remote_subdir"] else prefix
+                    if row is not None and remote != row["remote_prefix"]:
+                        changing.append(row["id"])
+                if changing:
+                    selected, parameters = self._ids_filter("root_id", changing)
+                    self._db.execute(
+                        "UPDATE jobs SET remote_key=?||id WHERE " + selected + " AND cloud_present=0 AND status<>'uploaded' "
+                        "AND NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists') "
+                        "AND NOT EXISTS (SELECT 1 FROM commit_intents WHERE job_id=jobs.id)",
+                        ("remap:" + uuid.uuid4().hex + ":", *parameters),
+                    )
+                for member in normalized:
+                    row = previous.get(member["path"])
+                    if row is None:
+                        highest += 1
+                        self._insert_group_member(group_id, highest, selected_alias, prefix, member)
+                        continue
+                    remote = prefix.rstrip("/") + "/" + member["remote_subdir"] if member["remote_subdir"] else prefix
+                    if bool(row["recursive"]) != member["recursive"] or json.loads(row["exclusions_json"]) != member["excluded_paths"]:
+                        self._delete_tasks("root_id=?", (row["id"],))
+                    elif remote != row["remote_prefix"]:
+                        self._retarget_root(row["id"], remote, now=now)
+                    self._db.execute(
+                        "UPDATE roots SET alias=?,alias_key=?,remote_prefix=?,recursive=?,exclusions_json=?,remote_subdir=? WHERE id=?",
+                        (selected_alias, "\x00member:" + str(row["id"]), remote, int(member["recursive"]),
+                         json.dumps(member["excluded_paths"], ensure_ascii=False), member["remote_subdir"], row["id"]),
+                    )
+                self._db.execute("UPDATE source_groups SET alias=?,alias_key=?,remote_prefix=?,definition_hash=?,updated_at=? WHERE id=?",
+                                 (selected_alias, _remote_key(selected_alias), prefix, definition, now, group_id))
             except sqlite3.IntegrityError as exc:
                 raise ScanCollisionError("The selected cloud folder conflicts with another task's destination.") from exc
-            self._put_meta("last_scan", {"complete": False, "reason": "source_updated"})
-            return Root(root_id, root["path"], selected_alias, selected_prefix)
+            self._put_meta("_root_id_high_water", highest)
+            self._sources_changed("source_updated")
+            return self.source_group(group_id)
 
-    def remove_root(self, root_id: int) -> int:
-        """Forget a source and its tasks, retaining detached upload evidence.
-
-        Neither local originals nor cloud objects are deleted. Returned count
-        includes absent historical task rows; upload_results remain separate.
-        """
+    def remove_source_group(self, group_id: int) -> int:
+        """Forget a logical source; never delete local or remote files."""
         with self.exclusive_run(), self._transaction():
             self._require_idle_sources()
-            if not self._db.execute("SELECT 1 FROM roots WHERE id=?", (root_id,)).fetchone():
-                raise QueueConfigurationError(f"Unknown source root: {root_id}")
-            # Legacy queues may not yet have a sequence. Save it before the
-            # largest/current root disappears so a stale browser action can
-            # never address a subsequently added source using the old ID.
-            highest = self._root_id_high_water()
-            if self._get_meta("_root_id_high_water", 0) < highest:
-                self._put_meta("_root_id_high_water", highest)
-            count = self._delete_tasks("root_id=?", (root_id,))
-            self._db.execute("DELETE FROM roots WHERE id=?", (root_id,))
-            self._put_meta("last_scan", {"complete": False, "reason": "source_removed"})
+            self.source_group(group_id)
+            self._put_meta("_root_id_high_water", self._source_id_high_water())
+            count = self._delete_tasks("source_group_id=?", (group_id,))
+            self._db.execute("DELETE FROM roots WHERE group_id=?", (group_id,))
+            self._db.execute("DELETE FROM source_groups WHERE id=?", (group_id,))
+            self._sources_changed("source_removed")
             return count
+
+    def source_group_stats(self, group_ids: Sequence[int] | None = None) -> list[dict[str, Any]]:
+        """One grouped pass, without fetching tasks or physical members."""
+        selected = None
+        if group_ids is not None:
+            if (not isinstance(group_ids, Sequence) or isinstance(group_ids, (str, bytes))
+                    or len(group_ids) > _MAX_SOURCE_MEMBERS
+                    or any(type(value) is not int or not 0 < value < 2**63 for value in group_ids)):
+                raise ValueError("group_ids must be a bounded sequence of positive IDs")
+            selected = tuple(sorted(set(group_ids)))
+            if not selected:
+                return []
+        expressions = []
+        for label, condition in (("total", "1"), ("cloud", "cloud_present=1"),
+                                 ("existing", "status='skipped' AND skip_reason='remote_exists'"),
+                                 ("uploaded", "status='uploaded'"), ("pending", "status='pending'"),
+                                 ("failed", "status='failed'"), ("skipped", "status='skipped' AND COALESCE(skip_reason,'')<>'remote_exists'")):
+            for suffix, amount in (("count", "1"), ("bytes", "size")):
+                expressions.append(f"COALESCE(SUM(CASE WHEN {condition} THEN {amount} ELSE 0 END),0) AS {label}_{suffix}")
+        with self._mutex:
+            job_condition, job_parameters = ("1", ()) if selected is None else self._ids_filter("source_group_id", selected)
+            group_condition, group_parameters = ("1", ()) if selected is None else self._ids_filter("id", selected)
+            ids = [row[0] for row in self._db.execute(
+                f"SELECT id FROM source_groups WHERE {group_condition} ORDER BY id", group_parameters,
+            )]
+            if selected is not None and len(ids) != len(selected):
+                raise QueueConfigurationError("Unknown source group in statistics selection.")
+            aggregated = {row["source_group_id"]: dict(row) for row in self._db.execute(
+                "SELECT source_group_id," + ",".join(expressions) + " FROM jobs INDEXED BY jobs_group "
+                f"WHERE present=1 AND {job_condition} GROUP BY source_group_id", job_parameters,
+            )}
+            empty = {f"{label}_{suffix}": 0 for label in ("total", "cloud", "existing", "uploaded", "pending", "failed", "skipped")
+                     for suffix in ("count", "bytes")}
+            return [{"id": identifier, **empty, **aggregated.get(identifier, {})} for identifier in ids]
+
+    def add_root(self, path: str | os.PathLike[str], alias: str, remote_prefix: str | None = None) -> Root:
+        """Legacy single-directory source API; physical IDs stay stable."""
+        root_path = _path_key(Path(path).expanduser())
+        alias = _alias(alias)
+        with self.exclusive_run():
+            with self._mutex:
+                row = self._db.execute("SELECT * FROM roots WHERE path_key=?", (root_path,)).fetchone()
+                if row is not None:
+                    group = self.source_group(row["group_id"])
+                    if (group["member_count"] != 1 or row["alias"] != alias
+                            or (remote_prefix is not None and row["remote_prefix"] != _destination(remote_prefix))
+                            or not row["recursive"] or row["remote_subdir"] or json.loads(row["exclusions_json"])):
+                        raise QueueConfigurationError("Use update_source_group to change an existing source mapping.")
+                    return self._root(row)
+            group = self.add_source_group([{"path": root_path}], alias, remote_prefix)
+            with self._mutex:
+                return self._root(self._db.execute("SELECT * FROM roots WHERE group_id=?", (group["id"],)).fetchone())
+
+    def update_root(self, root_id: int, remote_prefix: str, alias: str | None = None) -> Root:
+        with self.exclusive_run():
+            with self._mutex:
+                row = self._db.execute("SELECT * FROM roots WHERE id=?", (root_id,)).fetchone()
+                if row is None:
+                    raise QueueConfigurationError(f"Unknown source root: {root_id}")
+                if self.source_group(row["group_id"])["member_count"] != 1:
+                    raise QueueConfigurationError("Update the logical source group containing this directory.")
+            self.update_source_group(row["group_id"], remote_prefix, alias=alias)
+            with self._mutex:
+                return self._root(self._db.execute("SELECT * FROM roots WHERE id=?", (root_id,)).fetchone())
+
+    def remove_root(self, root_id: int) -> int:
+        with self.exclusive_run():
+            with self._mutex:
+                row = self._db.execute("SELECT group_id FROM roots WHERE id=?", (root_id,)).fetchone()
+                if row is None:
+                    raise QueueConfigurationError(f"Unknown source root: {root_id}")
+                if self.source_group(row["group_id"])["member_count"] != 1:
+                    raise QueueConfigurationError("Remove the logical source group containing this directory.")
+            return self.remove_source_group(row["group_id"])
 
     def roots(self) -> list[Root]:
         with self._mutex:
             return [Root(r["id"], r["path"], r["alias"], r["remote_prefix"])
                     for r in self._db.execute("SELECT * FROM roots ORDER BY id")]
 
-    def _selected_root_ids(self, root_ids: Sequence[int] | None) -> tuple[int, ...] | None:
-        """Validate a bounded explicit scope; None keeps the global operation."""
+    @staticmethod
+    def _ids_filter(column: str, values: Sequence[int]) -> tuple[str, tuple[Any, ...]]:
+        # column is always an internal literal. Only the values are external.
+        if not values:
+            return "0", ()
+        if len(values) <= 400:
+            return column + " IN (" + ",".join("?" for _ in values) + ")", tuple(values)
+        return column + " IN (SELECT value FROM json_each(?))", (json.dumps(list(values)),)
+
+    def _selected_root_ids(self, root_ids: Sequence[int] | None) -> _RootScope | None:
+        """Validate a scope once and compress complete logical sources."""
         if root_ids is None:
             return None
-        if (not isinstance(root_ids, Sequence) or isinstance(root_ids, (str, bytes))
-                or not 1 <= len(root_ids) <= 500
-                or any(type(value) is not int or not 0 < value < 2**63 for value in root_ids)):
-            raise ValueError("root_ids must be a nonempty sequence of at most 500 positive source IDs")
-        selected = tuple(sorted(set(root_ids)))
         with self._mutex:
-            found = {row[0] for row in self._db.execute(
-                "SELECT id FROM roots WHERE id IN (" + ",".join("?" for _ in selected) + ")", selected,
+            generation = self._get_meta("_sources_generation", 0)
+            if (isinstance(root_ids, _RootScope) and root_ids.database == self.path
+                    and root_ids.generation == generation):
+                return root_ids
+            if (not isinstance(root_ids, Sequence) or isinstance(root_ids, (str, bytes))
+                    or not 1 <= len(root_ids) <= _MAX_SOURCE_MEMBERS
+                    or any(type(value) is not int or not 0 < value < 2**63 for value in root_ids)):
+                raise ValueError(f"root_ids must be a nonempty sequence of at most {_MAX_SOURCE_MEMBERS} positive source IDs")
+            selected = tuple(sorted(set(root_ids)))
+            cached = self._scope_cache.get(selected)
+            if cached is not None and cached.generation == generation:
+                return cached
+            where, parameters = self._ids_filter("id", selected)
+            found = {row["id"]: row["group_id"] for row in self._db.execute(
+                f"SELECT id,group_id FROM roots WHERE {where}", parameters,
             )}
-        if found != set(selected):
-            raise QueueConfigurationError("Unknown source roots: " + ", ".join(str(value) for value in selected if value not in found))
-        return selected
+            if len(found) != len(selected):
+                missing = [str(value) for value in selected if value not in found]
+                raise QueueConfigurationError("Unknown source roots: " + ", ".join(missing[:30]))
+            group_counts: dict[int, int] = {}
+            for group_id in found.values():
+                group_counts[group_id] = group_counts.get(group_id, 0) + 1
+            where, parameters = self._ids_filter("group_id", tuple(group_counts))
+            complete = tuple(row["group_id"] for row in self._db.execute(
+                f"SELECT group_id,COUNT(*) AS n FROM roots WHERE {where} GROUP BY group_id", parameters,
+            ) if row["n"] == group_counts[row["group_id"]])
+            complete_set = set(complete)
+            partial = tuple(root_id for root_id in selected if found[root_id] not in complete_set)
+            result = _RootScope(selected, database=self.path, generation=generation, groups=complete, partial=partial)
+            if len(self._scope_cache) >= 8:
+                self._scope_cache.clear()
+            self._scope_cache[selected] = result
+            return result
 
-    @staticmethod
-    def _root_filter(root_ids: tuple[int, ...] | None) -> tuple[str, tuple[int, ...]]:
+    def _root_filter(self, root_ids: tuple[int, ...] | None) -> tuple[str, tuple[Any, ...]]:
         if root_ids is None:
             return "1", ()
-        return "root_id IN (" + ",".join("?" for _ in root_ids) + ")", root_ids
+        selected = self._selected_root_ids(root_ids)
+        clauses, parameters = [], ()
+        for column, ids in (("source_group_id", selected.groups), ("root_id", selected.partial)):
+            if ids:
+                clause, values = self._ids_filter(column, ids)
+                clauses.append(clause)
+                parameters += values
+        return "(" + " OR ".join(clauses) + ")", parameters
 
     def _walk_files(self, root: Root, extensions: frozenset[str], result: ScanResult,
                     stop: threading.Event | None = None) -> Iterator[tuple]:
+        with self._mutex:
+            rule = self._db.execute("SELECT recursive,exclusions_json FROM roots WHERE id=?", (root.id,)).fetchone()
+        recursive = bool(rule["recursive"]) if rule else True
+        excluded = {os.path.normcase(str(Path(root.path).joinpath(*relative.split("/"))))
+                    for relative in json.loads(rule["exclusions_json"])} if rule else set()
         directories = [root.path]
         while directories:
             if stop is not None and stop.is_set():
@@ -1364,7 +1881,8 @@ class Queue:
                                 result.ignored_symlinks += 1
                                 continue
                             if entry.is_dir(follow_symlinks=False):
-                                directories.append(entry.path)
+                                if recursive and os.path.normcase(entry.path) not in excluded:
+                                    directories.append(entry.path)
                                 continue
                             if not entry.is_file(follow_symlinks=False):
                                 continue
@@ -1406,7 +1924,8 @@ class Queue:
                     raise QueueBusyError("Pause/finish uploads or recover interrupted claims before scanning.")
                 # Recheck under the writer lock before beginning this scope.
                 selected_roots = self._selected_root_ids(selected_roots)
-                sources = [root for root in self.roots() if selected_roots is None or root.id in selected_roots]
+                source_selection = set(selected_roots) if selected_roots is not None else None
+                sources = [root for root in self.roots() if source_selection is None or root.id in source_selection]
                 if not sources:
                     raise QueueConfigurationError("Register at least one source root before scanning.")
                 # We own the OS lock, so an old token left by a killed scanner
@@ -1532,6 +2051,8 @@ class Queue:
         with self._transaction():
             highest_id = self._job_id_high_water()
             next_id = highest_id + 1
+            groups = {root_id: self._db.execute("SELECT group_id FROM roots WHERE id=?", (root_id,)).fetchone()[0]
+                      for root_id in {values[0] for values in batch}}
             for values in batch:
                 result.seen += 1
                 plan = classify_media(values[2], values[6])
@@ -1548,10 +2069,10 @@ class Queue:
                         else:
                             self._db.execute(
                                 "INSERT INTO jobs(id,root_id,relative_path,local_path,local_key,remote_path,remote_key,"
-                                "size,mtime_ns,device,inode,created_at,updated_at,seen_scan,planned_mode,planned_reason,name_sort,next_attempt) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                                "size,mtime_ns,device,inode,created_at,updated_at,seen_scan,planned_mode,planned_reason,name_sort,source_group_id,next_attempt) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                                 (next_id,) + values + (now, now, result.scan_id, plan["mode"], plan["reason"],
-                                                      unicodedata.normalize("NFC", values[1].rsplit("/", 1)[-1]).casefold()),
+                                                      unicodedata.normalize("NFC", values[1].rsplit("/", 1)[-1]).casefold(), groups[values[0]]),
                             )
                             next_id += 1
                             result.added += 1
@@ -1602,20 +2123,22 @@ class Queue:
         number of tasks in both selected and unrelated source directories.
         """
         modes = _STORAGE_MODES if storage_mode is None else (storage_mode,)
+        scope = self._selected_root_ids(root_ids)
         for state in ("failed", "pending"):
             retry = state == "failed"
-            index = "jobs_retry_root" if retry else "jobs_pending_root"
             retry_clause = " AND next_attempt IS NOT NULL AND next_attempt<=?" if retry else ""
             order = "next_attempt,id" if retry else "id"
             best = best_key = None
-            for root_id in root_ids:
+            for kind, source_id in ((kind, value) for kind, values in (("group", scope.groups), ("root", scope.partial)) for value in values):
+                index = "jobs_" + ("retry" if retry else "pending") + "_" + kind
+                column = "source_group_id" if kind == "group" else "root_id"
                 for mode in modes:
                     if stop is not None and stop.is_set():
                         return None
-                    parameters = (root_id, mode) + ((now,) if retry else ()) + (max_attempts, max_attempts)
+                    parameters = (source_id, mode) + ((now,) if retry else ()) + (max_attempts, max_attempts)
                     row = self._db.execute(
                         f"SELECT * FROM jobs INDEXED BY {index} WHERE status='{state}' AND present=1 "
-                        "AND paused=0 AND remove_requested=0 AND root_id=? AND planned_mode=?"
+                        f"AND paused=0 AND remove_requested=0 AND {column}=? AND planned_mode=?"
                         f"{retry_clause} AND (? IS NULL OR attempts<?) ORDER BY {order} LIMIT 1", parameters,
                     ).fetchone()
                     if row is not None:
@@ -1805,7 +2328,7 @@ class Queue:
             self._invalidate_claim(job, snapshot)
             raise FileChangedError(f"Source changed before remote commit: {job.local_path}")
         with self._transaction():
-            self._require_claim(job)
+            claimed = self._require_claim(job)
             account = self._get_meta("_account_id")
             if not account:
                 raise QueueConfigurationError("Bind the authenticated account before recording a remote commit.")
@@ -1828,6 +2351,9 @@ class Queue:
                 "storage_mode": storage_mode,
                 "intent_id": uuid.uuid4().hex,
             }
+            batch_id = self._active_batch_id(claimed)
+            if batch_id is not None:
+                intent["batch_id"] = batch_id
             self._db.execute(
                 "INSERT INTO commit_intents(job_id,source_size,source_mtime_ns,device,inode,remote_path,cloud_hash,created_at,intent_json) "
                 "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET "
@@ -1957,11 +2483,77 @@ class Queue:
             self._invalidate_claim(job, snapshot)
             raise FileChangedError(f"Source changed after saving {storage_mode} confirmation: {job.local_path}")
 
+    def set_active_batch(self, batch_id: str | None, source_group_id: int | None = None) -> None:
+        """Bind new commit attempts to this live controller process only.
+
+        The intent keeps durable provenance after creation. The runtime
+        context must not grant ownership to a later CLI run after a crash,
+        including a reused process ID or a fork inheriting module globals.
+        """
+        if batch_id is None:
+            if source_group_id is not None:
+                raise ValueError("Clearing a batch must not include a source group")
+        else:
+            batch_id = self._validate_batch_id(batch_id)
+            if type(source_group_id) is not int or not 0 < source_group_id < 2**63:
+                raise ValueError("source_group_id must be a positive source group ID")
+        with self.exclusive_run(), self._transaction():
+            if batch_id is None:
+                self._put_meta("active_batch", None)
+                return
+            owner = self._db.execute("SELECT owner_key FROM source_groups WHERE id=?", (source_group_id,)).fetchone()
+            if owner is None or owner[0] != "plan-batch:" + batch_id:
+                raise QueueConfigurationError("This source group does not belong to the selected batch.")
+            self._put_meta("active_batch", {"id": batch_id, "source_group_id": source_group_id,
+                                             "pid": os.getpid(), "process_nonce": _PROCESS_NONCE})
+
+    def _active_batch_id(self, row: sqlite3.Row) -> str | None:
+        active = self._get_meta("active_batch")
+        if (not isinstance(active, dict) or active.get("source_group_id") != row["source_group_id"]
+                or type(active.get("pid")) is not int or active["pid"] != os.getpid()
+                or active.get("process_nonce") != _PROCESS_NONCE
+                or not isinstance(active.get("id"), str) or not 1 <= len(active["id"]) <= 128
+                or any(ord(char) < 32 for char in active["id"])):
+            return None
+        owner = self._db.execute("SELECT owner_key FROM source_groups WHERE id=?", (row["source_group_id"],)).fetchone()
+        return active["id"] if owner is not None and owner[0] == "plan-batch:" + active["id"] else None
+
+    def _observation_batch_id(self, row: sqlite3.Row, remote_hash: str | None,
+                              remote_path: str, receipt: Mapping[str, Any]) -> str | None:
+        """Attribute creation, never mere discovery, to its original party."""
+        if (not remote_hash or row["source_group_id"] is None
+                or (receipt.get("commit_accepted") is not True and receipt.get("recovered_commit") is not True)):
+            return None
+        saved = self._db.execute("SELECT * FROM commit_intents WHERE job_id=?", (row["id"],)).fetchone()
+        if saved is None:
+            return None
+        try:
+            intent = json.loads(saved["intent_json"])
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(intent, dict) or not isinstance(intent.get("batch_id"), str):
+            return None
+        batch_id = intent["batch_id"]
+        mode = intent.get("storage_mode", "unlimited")
+        confirmed = mode in _STORAGE_MODES and intent.get(mode + "_confirmed") is True
+        if receipt.get("commit_accepted") is not True and not (confirmed and receipt.get("recovered_commit") is True):
+            return None
+        owner = self._db.execute("SELECT owner_key FROM source_groups WHERE id=?", (row["source_group_id"],)).fetchone()
+        if (owner is None or owner[0] != "plan-batch:" + batch_id
+                or intent.get("account_id") != self._get_meta("_account_id")
+                or intent.get("destination") != self.destination
+                or saved["remote_path"] != remote_path or row["remote_path"] != remote_path
+                or saved["cloud_hash"].casefold() != remote_hash.casefold()
+                or (saved["source_size"], saved["source_mtime_ns"], saved["device"], saved["inode"])
+                != (row["size"], row["mtime_ns"], row["device"], row["inode"])):
+            return None
+        return batch_id
+
     def _record_cloud_observation_row(
         self, row: sqlite3.Row, *, mode: str, remote_hash: str | None,
         remote_id: str | None = None, metadata: Mapping[str, Any] | None = None,
         received_at: float | None = None,
-    ) -> None:
+    ) -> str | None:
         """Append a receipt and update the current projection, in a transaction.
 
         This is separate from upload_results. The response may be durable
@@ -1980,19 +2572,21 @@ class Queue:
         now = time.time() if received_at is None else received_at
         encoded = json.dumps(receipt, ensure_ascii=False, allow_nan=False)
         cloud_hash = remote_hash.upper() if isinstance(remote_hash, str) else None
+        batch_id = self._observation_batch_id(row, cloud_hash, remote_path, receipt)
         self._db.execute(
             "INSERT INTO cloud_observations(job_id,origin_job_id,event,account_id,local_path,"
             "source_size,source_mtime_ns,source_device,source_inode,remote_path,cloud_hash,cloud_size,"
-            "remote_id,mode,verified,receipt_json,received_at) VALUES(?,?,'stored',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "remote_id,mode,verified,receipt_json,received_at,batch_id) VALUES(?,?,'stored',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (row["id"], row["id"], self._get_meta("_account_id"), row["local_path"],
              row["size"], row["mtime_ns"], row["device"], row["inode"], remote_path, cloud_hash,
-             cloud_size, remote_id, mode, int(verified), encoded, now),
+             cloud_size, remote_id, mode, int(verified), encoded, now, batch_id),
         )
         self._db.execute(
             "UPDATE jobs SET observed_mode=?,cloud_present=1,cloud_path=?,cloud_hash=?,cloud_size=?,"
             "cloud_verified=?,cloud_observed_at=?,cloud_deleted_at=NULL WHERE id=?",
             (mode, remote_path, cloud_hash, cloud_size, int(verified), now, row["id"]),
         )
+        return batch_id
 
     def record_cloud_observation(
         self, job: Job, *, mode: str, remote_hash: str,
@@ -2043,16 +2637,132 @@ class Queue:
             now = time.time()
             receipt = json.dumps({"recycle_bin_confirmed": True, "path": row["cloud_path"],
                                   "hash": row["cloud_hash"]}, ensure_ascii=False, allow_nan=False)
+            previous = self._db.execute(
+                "SELECT batch_id FROM cloud_observations WHERE account_id IS ? AND remote_path=? "
+                "AND cloud_hash=? ORDER BY id DESC LIMIT 1",
+                (self._get_meta("_account_id"), row["cloud_path"], row["cloud_hash"]),
+            ).fetchone()
             self._db.execute(
                 "INSERT INTO cloud_observations(job_id,origin_job_id,event,account_id,local_path,"
                 "source_size,source_mtime_ns,source_device,source_inode,remote_path,cloud_hash,cloud_size,"
-                "remote_id,mode,verified,receipt_json,received_at) VALUES(?,?,'deleted',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "remote_id,mode,verified,receipt_json,received_at,batch_id) VALUES(?,?,'deleted',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, job_id, self._get_meta("_account_id"), row["local_path"], row["size"],
                  row["mtime_ns"], row["device"], row["inode"], row["cloud_path"], row["cloud_hash"],
-                 row["cloud_size"], row["remote_id"], row["observed_mode"], row["cloud_verified"], receipt, now),
+                 row["cloud_size"], row["remote_id"], row["observed_mode"], row["cloud_verified"], receipt, now,
+                 previous[0] if previous else None),
             )
             self._db.execute(
                 "UPDATE jobs SET cloud_present=0,cloud_deleted_at=?,updated_at=? WHERE id=?", (now, now, job_id),
+            )
+            return True
+
+    @staticmethod
+    def _validate_batch_id(batch_id: str) -> str:
+        if (not isinstance(batch_id, str) or not 1 <= len(batch_id) <= 128
+                or any(ord(char) < 32 for char in batch_id)):
+            raise ValueError("batch_id must be a nonempty bounded identifier")
+        return batch_id
+
+    @staticmethod
+    def _batch_receipt_current() -> str:
+        # A later discovery of the same object is harmless. A new commit,
+        # deletion, different content or another party's receipt supersedes
+        # this proof. Cleanup still verifies the actual object before trash.
+        return ("o.event='stored' AND NOT EXISTS (SELECT 1 FROM cloud_observations n "
+                "INDEXED BY cloud_observations_path WHERE n.account_id IS o.account_id "
+                "AND n.remote_path=o.remote_path AND n.id>o.id AND (n.event='deleted' "
+                "OR n.batch_id IS NOT NULL OR n.cloud_hash IS NOT o.cloud_hash OR n.cloud_size<>o.cloud_size "
+                "OR json_extract(n.receipt_json,'$.commit_accepted')=1))")
+
+    def batch_cloud_objects(self, batch_id: str, *, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        """Page durable creation receipts, independent of the live task list.
+
+        Only creations attributed by a saved, matching commit attempt appear.
+        Reconciled existing objects never acquire batch ownership. The caller
+        must compare account, path, size, hash and node ID with fresh cloud
+        metadata before moving any object to its recycle bin.
+        """
+        batch_id = self._validate_batch_id(batch_id)
+        if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("after_id must be nonnegative and limit must be in 1..500")
+        with self._mutex:
+            return [dict(row) for row in self._db.execute(
+                "SELECT o.* FROM cloud_observations o INDEXED BY cloud_observations_batch "
+                "WHERE o.batch_id=? AND o.id>? AND " + self._batch_receipt_current() + " ORDER BY o.id LIMIT ?",
+                (batch_id, after_id, limit),
+            )]
+
+    def batch_cloud_object_state(self, batch_id: str, observation_id: int) -> dict[str, Any]:
+        """Revalidate one frozen cleanup receipt immediately before cloud I/O.
+
+        A journal survives restarts and can outlive the creation it describes.
+        Equal content at the same path is not sufficient proof of continued
+        ownership. Only the original current receipt permits another trash
+        request; an exact creation-ID tombstone permits idempotent completion.
+        """
+        batch_id = self._validate_batch_id(batch_id)
+        if type(observation_id) is not int or observation_id < 1:
+            raise ValueError("observation_id must be a positive integer")
+        with self._mutex:
+            row = self._db.execute(
+                "SELECT * FROM cloud_observations WHERE id=? AND batch_id=? AND event='stored'",
+                (observation_id, batch_id),
+            ).fetchone()
+            if row is None:
+                return {"state": "missing", "object": None}
+            item = dict(row)
+            if row["account_id"] != self._get_meta("_account_id"):
+                return {"state": "superseded", "object": item}
+            deleted = self._db.execute(
+                "SELECT 1 FROM cloud_observations INDEXED BY cloud_observations_path "
+                "WHERE account_id IS ? AND remote_path=? AND id>? AND batch_id=? AND event='deleted' "
+                "AND cloud_hash IS ? AND cloud_size=? AND json_extract(receipt_json,'$.creation_observation_id')=? LIMIT 1",
+                (row["account_id"], row["remote_path"], observation_id, batch_id,
+                 row["cloud_hash"], row["cloud_size"], observation_id),
+            ).fetchone()
+            if deleted is not None:
+                return {"state": "deleted", "object": item}
+            current = self._db.execute(
+                "SELECT 1 FROM cloud_observations o WHERE o.id=? AND " + self._batch_receipt_current(),
+                (observation_id,),
+            ).fetchone()
+            return {"state": "current" if current is not None else "superseded", "object": item}
+
+    def mark_batch_cloud_deleted(self, batch_id: str, observation_id: int, *, expected_hash: str,
+                                expected_path: str) -> bool:
+        """Record an externally confirmed recycle operation, after rescan too.
+
+        The observation ID freezes the exact original proof. A superseding
+        receipt or a different object cannot be cleared by a delayed result.
+        """
+        batch_id = self._validate_batch_id(batch_id)
+        if type(observation_id) is not int or observation_id < 1:
+            raise ValueError("observation_id must be a positive integer")
+        if not isinstance(expected_hash, str) or not expected_hash:
+            raise ValueError("expected_hash must be nonempty")
+        expected_path = _destination(expected_path)
+        with self._transaction():
+            row = self._db.execute(
+                "SELECT o.* FROM cloud_observations o WHERE o.id=? AND o.batch_id=? AND " + self._batch_receipt_current(),
+                (observation_id, batch_id),
+            ).fetchone()
+            if (row is None or not row["cloud_hash"] or row["cloud_hash"].casefold() != expected_hash.casefold()
+                    or row["remote_path"] != expected_path or row["account_id"] != self._get_meta("_account_id")):
+                return False
+            now = time.time()
+            receipt = json.dumps({"recycle_bin_confirmed": True, "path": expected_path, "hash": row["cloud_hash"],
+                                  "creation_observation_id": observation_id}, ensure_ascii=False, allow_nan=False)
+            self._db.execute(
+                "INSERT INTO cloud_observations(job_id,origin_job_id,event,account_id,local_path,source_size,source_mtime_ns,"
+                "source_device,source_inode,remote_path,cloud_hash,cloud_size,remote_id,mode,verified,receipt_json,received_at,batch_id) "
+                "VALUES(?,?,'deleted',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["job_id"], row["origin_job_id"], row["account_id"], row["local_path"], row["source_size"], row["source_mtime_ns"],
+                 row["source_device"], row["source_inode"], row["remote_path"], row["cloud_hash"], row["cloud_size"], row["remote_id"],
+                 row["mode"], row["verified"], receipt, now, batch_id),
+            )
+            self._db.execute(
+                "UPDATE jobs SET cloud_present=0,cloud_deleted_at=?,updated_at=? WHERE cloud_path=? AND cloud_hash=? AND cloud_present=1",
+                (now, now, expected_path, row["cloud_hash"]),
             )
             return True
 
@@ -2084,16 +2794,16 @@ class Queue:
             claimed = self._require_claim(job)
             if claimed["storage_mode"] not in (None, storage_mode):
                 raise QueueError("Verified storage mode does not match the saved commit intent.")
-            self._record_cloud_observation_row(
+            batch_id = self._record_cloud_observation_row(
                 claimed, mode=storage_mode, remote_hash=remote_hash, remote_id=remote_id,
                 metadata={**metadata, "verified": True}, received_at=now,
             )
             self._db.execute(
                 "INSERT INTO upload_results(job_id,origin_job_id,account_id,local_path,local_key,remote_path,"
-                "source_size,source_mtime_ns,source_device,source_inode,remote_hash,remote_id,verified_metadata,uploaded_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source_size,source_mtime_ns,source_device,source_inode,remote_hash,remote_id,verified_metadata,uploaded_at,batch_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.id, self._get_meta("_account_id"), job.local_path, claimed["local_key"], job.remote_path,
-                 job.size, job.mtime_ns, job.device, str(job.inode), remote_hash, remote_id, evidence, now),
+                 job.size, job.mtime_ns, job.device, str(job.inode), remote_hash, remote_id, evidence, now, batch_id),
             )
             self._archive_intent(job.id)
         snapshot = self._inspect_source(job)
@@ -2241,12 +2951,13 @@ class Queue:
             )
             return count
 
-    def retry_failed(self, *, include_permanent: bool = False) -> int:
+    def retry_failed(self, *, include_permanent: bool = False, root_ids: Sequence[int] | None = None) -> int:
+        root_filter, parameters = self._root_filter(self._selected_root_ids(root_ids))
         with self._transaction():
             return self._db.execute(
                 "UPDATE jobs SET status='pending',attempts=0,next_attempt=0,last_error=NULL,completed_at=NULL,updated_at=? "
-                "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND (? OR next_attempt IS NOT NULL)",
-                (time.time(), int(include_permanent)),
+                "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND (? OR next_attempt IS NOT NULL) "
+                f"AND {root_filter}", (time.time(), int(include_permanent), *parameters),
             ).rowcount
 
     def reconcile_candidates(self, *, after_id: int = 0, limit: int = 500,
@@ -2267,14 +2978,27 @@ class Queue:
                 # plus the requested page, and unrelated rows are never read.
                 cursors, heads, result = [], [], []
                 try:
-                    for root_id in selected_roots:
+                    selections = [(kind, value) for kind, values in (("group", selected_roots.groups), ("root", selected_roots.partial))
+                                  for value in values]
+                    if len(selections) > 32:
+                        where, parameters = self._root_filter(selected_roots)
+                        return [dict(row) for row in self._db.execute(
+                            "SELECT id,root_id,relative_path,local_path,remote_path,size,mtime_ns,device,inode "
+                            "FROM jobs INDEXED BY jobs_reconcile WHERE id>? "
+                            "AND present=1 AND paused=0 AND remove_requested=0 AND status IN ('pending','failed') "
+                            "AND cloud_present=0 AND size>0 "
+                            f"AND {where} AND NOT EXISTS (SELECT 1 FROM commit_intents WHERE job_id=jobs.id) ORDER BY id LIMIT ?",
+                            (after_id, *parameters, limit),
+                        )]
+                    for kind, source_id in selections:
+                        column = "source_group_id" if kind == "group" else "root_id"
                         cursor = self._db.execute(
                             "SELECT id,root_id,relative_path,local_path,remote_path,size,mtime_ns,device,inode "
-                            "FROM jobs INDEXED BY jobs_reconcile_root WHERE root_id=? AND id>? "
+                            f"FROM jobs INDEXED BY jobs_reconcile_{kind} WHERE {column}=? AND id>? "
                             "AND present=1 AND paused=0 AND remove_requested=0 AND status IN ('pending','failed') "
                             "AND cloud_present=0 AND size>0 "
                             "AND NOT EXISTS (SELECT 1 FROM commit_intents WHERE job_id=jobs.id) ORDER BY id LIMIT ?",
-                            (root_id, after_id, limit),
+                            (source_id, after_id, limit),
                         )
                         cursors.append(cursor)
                         row = cursor.fetchone()
@@ -2381,7 +3105,12 @@ class Queue:
         # when virtually every matching status belongs to another source.
         # A scheduled source summary must visit only its selected roots,
         # including permanent errors, future retries and adopted files.
-        source = "jobs INDEXED BY jobs_root_scan" if selected_roots is not None else "jobs"
+        source = "jobs"
+        if selected_roots is not None:
+            if not selected_roots.partial:
+                source = "jobs INDEXED BY jobs_group"
+            elif not selected_roots.groups:
+                source = "jobs INDEXED BY jobs_root_scan"
         with self._mutex:
             counts = {state: 0 for state in STATES}
             sizes = {state: 0 for state in STATES}
@@ -2434,6 +3163,7 @@ class Queue:
                 for suffix, amount in (("count", "1"), ("bytes", "COALESCE(cloud_size,size)")):
                     expressions.append(
                         f"COALESCE(SUM(CASE WHEN cloud_present=1 AND observed_mode='{mode}' "
+                        "AND NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists') "
                         f"THEN {amount} ELSE 0 END),0) AS uploaded_{mode}_{suffix}"
                     )
                     expressions.append(
@@ -2446,7 +3176,7 @@ class Queue:
             ).fetchone())
             for mode in _OBSERVED_MODES:
                 for suffix in ("count", "bytes"):
-                    storage[f"transferred_{mode}_{suffix}"] = storage[f"uploaded_{mode}_{suffix}"] - storage[f"existing_{mode}_{suffix}"]
+                    storage[f"transferred_{mode}_{suffix}"] = storage[f"uploaded_{mode}_{suffix}"]
             for category in ("uploaded", "existing", "transferred"):
                 for suffix in ("count", "bytes"):
                     storage[f"{category}_total_{suffix}"] = sum(storage[f"{category}_{mode}_{suffix}"] for mode in _OBSERVED_MODES)
@@ -2472,16 +3202,31 @@ class Queue:
         if status == "paused":
             conditions.append("paused=1")
         elif status in ("uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
-            conditions.extend(("cloud_present=1", "observed_mode=?"))
+            conditions.extend(("cloud_present=1", "observed_mode=?",
+                               "NOT (status='skipped' AND COALESCE(skip_reason,'')='remote_exists')"))
             parameters.append(status.removeprefix("uploaded_"))
         elif status is not None:
             conditions.append(f"({_FILTER_STATE})=?")
             parameters.append(status)
         return " AND ".join(conditions) or "1", parameters
 
+    @staticmethod
+    def _task_source(scope: _RootScope | None, *, status: str | None = None,
+                     sort_by: str | None = None, include_missing: bool = False) -> str:
+        if scope is None:
+            return "jobs"
+        if scope.partial:
+            return "jobs INDEXED BY jobs_root_scan" if not scope.groups else "jobs"
+        if len(scope.groups) != 1 or sort_by is None or include_missing:
+            return "jobs INDEXED BY jobs_group"
+        category = ("sort" if status is None else "paused" if status == "paused"
+                    else "observed" if status.startswith("uploaded_") else "filter")
+        return f"jobs INDEXED BY jobs_group_{category}_{sort_by}"
+
     def list_jobs(self, status: str | None = None, *, limit: int = 100, offset: int = 0,
                   summary: bool = False, include_missing: bool = False,
-                  sort: str = "asc", sort_by: str = "created_at") -> list[dict[str, Any]]:
+                  sort: str = "asc", sort_by: str = "created_at",
+                  root_ids: Sequence[int] | None = None) -> list[dict[str, Any]]:
         if type(limit) is not int or type(offset) is not int or not 1 <= limit <= 10000 or offset < 0:
             raise ValueError("limit must be in 1..10000 and offset nonnegative")
         order = self._task_order(sort_by, sort)
@@ -2489,10 +3234,15 @@ class Queue:
         # polling. The default retains the complete records used by the CLI.
         columns = _JOB_SUMMARY_COLUMNS if summary else "*"
         where, parameters = self._task_filter(status, include_missing=include_missing)
+        selected_roots = self._selected_root_ids(root_ids)
+        source = self._task_source(selected_roots, status=status, sort_by=sort_by, include_missing=include_missing)
+        scope, scope_parameters = self._root_filter(selected_roots)
+        where += " AND " + scope
+        parameters.extend(scope_parameters)
         parameters.extend((limit, offset))
         with self._mutex:
             return [self._task_dict(row) for row in self._db.execute(
-                f"SELECT {columns} FROM jobs WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                f"SELECT {columns} FROM {source} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 parameters,
             )]
 
@@ -2505,7 +3255,8 @@ class Queue:
         return _SORT_EXPRESSIONS[sort_by] + " " + sort + ",id " + sort
 
     def iter_export(self, status: str | None = None, *, sort_by: str = "created_at",
-                    sort: str = "asc", batch_size: int = 500) -> Iterator[dict[str, Any]]:
+                    sort: str = "asc", batch_size: int = 500,
+                    root_ids: Sequence[int] | None = None) -> Iterator[dict[str, Any]]:
         """Stream one coherent SELECT snapshot; caller owns a separate Queue.
 
         Closing the iterator on a disconnected download closes the cursor and
@@ -2514,9 +3265,14 @@ class Queue:
         if type(batch_size) is not int or not 1 <= batch_size <= 1000:
             raise ValueError("batch_size must be in 1..1000")
         where, parameters = self._task_filter(status, include_missing=False)
+        selected_roots = self._selected_root_ids(root_ids)
+        source = self._task_source(selected_roots, status=status, sort_by=sort_by)
+        scope, scope_parameters = self._root_filter(selected_roots)
+        where += " AND " + scope
+        parameters.extend(scope_parameters)
         order = self._task_order(sort_by, sort)
         with self._mutex:
-            cursor = self._db.execute(f"SELECT {_JOB_SUMMARY_COLUMNS} FROM jobs WHERE {where} ORDER BY {order}", parameters)
+            cursor = self._db.execute(f"SELECT {_JOB_SUMMARY_COLUMNS} FROM {source} WHERE {where} ORDER BY {order}", parameters)
             try:
                 while rows := cursor.fetchmany(batch_size):
                     for row in rows:
@@ -2524,16 +3280,22 @@ class Queue:
             finally:
                 cursor.close()
 
-    def jobs_summary(self, status: str | None = None, *, include_missing: bool = False) -> dict[str, int]:
+    def jobs_summary(self, status: str | None = None, *, include_missing: bool = False,
+                     root_ids: Sequence[int] | None = None) -> dict[str, int]:
         """Totals for the complete selected tab, independent of pagination."""
         where, parameters = self._task_filter(status, include_missing=include_missing)
+        selected_roots = self._selected_root_ids(root_ids)
+        source = self._task_source(selected_roots)
+        scope, scope_parameters = self._root_filter(selected_roots)
+        where += " AND " + scope
+        parameters.extend(scope_parameters)
         with self._mutex:
             return dict(self._db.execute(
-                f"SELECT COUNT(*) AS total,COALESCE(SUM(size),0) AS total_bytes FROM jobs WHERE {where}", parameters,
+                f"SELECT COUNT(*) AS total,COALESCE(SUM(size),0) AS total_bytes FROM {source} WHERE {where}", parameters,
             ).fetchone())
 
     def iter_tasks(self, *, after_id: int = 0, limit: int = 500, status: str | None = None,
-                   include_missing: bool = True) -> list[dict[str, Any]]:
+                   include_missing: bool = True, root_ids: Sequence[int] | None = None) -> list[dict[str, Any]]:
         """One bounded keyset page for deletion/snapshot operations.
 
         Unlike UI sorting this always follows the stable primary key. Rows
@@ -2543,9 +3305,14 @@ class Queue:
         if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("after_id must be nonnegative and limit must be in 1..500")
         where, parameters = self._task_filter(status, include_missing=include_missing)
+        selected_roots = self._selected_root_ids(root_ids)
+        source = self._task_source(selected_roots)
+        scope, scope_parameters = self._root_filter(selected_roots)
+        where += " AND " + scope
+        parameters.extend(scope_parameters)
         with self._mutex:
             return [self._task_dict(row) for row in self._db.execute(
-                f"SELECT * FROM jobs WHERE id>? AND ({where}) ORDER BY id LIMIT ?", (after_id, *parameters, limit),
+                f"SELECT * FROM {source} WHERE id>? AND ({where}) ORDER BY id LIMIT ?", (after_id, *parameters, limit),
             )]
 
     def get_job(self, job_id: int, *, include_missing: bool = False) -> dict[str, Any] | None:

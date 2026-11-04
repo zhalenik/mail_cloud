@@ -81,12 +81,14 @@ class ExportTests(unittest.TestCase):
         self.queue._db.execute("UPDATE jobs SET status='failed',cloud_present=1,observed_mode='regular',cloud_path=remote_path WHERE id=?", (rows[0]['id'],))
         self.queue._db.execute("UPDATE jobs SET status='skipped',skip_reason='remote_exists',cloud_present=1,observed_mode='unlimited',cloud_path='/Other/b.jpg' WHERE id=?", (rows[1]['id'],))
         self.queue.request_control(rows[2]['id'], 'skip')
-        for status, expected in (('failed', 'a.jpg'), ('uploaded_regular', 'a.jpg'), ('uploaded_unlimited', 'b.jpg'), ('skipped', 'c.jpg')):
+        for status, expected in (('failed', 'a.jpg'), ('uploaded_regular', 'a.jpg'), ('uploaded_unlimited', ''), ('skipped', 'c.jpg')):
             with self.subTest(status=status):
                 data = b''.join(self.response(f'format=txt&header=0&fields=name&status={status}')).decode()
-                self.assertEqual(data, expected + '\r\n')
+                self.assertEqual(data, expected + '\r\n' if expected else '')
         statuses = b''.join(self.response('format=txt&header=0&fields=status')).decode()
         self.assertIn('другой путь: /Other/b.jpg', statuses)
+        self.assertIn('Уже в Облаке; другой путь: /Other/b.jpg', statuses)
+        self.assertNotIn('Уже в Облаке; безлимит', statuses)
         self.assertIn('Ошибка; в Облаке; квота', statuses)
 
     def test_head_and_disconnect_release_read_snapshot_and_connection(self):

@@ -37,7 +37,7 @@ class FreshScanTests(unittest.TestCase):
         fresh = self.service.jobs()['jobs']
         self.assertTrue(old_ids.isdisjoint(row['id'] for row in fresh))
         self.assertEqual(scanned['storage_plan']['uploaded']['count'], 0)
-        self.assertEqual(scanned['storage_plan']['existing_unlimited']['count'], 1)
+        self.assertEqual(scanned['storage_plan']['existing']['count'], 1)
         with self.service._queue() as queue:
             self.assertEqual(len(queue.upload_history(lost['id'])), 1)
         self.service.start()
@@ -58,13 +58,13 @@ class FreshScanTests(unittest.TestCase):
         self.assertEqual(found['skip_reason'], 'remote_exists')
         self.assertFalse(found['cloud_path_matches'])
         self.assertEqual(found['cloud_path'], '/Семья/Архив/другое имя.jpg')
-        self.assertEqual(found['observed_mode'], 'regular')
+        self.assertIsNone(found['observed_mode'], 'Discovery does not publish an unreliable billing mode')
         self.assertEqual(rows['001.jpg']['status'], 'pending')
-        self.assertEqual(state['storage_plan']['existing_regular']['count'], 1)
+        self.assertEqual(state['storage_plan']['existing']['count'], 1)
         self.assertEqual(state['storage_plan']['uploaded']['count'], 0)
         self.assertEqual(self.cloud.commits, [])
 
-    def test_existing_regular_is_recognized_before_skip_policy_and_unknown_is_truthful(self):
+    def test_existing_files_are_recognized_before_skip_policy_without_publishing_modes(self):
         path = self.photos / 'clip.m4v'
         path.write_bytes(b'ordinary format')
         self.remote_copy(path, '/Camera/clip.m4v', unlimited=False)
@@ -76,9 +76,11 @@ class FreshScanTests(unittest.TestCase):
         self.assertEqual(state['stats']['existing'], 2)
         self.assertEqual(state['stats']['skipped_tasks_count'], 0)
         self.assertEqual(state['storage_plan']['regular']['count'], 0)
-        self.assertEqual(state['storage_plan']['existing_regular']['count'], 1)
-        self.assertEqual(state['storage_plan']['existing_unknown']['count'], 1)
-        self.assertEqual(state['storage_plan']['existing_unlimited']['count'], 0)
+        self.assertEqual(state['storage_plan']['existing']['count'], 2)
+        for mode in ('regular', 'unknown', 'unlimited'):
+            self.assertNotIn('existing_' + mode, state['storage_plan'])
+            self.assertNotIn('existing_' + mode + '_count', state['stats'])
+        self.assertTrue(all(row['observed_mode'] is None for row in self.service.jobs('existing')['jobs']))
 
     def test_disabled_cloud_check_still_rebuilds_without_inheriting_old_presence(self):
         self.photos_count(1)
@@ -117,7 +119,7 @@ class FreshScanTests(unittest.TestCase):
         self.service.scan()
         state = self.done()
         self.assertEqual(state['stats']['failed'], 0)
-        self.assertEqual(state['storage_plan']['existing_regular']['count'], 1)
+        self.assertEqual(state['storage_plan']['existing']['count'], 1)
         self.assertEqual(state['storage_plan']['regular']['count'], 0)
 
     def test_manual_warning_counts_only_new_quota_tasks(self):
@@ -130,7 +132,7 @@ class FreshScanTests(unittest.TestCase):
         self.assertTrue(state['last_scan']['warning_allowed'])
         self.assertEqual(state['last_scan']['trigger'], 'manual')
         self.assertEqual(state['storage_plan']['regular'], {'count': 1, 'bytes': (self.photos / 'new.m4v').stat().st_size})
-        self.assertEqual(state['storage_plan']['existing_regular']['count'], 1)
+        self.assertEqual(state['storage_plan']['existing']['count'], 1)
 
     def test_selected_start_survives_new_task_ids_without_starting_other_tasks(self):
         self.photos_count(3)

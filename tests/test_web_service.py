@@ -167,7 +167,9 @@ class WebServiceTests(unittest.TestCase):
         cleared = self.service.clear_tasks('all')
         self.assertEqual(cleared['removed_tasks'], 2)
         state = self.service.snapshot()
-        self.assertEqual(state['sources'], previous['sources'])
+        self.assertEqual([{k: v for k, v in source.items() if k != 'stats'} for source in state['sources']],
+                         [{k: v for k, v in source.items() if k != 'stats'} for source in previous['sources']])
+        self.assertEqual(state['sources'][0]['stats']['total_count'], 0)
         self.assertEqual(state['last_scan'], previous['last_scan'])
         self.service.start()
         self.assertEqual(self.done()['stats']['total'], 0, 'Start must not undo a deliberate clear')
@@ -1071,7 +1073,7 @@ class WebServiceTests(unittest.TestCase):
         self.assertTrue(state['configured'])
         self.assertFalse(state['authenticated'])
         self.assertEqual(state['destination'], '/')
-        self.assertEqual(state['sources'], [result['source']])
+        self.assertEqual([{k: v for k, v in source.items() if k != 'stats'} for source in state['sources']], [result['source']])
         self.assertEqual(state['sources'][0]['remote_prefix'], '/Camera/Family')
         self.photos_count(1)
         fresh.scan()
@@ -1094,7 +1096,7 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(updated['alias'], 'Renamed')
         self.assertEqual(updated['path'], first['path'])
         state = fresh.snapshot()
-        self.assertIn(second, state['sources'])
+        self.assertIn(second, [{k: v for k, v in source.items() if k != 'stats'} for source in state['sources']])
         self.assertFalse(state['last_scan']['complete'])
         self.assertNotIn('probe', state)
         self.assertEqual({row['remote_path'] for row in fresh.jobs()['jobs']},

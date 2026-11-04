@@ -16,6 +16,7 @@ VERSIONS = {
     '0.5.2': '1025b7813e8210b197b89aaceee5a89cecc54e85',
     '0.6.0': '87e9e48c1f4c54f9d49e0d0fa2d0944112acb052',
     '0.7.0': '0f0edc7a838a016e11814207d709e899fec303b2',
+    '0.8.0': 'e83d530c3bd428481157f78acf5cff8b489b75d7',
 }
 CREATE = r'''
 from dataclasses import asdict
@@ -67,9 +68,9 @@ from mailru_photos import __version__
 from mailru_photos.queue import Queue, QueueConfigurationError, SCHEMA_VERSION
 base = Path(sys.argv[2]); before = json.loads((base/'before.json').read_text())
 q = Queue(base/'queue.sqlite3', destination='/Legacy', account_id='offline-fixture')
-assert SCHEMA_VERSION == 5
+assert SCHEMA_VERSION == 6
 assert q._db.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
-backups = list((base/'backups').glob('queue-schema%d-before5-*.sqlite3' % before['schema']))
+backups = list((base/'backups').glob('queue-schema%d-before6-*.sqlite3' % before['schema']))
 assert len(backups) == 1, backups
 with sqlite3.connect(backups[0]) as backup:
     assert backup.execute('PRAGMA user_version').fetchone()[0] == before['schema']
@@ -77,8 +78,11 @@ with sqlite3.connect(backups[0]) as backup:
     assert backup.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
     assert backup.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == len(before['rows'])
     assert backup.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0] == before['upload_history_count']
-    assert 'progress_bytes' not in {row[1] for row in backup.execute('PRAGMA table_info(jobs)')}
+    assert ('progress_bytes' in {row[1] for row in backup.execute('PRAGMA table_info(jobs)')}) == (before['schema'] >= 5)
 assert [asdict(r) for r in q.roots()] == before['roots']
+assert [(g['id'],g['alias'],g['remote_prefix'],g['member_count']) for g in q.source_groups()] == [
+    (r['id'],r['alias'],r['remote_prefix'],1) for r in before['roots']]
+assert all(r['source_group_id'] == r['root_id'] for r in q._db.execute('SELECT source_group_id,root_id FROM jobs'))
 assert q.account_id == before['account_id'] == 'offline-fixture'
 assert q.destination == before['destination'] == '/Legacy'
 try:
@@ -98,8 +102,10 @@ for old in before['rows']:
     current = rows[old['id']]
     assert current['name_sort'] == unicodedata.normalize('NFC', old['relative_path'].rsplit('/',1)[-1]).casefold()
     terminal_upload = old['status'] == 'uploaded' or (old['status'] == 'skipped' and old['skip_reason'] == 'remote_exists')
-    assert current['progress_bytes'] == (old['size'] if terminal_upload else 0)
-    if old['status'] == 'uploaded':
+    assert current['progress_bytes'] == old.get('progress_bytes', old['size'] if terminal_upload else 0)
+    if 'completed_at' in old:
+        assert current['completed_at'] == old['completed_at']
+    elif old['status'] == 'uploaded':
         assert current['completed_at'] == old['uploaded_at']
     elif not terminal_upload:
         assert current['completed_at'] is None

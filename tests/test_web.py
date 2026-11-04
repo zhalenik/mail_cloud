@@ -542,7 +542,7 @@ class WebTests(unittest.TestCase):
     def test_invalid_json_and_oversized_requests_do_not_reach_engine(self):
         self.authenticate()
         self.assertEqual(self.request("/api/setup", method="POST", body=b'{"destination":NaN}')["status"], 400)
-        self.assertEqual(self.request("/api/setup", method="POST", body=b"x" * 20000)["status"], 413)
+        self.assertEqual(self.request("/api/setup", method="POST", body=b"x" * (128 * 1024 + 1))["status"], 413)
         self.assertEqual(self.request("/api/setup", method="POST", data={"destination": "/Photos"}, content_type="text/plain")["status"], 415)
         self.assertEqual(self.service.calls, [])
 

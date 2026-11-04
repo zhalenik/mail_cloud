@@ -41,7 +41,8 @@ def selected_tasks(queue, selection):
     after = 0
     status = selection.get("status") if selection.get("scope") == "filter" else None
     while True:
-        rows = queue.iter_tasks(after_id=after, limit=500, status=status, include_missing=selection.get("scope") != "filter")
+        rows = queue.iter_tasks(after_id=after, limit=500, status=status, include_missing=selection.get("scope") != "filter",
+                                root_ids=selection.get("root_ids"))
         if not rows:
             return
         for row in rows:

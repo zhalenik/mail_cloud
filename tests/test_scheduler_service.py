@@ -262,7 +262,8 @@ class ScheduledServiceTests(unittest.TestCase):
             self.assertTrue(current["last_scan"]["complete"])
             self.assertFalse(current["last_scan"]["warning_allowed"])
             self.assertEqual(current["storage_plan"]["regular"]["count"], 1)
-            self.assertEqual(current["stats"]["existing_regular_count"], 1)
+            self.assertEqual(current["stats"]["existing"], 1)
+            self.assertNotIn("existing_regular_count", current["stats"])
             rows = self.service.jobs()["jobs"]
             self.assertFalse(old_ids.intersection(row["id"] for row in rows))
             photo = next(row for row in rows if row["relative_path"] == "вернуть.jpg")

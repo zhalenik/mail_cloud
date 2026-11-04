@@ -991,6 +991,9 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(self.queue.claim())
 
     def schema_four_task_fixture(self):
+        for row in self.queue._db.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall():
+            if row[0].startswith("jobs_group_") or row[0] in {"jobs_pending_group", "jobs_retry_group", "jobs_reconcile_group"}:
+                self.queue._db.execute(f"DROP INDEX {row[0]}")
         for name in _NEW_SORT_INDEX_NAMES:
             self.queue._db.execute(f"DROP INDEX IF EXISTS {name}")
         self.queue._db.execute("DROP TABLE IF EXISTS rescan_intents")
@@ -2742,11 +2745,11 @@ class QueueTests(unittest.TestCase):
         self.assertEqual((stats["existing_unlimited_count"], stats["existing_regular_count"], stats["existing_unknown_count"]), (1, 1, 1))
         self.assertEqual((stats["transferred_total_count"], stats["transferred_total_bytes"]), (2, 24))
         self.assertEqual((stats["transferred_unlimited_bytes"], stats["transferred_regular_bytes"]), (11, 13))
-        self.assertEqual((stats["uploaded_total_count"], stats["uploaded_total_bytes"]), (5, 39))
+        self.assertEqual((stats["uploaded_total_count"], stats["uploaded_total_bytes"]), (2, 24))
         self.assertEqual((stats["skipped_tasks_count"], stats["skipped_tasks_bytes"]), (1, 17))
         self.assertEqual(self.queue.jobs_summary("existing"), {"total": 3, "total_bytes": 15})
         self.assertEqual(self.queue.jobs_summary("skipped"), {"total": 1, "total_bytes": 17})
-        self.assertEqual(self.queue.jobs_summary("uploaded_regular"), {"total": 2, "total_bytes": 18})
+        self.assertEqual(self.queue.jobs_summary("uploaded_regular"), {"total": 1, "total_bytes": 13})
         with self.assertRaises(QueueBusyError):
             self.queue.request_control(rows["existing-regular.m4v"]["id"], "return")
 
@@ -2985,7 +2988,7 @@ class QueueTests(unittest.TestCase):
         before = self.queue.list_jobs()
         operations = (self.queue.scan, self.queue.claim, self.queue.stats, self.queue.reconcile_candidates,
                       lambda **kwargs: self.queue.apply_regular_policy(False, **kwargs))
-        for ids in ([], (), [True], ["1"], [0], [-1], [2**63], "1", [1] * 501):
+        for ids in ([], (), [True], ["1"], [0], [-1], [2**63], "1", [1] * 50001):
             for operation in operations:
                 with self.subTest(ids=ids[:3] if isinstance(ids, list) else ids, operation=operation.__name__):
                     with self.assertRaises(ValueError):

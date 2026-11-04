@@ -16,7 +16,7 @@ DELIMITERS = {"comma": ",", "space": " ", "tab": "\t", "semicolon": ";"}
 
 
 def options(query):
-    allowed = {"status", "fields", "format", "delimiter", "header", "sort_by", "sort"}
+    allowed = {"status", "fields", "format", "delimiter", "header", "sort_by", "sort", "source_id"}
     if set(query) - allowed or any(len(value) != 1 for value in query.values()):
         raise ValueError("Некорректные параметры выгрузки очереди.")
     values = {key: value[0] for key, value in query.items()}
@@ -33,6 +33,11 @@ def options(query):
         raise ValueError("Выберите фильтр, колонки и формат выгрузки очереди.")
     result["header"] = result["header"] == "1"
     result["delimiter"] = DELIMITERS[result["delimiter"]]
+    if "source_id" in values:
+        value = values["source_id"]
+        if not value.isascii() or not value.isdecimal() or not 0 < int(value) < 2**63:
+            raise ValueError("Некорректный источник для выгрузки.")
+        result["source_id"] = int(value)
     return result
 
 
@@ -41,7 +46,7 @@ def _status(row):
     storage = {"unlimited": "безлимит", "regular": "квота"}.get(mode, "режим хранения неизвестен")
     if row.get("skip_reason") == "remote_exists":
         suffix = "; другой путь: " + row["cloud_path"] if not row.get("cloud_path_matches", True) else ""
-        return "Уже в Облаке; " + storage + suffix
+        return "Уже в Облаке" + suffix
     if row["status"] == "uploaded":
         return "Выполнено; " + storage
     if row.get("paused"):
@@ -83,7 +88,8 @@ class QueueExportResponse:
                 # Establish the snapshot before headers, not at a later chunk.
                 queue._db.execute("SELECT id FROM jobs LIMIT 1").fetchone()
                 self.rows = queue.iter_export(None if settings["status"] == "all" else settings["status"],
-                                              sort_by=settings["sort_by"], sort=settings["sort"], batch_size=500)
+                                              sort_by=settings["sort_by"], sort=settings["sort"], batch_size=500,
+                                              root_ids=settings.get("root_ids"))
             except BaseException:
                 self.close()
                 raise

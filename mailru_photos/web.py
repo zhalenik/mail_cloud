@@ -34,7 +34,7 @@ from .content import ContentError, FileResponse, open_task_content
 from .export import QueueExportResponse, options as export_options
 from .queue import QueueBusyError, QueueConfigurationError, QueueError, _file_lock
 
-MAX_BODY = 16384
+MAX_BODY = 128 * 1024
 COOKIE = "mailru_panel"
 PASSWORD_ROUNDS = 600000
 STATIC = Path(__file__).with_name("web_static")
@@ -337,7 +337,8 @@ class WebApplication:
         except QueueBusyError as error:
             status, value, content_type = 409, {"error": {"message": str(error), "code": "busy"}}, "application/json"
         except (QueueError, AuthError, ValueError) as error:
-            status, value, content_type = 400, {"error": {"message": str(error), "code": "operation_error"}}, "application/json"
+            missing_source = getattr(error, "code", None) == "source_not_found"
+            status, value, content_type = (404 if missing_source else 400), {"error": {"message": str(error), "code": "source_not_found" if missing_source else "operation_error"}}, "application/json"
         except Exception:
             # Do not expose arbitrary exception strings, credentials or traces.
             status, value, content_type = 500, {"error": {"message": "Не удалось выполнить запрос. Очередь сохранена.", "code": "internal_error"}}, "application/json"
@@ -378,10 +379,18 @@ class WebApplication:
             return open_task_content(*source, download=choice[0] == "1", head=method == "HEAD",
                                      range_header=None if environ.get("HTTP_IF_RANGE") else environ.get("HTTP_RANGE"))
         if method == "GET":
+            if path == "/api/sources":
+                return self.service.sources(limit=_integer(query.get("limit", ["50"])[0], 1, 200),
+                    offset=_integer(query.get("offset", ["0"])[0], 0, 100000000),
+                    kind=query.get("kind", ["all"])[0], q=query.get("q", [""])[0])
+            if path == "/api/sources/members":
+                return self.service.source_members(_integer(query.get("id", [None])[0], 1, 2**63 - 1),
+                    limit=_integer(query.get("limit", ["200"])[0], 1, 200),
+                    offset=_integer(query.get("offset", ["0"])[0], 0, 100000000))
             if path == "/api/schedules":
                 return self.service.schedules()
             if path == "/api/state":
-                return self.service.snapshot()
+                return self.service.snapshot(**({"source_id": _integer(query["source_id"][0], 1, 2**63 - 1)} if "source_id" in query else {}))
             if path == "/api/jobs":
                 status = query.get("status", ["all"])[0]
                 if status not in {"all", "pending", "running", "uploaded", "failed", "skipped", "paused", "existing",
@@ -391,12 +400,16 @@ class WebApplication:
                                          limit=_integer(query.get("limit", ["50"])[0], 1, 200),
                                          offset=_integer(query.get("offset", ["0"])[0], 0, 100000000),
                                          sort=query.get("sort", ["asc"])[0],
-                                         sort_by=query.get("sort_by", ["created_at"])[0])
+                                         sort_by=query.get("sort_by", ["created_at"])[0],
+                                         **({"source_id": _integer(query["source_id"][0], 1, 2**63 - 1)} if "source_id" in query else {}))
             if path == "/api/folders":
                 return self.service.folders(query.get("path", [None])[0])
             if path == "/api/report":
                 return {"client_version": __version__, "state": self.service.snapshot(),
                         "errors": self.service.jobs(status="failed", limit=100, offset=0)}
+        if path.startswith("/api/plans") or path.startswith("/api/notifications"):
+            return self.service.planning_request(method, path, query, data,
+                                                 owner=environ.get("mailru.session_owner", ""))
         if method != "POST":
             raise WebError(404, "Неизвестная команда.")
         if path == "/api/schedules/save":
@@ -412,8 +425,9 @@ class WebApplication:
         elif path == "/api/logout":
             self.service.logout()
         elif path == "/api/sources/add":
-            self.service.add_folder(_text(data, "path"), _text(data, "alias", limit=255),
-                                    remote_prefix=_text(data, "remote_prefix", limit=2048))
+            self.service.add_folder(_text(data, "path") if "paths" not in data else None, _text(data, "alias", limit=255),
+                                    remote_prefix=_text(data, "remote_prefix", limit=2048),
+                                    **({"paths": data["paths"]} if "paths" in data else {}))
         elif path in {"/api/sources", "/api/add-folder"}:
             # Older panels and scripted clients derive their default from the
             # existing queue configuration; new forms always send a full path.
@@ -423,7 +437,8 @@ class WebApplication:
         elif path == "/api/sources/update":
             self.service.update_source(_integer(data.get("id"), 1, 2**63 - 1),
                                        remote_prefix=_text(data, "remote_prefix", limit=2048),
-                                       alias=_text(data, "alias", limit=255) if "alias" in data else None)
+                                       alias=_text(data, "alias", limit=255) if "alias" in data else None,
+                                       **({"paths": data["paths"]} if "paths" in data else {}))
         elif path == "/api/sources/remove":
             self.service.remove_source(_integer(data.get("id"), 1, 2**63 - 1))
         elif path == "/api/tasks/delete/preview":
@@ -432,7 +447,8 @@ class WebApplication:
                 scope=_text(data, "scope", limit=16) if "scope" in data else "all",
                 status=_text(data, "status", limit=32) if "status" in data else None,
                 delete_cloud=data.get("delete_cloud", False), delete_local=data.get("delete_local", False),
-                owner=environ.get("mailru.session_owner", ""))
+                owner=environ.get("mailru.session_owner", ""),
+                **({"source_id": _integer(data["source_id"], 1, 2**63 - 1)} if "source_id" in data else {}))
         elif path == "/api/tasks/delete":
             self.service.confirm_deletion(_text(data, "token", limit=200),
                 local_confirmation=_text(data, "local_confirmation", limit=100) if "local_confirmation" in data else "",
@@ -443,18 +459,19 @@ class WebApplication:
             scope = _text(data, "scope", limit=16)
             if scope not in {"all", "finished"}:
                 raise WebError(400, "Выберите все задачи или обработанные задачи.")
-            self.service.clear_tasks(scope)
+            self.service.clear_tasks(scope, **({"source_id": _integer(data["source_id"], 1, 2**63 - 1)} if "source_id" in data else {}))
         elif path == "/api/scan":
-            self.service.scan()
+            self.service.scan(**({"source_id": _integer(data["source_id"], 1, 2**63 - 1)} if "source_id" in data else {}))
         elif path == "/api/start":
-            self.service.start()
+            self.service.start(**({"source_id": _integer(data["source_id"], 1, 2**63 - 1)} if "source_id" in data else {}))
         elif path == "/api/pause":
             self.service.pause()
         elif path == "/api/retry":
             include = data.get("include_permanent", False)
             if type(include) is not bool:
                 raise WebError(400, "Некорректный параметр повторной попытки.")
-            self.service.retry_failed(include_permanent=include)
+            self.service.retry_failed(include_permanent=include,
+                **({"source_id": _integer(data["source_id"], 1, 2**63 - 1)} if "source_id" in data else {}))
         elif path == "/api/quota/refresh":
             self.service.refresh_quota()
         elif path == "/api/settings":

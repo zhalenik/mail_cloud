@@ -26,15 +26,20 @@ from . import __version__
 from .api import CloudAPI, FileIdentity, PROTOCOL_VERSION, ProtocolError, is_auth_failure
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .cli import write_json
-from .queue import FileChangedError, Queue, QueueBusyError, QueueError, STATES, _file_lock
+from .queue import FileChangedError, Queue, QueueBusyError, QueueConfigurationError, QueueError, STATES, _file_lock
 from .runner import QuotaBudget, run
 from .scheduler import Scheduler, checked_timezone
 from .deletion import (DeletionJournal, LocalDeletionRecoveryRequired, LOCAL_CONFIRMATION, deletion_preview,
                        delete_local_file, local_delete_supported, selected_tasks)
 from .transport import Cancelled, TransportError
+from .planning_service import PlanningService
 
 LOGGER = logging.getLogger("mailru_photos.service")
 LOGGER.addHandler(logging.NullHandler())
+
+
+class SourceNotFoundError(ValueError):
+    code = "source_not_found"
 
 
 class _QuotaObservedAPI:
@@ -51,7 +56,7 @@ class _QuotaObservedAPI:
         return value
 
 
-class WebService:
+class WebService(PlanningService):
     def __init__(self, state_dir: Path, allowed_roots: list[Path], *,
                  api_factory: Callable[..., CloudAPI] = CloudAPI,
                  auth_client_factory: Callable[..., AuthClient] = AuthClient,
@@ -68,11 +73,17 @@ class WebService:
         self._stats_lock = threading.Lock()
         self._stats_cache: tuple[float, dict] | None = None
         self._database_cache: tuple[float, dict] | None = None
+        self._scope_cache = OrderedDict()
+        self._source_pages = OrderedDict()
         self._jobs_cache = OrderedDict()
         self._priority_jobs = deque()
         self._task_starts_closed = True
         self._deletion_previews = {}
         self.scheduler = None
+        self.plans = self.inventory = self.notifications = None
+        self._plan_cache = OrderedDict()
+        self._batch_cleanup_previews = {}
+        self._batch_cleanup_pending = None
         self._deletion = None
         self._deletion_pending = False
         self._auto_deletion = False
@@ -122,6 +133,8 @@ class WebService:
         self._resume_root_ids = sorted(set(scope)) if isinstance(scope, list) and scope and all(type(i) is int and i > 0 for i in scope) else None
         occurrence = previous.get("occurrence_id") if isinstance(previous, dict) else None
         self._resume_occurrence_id = occurrence if isinstance(occurrence, str) and len(occurrence) == 32 else None
+        batch = previous.get("batch_id") if isinstance(previous, dict) else None
+        self._resume_batch_id = batch if isinstance(batch, str) and len(batch) == 32 else None
         self._auto_pending = self._resume_upload and self._settings["auto_resume"]
         self._activity = {"phase": "paused" if self._resume_upload else "idle",
                           "message": "Очередь восстановлена после остановки." if self._resume_upload else "Готово к работе.",
@@ -179,7 +192,9 @@ class WebService:
                     self._resume_upload = self._auto_pending = False
                     self._activity.update(phase="paused", message="Запуск планировщика приостановлен. Нажмите «Продолжить».")
                     self._persist_activity()
+            self._init_planning(previous)
         except BaseException:
+            self._close_planning()
             self._server_lock.__exit__(None, None, None)
             raise
 
@@ -249,30 +264,87 @@ class WebService:
         except AuthError:
             return False
 
-    def _database_snapshot(self) -> dict:
+    def _database_snapshot(self, source_id=None) -> dict:
         """No SQLite opens or file stats for repeated idle dashboard polling."""
         with self._stats_lock:
             active = self._operation is not None
             cached = self._database_cache
             if cached is None or (active and time.monotonic() - cached[0] >= 5):
                 with self._queue() as queue:
+                    source_page = self._sources_snapshot(queue)
+                    source_counts = queue.source_group_counts()
                     value = {"destination": queue.destination, "account": queue.account_id,
-                             "sources": [dataclasses.asdict(r) for r in queue.roots()],
+                             "sources": source_page["sources"], "sources_total": source_counts["total"],
+                             "manual_sources_total": source_counts["manual"], "source_offset": 0,
                              "stats": queue.stats(), "last_scan": queue.get_metadata("last_scan")}
                 self._database_cache = (time.monotonic(), value)
-            return copy.deepcopy(self._database_cache[1])
+            result = copy.deepcopy(self._database_cache[1])
+            if source_id is not None:
+                source_id = self._source_id(source_id)
+                selected = next((item for item in result["sources"] if item["id"] == source_id), None)
+                scoped = self._scope_cache.get(source_id)
+                if scoped is None or (active and time.monotonic() - scoped[0] >= 5):
+                    with self._queue() as queue:
+                        try:
+                            if selected is None:
+                                selected = queue.source_group(source_id)
+                                selected["stats"] = queue.source_group_stats([source_id])[0]
+                            scoped = (time.monotonic(), queue.stats(root_ids=queue.group_root_ids([source_id])), selected)
+                        except QueueConfigurationError:
+                            raise SourceNotFoundError("Исходная папка не найдена. Обновите страницу.") from None
+                    self._scope_cache[source_id] = scoped
+                    self._scope_cache.move_to_end(source_id)
+                    while len(self._scope_cache) > 16:
+                        self._scope_cache.popitem(last=False)
+                result["stats"] = copy.deepcopy(scoped[1])
+                result["source_id"] = source_id
+                result["selected_source"] = copy.deepcopy(scoped[2])
+            return result
+
+    @staticmethod
+    def _sources_snapshot(queue, *, limit=50, offset=0, kind="all", q=""):
+        page = queue.source_groups_page(limit=limit, offset=offset, kind=kind, q=q)
+        ids = [item["id"] for item in page["sources"]]
+        counts = {row["id"]: row for row in queue.source_group_stats(ids)} if ids else {}
+        page["sources"] = [{**item, "stats": counts.get(item["id"], {})} for item in page["sources"]]
+        return page
+
+    def sources(self, *, limit=50, offset=0, kind="all", q=""):
+        if self._configuration is None:
+            return {"sources": [], "total": 0, "offset": offset, "limit": limit}
+        key = (limit, offset, kind, q)
+        with self._stats_lock:
+            cached = self._source_pages.get(key)
+            if cached is None or (self._operation is not None and time.monotonic() - cached[0] >= 5):
+                with self._queue() as queue:
+                    page = self._sources_snapshot(queue, limit=limit, offset=offset, kind=kind, q=q)
+                self._source_pages[key] = (time.monotonic(), page)
+                self._source_pages.move_to_end(key)
+                while len(self._source_pages) > 16:
+                    self._source_pages.popitem(last=False)
+            return copy.deepcopy(self._source_pages[key][1])
+
+    def _source_scope(self, queue, source_id):
+        try:
+            return queue.group_root_ids([self._source_id(source_id)]) if source_id is not None else None
+        except QueueConfigurationError:
+            raise SourceNotFoundError("Исходная папка не найдена. Обновите страницу.") from None
 
     def _invalidate_stats(self) -> None:
         with self._stats_lock:
             self._stats_cache = None
             self._database_cache = None
+            self._scope_cache.clear()
+            self._source_pages.clear()
             self._jobs_cache.clear()
+            self._plan_cache.clear()
 
     def _persist_activity(self) -> None:
         write_json(self.state_dir / "web_activity.json", {
             "version": 1, "resume_upload": self._resume_upload, "job_id": self._resume_job_id,
             "selection": self._resume_selection,
             "root_ids": self._resume_root_ids, "occurrence_id": self._resume_occurrence_id,
+            "batch_id": self._resume_batch_id,
             "logout_requested": self._logout_requested,
             "auth_required": self._auth_required,
             "phase": self._activity["phase"], "updated_at": time.time(),
@@ -331,25 +403,38 @@ class WebService:
             self._event("Папка назначения сохранена.")
         return {"ok": True}
 
-    def add_folder(self, path: str, alias: str, remote_prefix: str | None = None) -> dict:
+    def _source_members(self, paths):
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 200:
+            raise ValueError("Добавьте от 1 до 200 папок. Большие наборы создаются через план загрузки.")
+        checked = [self._allowed_path(path) for path in paths]
+        if len(set(checked)) != len(checked):
+            raise ValueError("Одна папка указана несколько раз.")
+        names = [path.name for path in checked]
+        if len(checked) > 1 and len({name.casefold() for name in names}) != len(names):
+            raise ValueError("В одном источнике выберите папки с разными именами, чтобы они не совпали в Облаке.")
+        return [{"path": str(path), "remote_subdir": path.name if len(checked) > 1 else "",
+                 "recursive": True, "excluded_paths": []} for path in checked]
+
+    def add_folder(self, path: str | None, alias: str, remote_prefix: str | None = None, *, paths=None) -> dict:
         alias = self._source_alias(alias)
         if remote_prefix is not None:
             remote_prefix = self._source_destination(remote_prefix)
         with self._lock:
             self._ensure_idle()
             self._ensure_no_deletion()
-            source = self._allowed_path(path)
+            members = self._source_members(paths if paths is not None else [path])
             self._ensure_configuration()
             with self._queue() as queue, queue.exclusive_run():
-                previous = queue.roots()
-                root = queue.add_root(source, alias, remote_prefix=remote_prefix)
-                changed = root not in previous
+                if len(members) == 1:
+                    root = queue.add_root(Path(members[0]["path"]), alias, remote_prefix=remote_prefix)
+                    group = queue.source_group(queue.root_group_id(root.id))
+                else:
+                    group = queue.add_source_group(members, alias, remote_prefix=remote_prefix)
             self._invalidate_stats()
-            if changed:
-                self._event(f"Добавлена папка: {root.alias}.")
-        return {"ok": True, "source": dataclasses.asdict(root)}
+            self._event(f"Сохранён источник: {group['alias']}.")
+        return {"ok": True, "source": group}
 
-    def update_source(self, source_id: int, *, remote_prefix: str, alias: str | None = None) -> dict:
+    def update_source(self, source_id: int, *, remote_prefix: str, alias: str | None = None, paths=None) -> dict:
         source_id = self._source_id(source_id)
         remote_prefix = self._source_destination(remote_prefix)
         if alias is not None:
@@ -358,16 +443,21 @@ class WebService:
             self._ensure_idle()
             self._ensure_no_deletion()
             with self._queue() as queue, queue.exclusive_run():
-                previous = next((root for root in queue.roots() if root.id == source_id), None)
-                if previous is None:
-                    raise ValueError("Исходная папка не найдена. Обновите страницу.")
-                self._allowed_path(previous.path, exists=False)
-                root = queue.update_root(source_id, remote_prefix=remote_prefix, alias=alias)
-                changed = root != previous
+                try:
+                    previous = queue.source_group(source_id)
+                except QueueConfigurationError:
+                    raise ValueError("Исходная папка не найдена. Обновите страницу.") from None
+                if previous.get("owner_key"):
+                    raise ValueError("Этот источник принадлежит партии. Измените или удалите партию в плане загрузки.")
+                members = self._source_members(paths) if paths is not None else None
+                group = queue.update_source_group(source_id, remote_prefix=remote_prefix, alias=alias, members=members)
             self._invalidate_stats()
-            if changed:
-                self._event(f"Изменён источник: {root.alias}. Уже загруженные файлы остаются на прежнем месте.")
-        return {"ok": True, "source": dataclasses.asdict(root)}
+            self._event(f"Изменён источник: {group['alias']}. Уже загруженные файлы остаются на прежнем месте.")
+        return {"ok": True, "source": group}
+
+    def source_members(self, source_id, *, limit=200, offset=0):
+        with self._queue() as queue:
+            return queue.source_group_members(self._source_id(source_id), limit=limit, offset=offset)
 
     def remove_source(self, source_id: int) -> dict:
         source_id = self._source_id(source_id)
@@ -375,14 +465,14 @@ class WebService:
             self._ensure_idle()
             self._ensure_no_deletion()
             with self._queue() as queue, queue.exclusive_run():
-                root = next((root for root in queue.roots() if root.id == source_id), None)
-                if root is None:
-                    raise ValueError("Исходная папка не найдена. Обновите страницу.")
+                group = queue.source_group(source_id)
+                if group.get("owner_key"):
+                    raise ValueError("Этот источник принадлежит партии. Удалите партию в плане загрузки.")
                 if self.scheduler is not None:
                     self.scheduler.remove_source(source_id)
-                removed = queue.remove_root(source_id)
+                removed = queue.remove_source_group(source_id)
             self._invalidate_stats()
-            self._event(f"Убран источник: {root.alias}. Удалено задач: {removed:,}. Файлы на диске и в Облаке сохранены.")
+            self._event(f"Убран источник: {group['alias']}. Удалено задач: {removed:,}. Файлы на диске и в Облаке сохранены.")
         return {"ok": True, "removed_tasks": removed}
 
     def settings(self, workers: int | None = None, auto_resume: bool | None = None,
@@ -521,7 +611,7 @@ class WebService:
     def _task_controls_available(self) -> bool:
         return (not self._closed and not self._shutting_down and not self._logout_requested
                 and self._configuration is not None
-                and self._operation in (None, "upload") and not self._deletion_pending
+                and self._operation in (None, "upload") and not self._deletion_pending and not self._batch_cleanup_pending
                 and self._activity["phase"] not in {"scanning", "reconciling"}
                 and not (self._pause_requested and self._operation is not None))
 
@@ -562,6 +652,7 @@ class WebService:
                     row = queue.get_job(task_id)
                     if row is None:
                         raise ValueError("Задача не найдена. Обновите список.")
+                    owner_key = queue.source_group(queue.root_group_id(row["root_id"])).get("owner_key")
                     if action == "start" and self._operation == "upload" and (
                             (self._resume_job_id is not None and self._resume_job_id != task_id)
                             or (self._resume_root_ids is not None and row["root_id"] not in self._resume_root_ids)):
@@ -577,10 +668,13 @@ class WebService:
             self._invalidate_stats()
             if action == "start":
                 if self._operation is None:
+                    if owner_key and owner_key.startswith("plan-batch:"):
+                        return self.plan_start_batch(owner_key.split(":", 1)[1], job_id=task_id)
                     self._resume_job_id = task_id
                     self._resume_selection = {key: row[key] for key in ("root_id", "local_path", "size", "mtime_ns", "device", "inode")}
                     self._resume_root_ids = None
                     self._resume_occurrence_id = None
+                    self._resume_batch_id = None
                     return self._launch("upload", lambda: self._pipeline(job_id=task_id), upload_intent=True)
                 if task_id not in self._priority_jobs:
                     self._priority_jobs.append(task_id)
@@ -590,20 +684,20 @@ class WebService:
             self._event(f"{messages[action]}: {task_id}.")
         return {"ok": True, "task_id": task_id, "action": action}
 
-    def clear_tasks(self, scope: str = "all") -> dict:
+    def clear_tasks(self, scope: str = "all", *, source_id=None) -> dict:
         if scope not in {"all", "finished"}:
             raise ValueError("Выберите все задачи или обработанные задачи.")
         with self._lock:
             self._ensure_idle()
             self._ensure_no_deletion()
             with self._queue() as queue, queue.exclusive_run():
-                removed = queue.clear_tasks(scope=scope)
+                removed = queue.clear_tasks(scope=scope, root_ids=self._source_scope(queue, source_id))
             self._invalidate_stats()
             self._event(f"Из очереди убрано задач: {removed:,}. Файлы на диске и в Облаке сохранены.")
         return {"ok": True, "removed_tasks": removed}
 
     def _ensure_no_deletion(self):
-        if self._deletion_pending:
+        if self._deletion_pending or self._batch_cleanup_pending:
             raise QueueBusyError("Сначала продолжите подтверждённое удаление. Его состояние сохранено.")
 
     @staticmethod
@@ -619,7 +713,7 @@ class WebService:
         return {"scope": scope, "status": status if scope == "filter" else None}
 
     def preview_deletion(self, *, task_id=None, scope="all", status=None,
-                         delete_cloud=False, delete_local=False, owner=""):
+                         delete_cloud=False, delete_local=False, owner="", source_id=None):
         if type(delete_cloud) is not bool or type(delete_local) is not bool:
             raise ValueError("Выберите действия с помощью галочек.")
         selection = self._delete_selection(task_id, scope, status)
@@ -630,6 +724,8 @@ class WebService:
             if delete_cloud or delete_local or task_id is None:
                 self._ensure_idle()
             with self._queue() as queue:
+                if source_id is not None:
+                    selection["root_ids"] = self._source_scope(queue, source_id)
                 guard = queue.exclusive_run() if self._operation is None else contextlib.nullcontext()
                 with guard:
                     preview = deletion_preview(queue, selection, delete_cloud=delete_cloud, delete_local=delete_local)
@@ -677,7 +773,7 @@ class WebService:
                     if current["fingerprint"] != preview["fingerprint"]:
                         raise ValueError("Список задач изменился. Подтвердите новый список.")
                     if selected["scope"] in {"all", "finished"}:
-                        removed = queue.clear_tasks(selected["scope"])
+                        removed = queue.clear_tasks(selected["scope"], root_ids=selected.get("root_ids"))
                     else:
                         removed = 0
                         for row in selected_tasks(queue, selected):
@@ -804,7 +900,7 @@ class WebService:
                 self._invalidate_stats()
 
     def jobs(self, status: str | None = None, limit: int = 50, offset: int = 0, sort: str = "asc",
-             sort_by: str = "created_at") -> dict:
+             sort_by: str = "created_at", source_id=None) -> dict:
         if status in ("", "all"):
             status = None
         if status is not None and status not in (*STATES, "paused", "existing", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
@@ -814,21 +910,29 @@ class WebService:
             raise ValueError("Некорректная страница списка задач.")
         if self._configuration is None:
             return {"jobs": [], "total": 0, "total_bytes": 0, "offset": offset, "limit": limit, "sort": sort, "sort_by": sort_by}
-        key = (status, limit, offset, sort, sort_by)
+        if source_id is not None:
+            source_id = self._source_id(source_id)
+        key = (status, limit, offset, sort, sort_by, source_id)
         with self._stats_lock:
             cached = self._jobs_cache.get(key)
             if cached is None or (self._operation is not None and time.monotonic() - cached[0] >= 5):
                 with self._queue() as queue:
-                    rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True, sort=sort, sort_by=sort_by)
-                    totals = queue.jobs_summary(status)
+                    root_ids = self._source_scope(queue, source_id)
+                    rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True, sort=sort, sort_by=sort_by, root_ids=root_ids)
+                    totals = queue.jobs_summary(status, root_ids=root_ids)
                 self._jobs_cache[key] = (time.monotonic(), rows, totals)
                 self._jobs_cache.move_to_end(key)
                 while len(self._jobs_cache) > 32:
                     self._jobs_cache.popitem(last=False)
-            _, rows, totals = copy.deepcopy(self._jobs_cache[key])
+            # The summary projection contains immutable scalar values only.
+            # Copy its dicts without recursively traversing every scalar for
+            # each panel poll; keep the cached rows private and unchanged.
+            _, cached_rows, cached_totals = self._jobs_cache[key]
+            rows = [dict(row) for row in cached_rows]
+            totals = dict(cached_totals)
         with self._lock:
             active = copy.deepcopy(self._files)
-        fields = {"id", "root_id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
+        fields = {"id", "root_id", "source_group_id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
                   "last_error", "skip_reason", "next_attempt", "uploaded_at", "storage_mode", "created_at",
                   "paused", "remove_requested", "planned_mode", "planned_reason", "observed_mode",
                   "cloud_present", "cloud_verified", "cloud_path", "cloud_size", "cloud_observed_at", "cloud_deleted_at",
@@ -836,6 +940,9 @@ class WebService:
         items = []
         for row in rows:
             item = {k: v for k, v in row.items() if k in fields}
+            if row.get("skip_reason") == "remote_exists":
+                item["observed_mode"] = None
+                item["storage_mode"] = None
             for name in ("paused", "remove_requested", "cloud_present", "cloud_verified"):
                 item[name] = bool(row.get(name))
             content_url = f"/api/tasks/{row['id']}/content"
@@ -862,9 +969,17 @@ class WebService:
 
     def export_jobs(self, options, *, head=False):
         from .export import QueueExportResponse
-        return QueueExportResponse(self._queue(), options, head=head)
+        queue = self._queue()
+        try:
+            options = {**options, "root_ids": self._source_scope(queue, options.get("source_id"))}
+            return QueueExportResponse(queue, options, head=head)
+        except BaseException:
+            queue.close()
+            raise
 
-    def snapshot(self) -> dict:
+    def snapshot(self, source_id=None) -> dict:
+        if source_id is not None and self._configuration is None:
+            raise SourceNotFoundError("Исходная папка не найдена. Обновите страницу.")
         with self._lock:
             activity = copy.deepcopy(self._activity)
             quota = copy.deepcopy(self._quota_cache)
@@ -875,6 +990,7 @@ class WebService:
             result = {"version": __version__, "configured": self._configuration is not None,
                       "authenticated": self._authenticated, "auth_required": self._auth_required,
                       "destination": None, "account": None, "sources": [],
+                      "sources_total": 0, "manual_sources_total": 0, "source_offset": 0,
                       "stats": {**{s: 0 for s in STATES}, "total": 0, "total_bytes": 0,
                                 "uploaded_bytes": 0, "ready": 0, "permanent_failures": 0},
                       "activity": activity, "settings": dict(self._settings),
@@ -884,27 +1000,32 @@ class WebService:
                           and not self._closed and not self._logout_requested and not self._auto_pending,
                       "task_controls_available": self._task_controls_available(),
                       "queue_clear_available": self._configuration is not None and self._operation is None
-                          and not self._closed and not self._logout_requested and not self._deletion_pending,
+                          and not self._closed and not self._logout_requested and not self._deletion_pending and not self._batch_cleanup_pending,
                       "local_delete_available": local_delete_supported(),
                       "deletion": copy.deepcopy(self._deletion),
                       "last_scan": None, "events": copy.deepcopy(self._events),
                       "scheduler": self.scheduler.summary() if self.scheduler is not None else None}
             if self._configuration is not None:
-                result.update(self._database_snapshot())
+                result.update(self._database_snapshot(source_id))
+            result["active_batch_id"] = self._resume_batch_id
+            result["batch_cleanup"] = self._batch_cleanup_pending
+            result["plans"] = self.plans.summary() if self.plans is not None else None
         stats = result["stats"]
+        for key in list(stats):
+            if key.startswith(("existing_unlimited", "existing_regular", "existing_unknown")):
+                stats.pop(key)
         result["storage_plan"] = {key: {"count": stats.get(prefix + "_count", 0), "bytes": stats.get(prefix + "_bytes", 0)}
             for key, prefix in (("unlimited", "planned_unlimited"), ("regular", "planned_regular"),
                                 ("uploaded", "transferred_total"), ("uploaded_unlimited", "transferred_unlimited"),
                                 ("uploaded_regular", "transferred_regular"), ("uploaded_unknown", "transferred_unknown"),
-                                ("existing", "existing_total"), ("existing_unlimited", "existing_unlimited"),
-                                ("existing_regular", "existing_regular"), ("existing_unknown", "existing_unknown"))}
+                                ("existing", "existing_total"))}
         return result
 
     def _launch(self, name: str, function: Callable[[], tuple[str, str]], *, upload_intent: bool = False,
                 origin: str = "manual") -> dict:
         with self._lock:
             self._ensure_idle()
-            if name in {"upload", "scanning"}:
+            if name in {"upload", "scanning", "planning"}:
                 self._ensure_no_deletion()
             self._stop = self._event_factory()
             self._pause_requested = False
@@ -920,7 +1041,7 @@ class WebService:
             self._invalidate_stats()
             self._resume_upload = upload_intent
             self._auto_pending = False
-            self._activity.update(phase=name if name in {"login", "scanning", "quota", "deleting"} else "checking",
+            self._activity.update(phase=name if name in {"login", "scanning", "quota", "deleting", "planning"} else "checking",
                                   message="Запускаем операцию…", last_error=None, started_at=time.time(),
                                   scan=None)
             try:
@@ -998,6 +1119,9 @@ class WebService:
                 self._persist_activity()
                 if self.scheduler is not None:
                     self.scheduler.wake()
+                if self.plans is not None:
+                    self._invalidate_plans()
+                    self.plans.wake()
                 if self._closed:
                     self._release_server_lock()
 
@@ -1109,7 +1233,7 @@ class WebService:
             return self._launch("login", perform)
 
     def _scan_queue(self, queue: Queue, root_ids=None, *, trigger=None) -> None:
-        trigger = trigger or ("scheduled" if self._resume_occurrence_id else self._launch_origin)
+        trigger = trigger or ("scheduled" if self._resume_occurrence_id else "planned" if self._resume_batch_id else self._launch_origin)
         self._phase("scanning", "Заново сканируем выбранные папки…")
         def on_progress(result):
             with self._lock:
@@ -1117,8 +1241,9 @@ class WebService:
                 self._activity["message"] = f"Найдено файлов: {result.seen:,}."
         with queue.exclusive_run():
             queue.recover_running()
+            selected_root_set = set(root_ids) if root_ids is not None else None
             for source in queue.roots():
-                if root_ids is None or source.id in root_ids:
+                if selected_root_set is None or source.id in selected_root_set:
                     self._allowed_path(source.path)
             extensions = queue.discovery_extensions()
             queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started", "root_ids": root_ids,
@@ -1127,6 +1252,7 @@ class WebService:
             result = queue.scan(extensions, stop=self._stop, progress=on_progress, root_ids=root_ids)
             saved = {**dataclasses.asdict(result), "root_ids": root_ids, "local_complete": result.complete,
                      "complete": False, "occurrence_id": self._resume_occurrence_id if trigger == "scheduled" else None,
+                     "batch_id": self._resume_batch_id if trigger == "planned" else None,
                      "trigger": trigger, "warning_allowed": False, "cloud_checked": False}
             queue.set_metadata("last_scan", saved)
             queue.set_metadata("extensions", sorted(extensions))
@@ -1215,13 +1341,15 @@ class WebService:
                 api.close_thread()
             self._invalidate_stats()
 
-    def scan(self) -> dict:
+    def scan(self, source_id=None) -> dict:
         if self._configuration is None:
             raise ValueError("Добавьте хотя бы одну исходную папку с фото и видео.")
+        with self._queue() as queue:
+            root_ids = self._source_scope(queue, source_id)
         def perform():
             with self._queue() as queue:
-                self._scan_queue(queue, trigger="manual")
-                total = queue.stats()["total"]
+                self._scan_queue(queue, root_ids=root_ids, trigger="manual")
+                total = queue.stats(root_ids=root_ids)["total"]
             return "idle", f"Сканирование завершено. Задач в очереди: {total:,}."
         return self._launch("scanning", perform)
 
@@ -1349,7 +1477,19 @@ class WebService:
                     self._task_starts_closed = True
                 api.close_thread()
 
-    def start(self, *, job_id: int | None = None, root_ids=None, occurrence_id=None, origin="manual") -> dict:
+    def start(self, *, job_id: int | None = None, root_ids=None, occurrence_id=None, origin="manual", source_id=None) -> dict:
+        if self._batch_cleanup_pending:
+            return self._resume_batch_cleanup()
+        if source_id is not None:
+            with self._queue() as queue:
+                source = queue.source_group(self._source_id(source_id))
+                if source.get("owner_key", "") and source["owner_key"].startswith("plan-batch:"):
+                    return self.plan_start_batch(source["owner_key"].split(":", 1)[1])
+                root_ids = self._source_scope(queue, source_id)
+        if (source_id is None and job_id is None and occurrence_id is None and self._resume_batch_id):
+            item = self.plans.batch(self._resume_batch_id)
+            if item and item["status"] in {"paused", "running"}:
+                return self.plan_start_batch(item["id"])
         if self._deletion_pending:
             with DeletionJournal(self.state_dir / "deletions.sqlite3") as journal:
                 operation = journal.operation()
@@ -1382,11 +1522,21 @@ class WebService:
             raise ValueError("Сначала войдите в аккаунт Mail.")
         with self._lock:
             self._ensure_idle()
+            if root_ids is None and job_id is None:
+                with self._queue() as queue:
+                    manual_groups = [group["id"] for group in queue.source_groups() if not group.get("owner_key")]
+                    if not manual_groups:
+                        raise ValueError("Исходные папки принадлежат плану. Запустите нужную партию на странице «План загрузки».")
+                    # Preserve the historical whole-queue behaviour when no
+                    # planned groups exist, but never bypass their calendar.
+                    if len(manual_groups) != len(queue.source_groups()):
+                        root_ids = queue.group_root_ids(manual_groups)
             if job_id is None or job_id != self._resume_job_id:
                 self._resume_selection = None
             self._resume_job_id = job_id
             self._resume_root_ids = root_ids
             self._resume_occurrence_id = None
+            self._resume_batch_id = None
             return self._launch("upload", lambda: self._pipeline(job_id=job_id, root_ids=root_ids), upload_intent=True, origin=origin)
 
     def pause(self) -> dict:
@@ -1404,13 +1554,13 @@ class WebService:
             self._persist_activity()
         return {"ok": True}
 
-    def retry_failed(self, include_permanent: bool = False) -> dict:
+    def retry_failed(self, include_permanent: bool = False, *, source_id=None) -> dict:
         if type(include_permanent) is not bool:
             raise ValueError("Некорректный параметр повторной попытки.")
         with self._lock:
             self._ensure_idle()
             with self._queue() as queue, queue.exclusive_run():
-                count = queue.retry_failed(include_permanent=include_permanent)
+                count = queue.retry_failed(include_permanent=include_permanent, root_ids=self._source_scope(queue, source_id))
             self._invalidate_stats()
             self._event(f"Возвращено в очередь: {count:,}.")
             return {"ok": True, "queued_again": count}
@@ -1421,6 +1571,7 @@ class WebService:
         finally:
             if self.scheduler is not None:
                 self.scheduler.start()
+            self._start_planning()
 
     def _resume_if_requested(self) -> bool:
         """Call after the HTTP listener is ready; no spontaneous fresh uploads."""
@@ -1436,8 +1587,11 @@ class WebService:
             return True
         if requested:
             try:
-                self.start(job_id=self._resume_job_id, root_ids=self._resume_root_ids,
-                           occurrence_id=self._resume_occurrence_id, origin="automatic")
+                if self._resume_batch_id:
+                    self.plan_start_batch(self._resume_batch_id, automatic=True)
+                else:
+                    self.start(job_id=self._resume_job_id, root_ids=self._resume_root_ids,
+                               occurrence_id=self._resume_occurrence_id, origin="automatic")
             except (ValueError, QueueError) as error:
                 with self._lock:
                     self._resume_upload = False
@@ -1454,8 +1608,9 @@ class WebService:
         with self._lock:
             if self._closed:
                 raise QueueBusyError("Приложение останавливается.")
-            roots = self._database_snapshot()["sources"] if self._configuration is not None else []
-            result = self.scheduler.save(data, [root["id"] for root in roots])
+            with self._queue() as queue:
+                roots = queue.source_groups()
+            result = self.scheduler.save(data, [root["id"] for root in roots if not root.get("owner_key")])
             self._event("Сохранён планировщик: " + result["name"] + ".")
             return self.scheduler.list()
 
@@ -1472,7 +1627,7 @@ class WebService:
     def _start_scheduled(self, occurrence, *, scan_first=True):
         with self._lock:
             if (self._closed or self._shutting_down or self._operation is not None
-                    or self._deletion_pending or self._logout_requested or not self._authenticated):
+                    or self._deletion_pending or self._batch_cleanup_pending or self._logout_requested or not self._authenticated):
                 return False
             current = self.scheduler.occurrence(occurrence["id"])
             if current is None or current["status"] not in {"queued", "paused"}:
@@ -1480,8 +1635,10 @@ class WebService:
             item = self.scheduler.begin(occurrence["id"])
             self._resume_job_id = None
             self._resume_selection = None
-            self._resume_root_ids = list(item["source_ids"])
+            with self._queue() as queue:
+                self._resume_root_ids = queue.group_root_ids(item["source_ids"])
             self._resume_occurrence_id = item["id"]
+            self._resume_batch_id = None
             try:
                 self._event("Запущен планировщик: " + item["name"] + ".")
                 self._launch("upload", lambda: self._scheduled_pipeline(item, scan_first=scan_first), upload_intent=True, origin="scheduled")
@@ -1499,7 +1656,7 @@ class WebService:
 
     def _scheduled_pipeline(self, occurrence, *, scan_first):
         try:
-            result = self._pipeline(root_ids=occurrence["source_ids"], scan_first=scan_first)
+            result = self._pipeline(root_ids=self._resume_root_ids, scan_first=scan_first)
         except Cancelled:
             status = "running" if self._shutting_down else "paused"
             self.scheduler.finish(occurrence["id"], status, "Выполнение приостановлено; очередь сохранена.")
@@ -1545,3 +1702,4 @@ class WebService:
             self._release_server_lock()
         if self.scheduler is not None:
             self.scheduler.close()
+        self._close_planning()
