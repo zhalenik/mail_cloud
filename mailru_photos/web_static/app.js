@@ -21,9 +21,17 @@
     error: ["Нужно ваше внимание", "Приостановлено", "red", "alert"]
   };
   const jobStates = {
-    pending: ["Ожидает", "neutral"], running: ["В работе", "blue"], uploaded: ["Выполнена", "green"],
-    failed: ["Ошибка", "red"], skipped: ["Пропущена", "orange"], paused: ["На паузе", "orange"]
+    pending: ["Ожидает", "neutral"], running: ["Загружается", "blue"], uploaded: ["Выполнено", "green"],
+    failed: ["Ошибка", "red"], skipped: ["Пропущено", "orange"], paused: ["На паузе", "orange"]
   };
+  const jobsSortFields = { name: "Имя файла", progress: "Прогресс", status: "Статус", size: "Размер", created_at: "Создана", completed_at: "Выполнена" };
+  const jobsPageSizes = [25, 50, 100, 200];
+  const jobsPreferences = (() => {
+    try {
+      const value = JSON.parse(localStorage.getItem("mail-cloud.queue.v2") || "{}");
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    } catch { return {}; }
+  })();
   const planReasons = {
     size_limit: "Размер больше 2 ГБ: требуется обычное хранилище.",
     documented_format: "Формат указан в справке автозагрузки; итоговый режим подтвердит Облако.",
@@ -44,7 +52,9 @@
   let jobsOffset = 0;
   let jobsTotal = 0;
   let jobsTotalBytes = null;
-  let jobsSort = "asc";
+  let jobsSort = jobsPreferences.sort === "desc" ? "desc" : "asc";
+  let jobsSortBy = Object.hasOwn(jobsSortFields, jobsPreferences.sort_by) ? jobsPreferences.sort_by : "created_at";
+  let jobsLimit = jobsPageSizes.includes(jobsPreferences.limit) ? jobsPreferences.limit : 50;
   let actionMenuJobId = null;
   let actionMenuSignature = "";
   let deleteContext = null;
@@ -77,7 +87,6 @@
   const pendingActions = new Set();
   const pendingTaskActions = new Map();
   const jobViews = new Map();
-  const jobsLimit = 50;
 
   function finite(value, fallback = 0) {
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -107,7 +116,7 @@
   }
   function plain(value, fallback = "") { return typeof value === "string" ? value : fallback; }
   function mediaIcon(path) { return /\.(mp4|3gp|3g2|3gpp|3gpp2|avi|vob|mov|mkv|m2t|m2ts|ts|mts|f4v|flv|wmv|m4v|mpg|ogv|webm|hevc)$/i.test(path) ? "video" : "image"; }
-  function setText(id, value) { $(id).textContent = String(value); }
+  function setText(id, value) { const text = String(value); if ($(id).textContent !== text) $(id).textContent = text; }
   function setHidden(id, hidden) { $(id).hidden = Boolean(hidden); }
   function icon(name, extraClass = "") {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -256,7 +265,7 @@
     renderConnectivity();
     setHidden("connection-banner", ok);
     if (!ok) setText("connection-message", message || "Нет связи с клиентом. Последнее полученное состояние сохранено на экране.");
-    if (snapshot) updateControls();
+    if (snapshot) { renderApplicationStatus(snapshot); updateControls(); }
   }
 
   async function refreshState() {
@@ -303,6 +312,10 @@
   function anyAction() { return pendingActions.size > 0 || pendingTaskActions.size > 0; }
   function canControlTasks() { return Boolean(snapshot && snapshot.task_controls_available === true && connected && session.authenticated && pendingActions.size === 0); }
   function canClearQueue() { return Boolean(snapshot && snapshot.queue_clear_available === true && connected && session.authenticated && !anyAction()); }
+  function canExportQueue() {
+    return Boolean(snapshot && snapshot.configured === true && connected && session.authenticated
+      && !pendingActions.has("password") && !["scanning", "reconciling"].includes(phase()));
+  }
 
   function updateControls() {
     if (!snapshot) return;
@@ -311,15 +324,24 @@
     const transient = anyAction();
     const current = phase();
     const resumeDeletion = Boolean(snapshot.deletion && snapshot.deletion.resume_available === true);
-    $("start-upload").disabled = busy || transient || !connected || !resumeDeletion && (!snapshot.authenticated || !hasSources);
-    $("scan-folders").disabled = busy || transient || !hasSources || !connected;
+    ["start-upload", "queue-start-upload"].forEach((id) => {
+      $(id).disabled = busy || transient || !connected || !resumeDeletion && (!snapshot.authenticated || !hasSources);
+    });
+    ["scan-folders", "queue-scan-folders"].forEach((id) => { $(id).disabled = busy || transient || !hasSources || !connected; });
     const pausable = ["scanning", "checking", "uploading", "pausing", "reconciling", "deleting"].includes(current);
-    setHidden("pause-upload", !pausable);
-    setHidden("start-upload", pausable);
-    $("pause-upload").disabled = current === "pausing" || pendingActions.has("pause") || pendingActions.has("password") || !connected;
-    $("pause-upload").querySelector("span").textContent = current === "scanning" ? "Остановить сканирование" : current === "pausing" ? "Сохраняем прогресс…" : current === "deleting" ? "Приостановить удаление" : "Приостановить";
+    ["pause-upload", "queue-pause-upload"].forEach((id) => {
+      setHidden(id, !pausable);
+      $(id).disabled = current === "pausing" || pendingActions.has("pause") || pendingActions.has("password") || !connected;
+      $(id).querySelector("span").textContent = current === "scanning" ? "Остановить сканирование" : current === "pausing" ? "Сохраняем прогресс…" : current === "deleting" ? "Приостановить удаление" : "Приостановить";
+    });
     const resumed = ["paused", "error"].includes(current) || finite(snapshot.stats && snapshot.stats.uploaded) > 0;
-    $("start-upload").querySelector("span").textContent = resumeDeletion ? "Продолжить удаление" : resumed ? "Продолжить загрузку" : "Начать загрузку";
+    ["start-upload", "queue-start-upload"].forEach((id) => {
+      setHidden(id, pausable);
+      $(id).querySelector("span").textContent = resumeDeletion ? "Продолжить удаление" : resumed ? "Продолжить загрузку" : "Начать загрузку";
+    });
+    $("export-queue").disabled = !canExportQueue();
+    $("export-queue").title = ["scanning", "reconciling"].includes(current) ? "Дождитесь завершения сканирования" : "Скачать задачи выбранного фильтра";
+    $("export-submit").disabled = !canExportQueue();
     const sourcesDisabled = busy || transient || resumeDeletion || !connected;
     ["add-source", "empty-add-source", "onboarding-source", "source-submit", "source-remove-submit", "browse-folders", "source-path", "source-alias", "source-remote-prefix"].forEach((id) => { $(id).disabled = sourcesDisabled; });
     document.querySelectorAll("[data-source-action]").forEach((button) => { button.disabled = sourcesDisabled; });
@@ -356,14 +378,76 @@
     updateScheduleControls();
   }
 
+  function renderApplicationStatus(state) {
+    const stats = state.stats || {}, activity = state.activity || {}, scheduler = state.scheduler || {};
+    const current = plain(activity.phase, "idle");
+    const errors = finite(stats.failed), enabled = finite(scheduler.enabled);
+    let title = "Готов к работе", description = "Все задачи обработаны. Можно запустить новое сканирование.", tone = "neutral", badge = "Ожидание", symbol = "cloud";
+    if (!connected) {
+      title = "Нет связи с сервером"; description = "На экране последние полученные данные. Проверяем подключение."; tone = "orange"; badge = "Нет связи"; symbol = "alert";
+    } else if (["scanning", "reconciling"].includes(current)) {
+      title = "Выполняется сканирование";
+      description = plain(activity.message) || (current === "reconciling" ? "Сравниваем найденные файлы с актуальным содержимым Облака." : "Создаём новый список задач из выбранных исходных папок.");
+      tone = "blue"; badge = current === "reconciling" ? "Сверка с Облаком" : "Сканирование"; symbol = "scan";
+    } else if (current === "pausing") {
+      title = "Приостанавливаем работу"; description = "Дожидаемся текущих операций и сохраняем результат."; tone = "orange"; badge = "Останавливаем"; symbol = "pause";
+    } else if (current === "deleting") {
+      title = "Выполняется удаление"; description = "Обрабатываем подтверждённый список задач и файлов."; tone = "orange"; badge = "Удаление"; symbol = "remove";
+    } else if (finite(stats.running) > 0 || current === "uploading") {
+      title = "Выполняется загрузка"; description = "Загружаются: " + taskCount(stats.running) + ". " + (enabled ? "Расписания включены." : "Ход выполнения показан в очереди."); tone = "blue"; badge = "Загрузка";
+    } else if (["login", "logout", "checking", "quota"].includes(current)) {
+      const info = phaseInfo[current] || phaseInfo.idle;
+      title = info[0]; description = plain(activity.message) || "Дожидаемся ответа Облака."; tone = info[2]; badge = info[1]; symbol = info[3];
+    } else if (state.auth_required === true || errors > 0 || plain(activity.last_error) || plain(scheduler.error)) {
+      title = "Требуются действия";
+      description = state.auth_required === true ? "Войдите в Mail.ru, чтобы продолжить работу." : errors > 0 ? "С ошибкой: " + taskCount(errors) + ". Подробности и повтор доступны в очереди." : plain(activity.last_error, plain(scheduler.error));
+      tone = "orange"; badge = "Внимание"; symbol = "alert";
+    } else if (state.deletion && state.deletion.resume_available === true) {
+      title = "Требуются действия"; description = "Подтверждённое удаление приостановлено. Его можно продолжить."; tone = "orange"; badge = "На паузе"; symbol = "pause";
+    } else if (!state.authenticated || !Array.isArray(state.sources) || state.sources.length === 0) {
+      title = "Требуются действия";
+      description = !state.authenticated ? "Подключите аккаунт Mail.ru для работы с Облаком." : "Добавьте исходные папки с фото и видео.";
+      tone = "orange"; badge = "Настройка"; symbol = "alert";
+    } else if (enabled > 0) {
+      title = "Работа по расписанию";
+      const next = scheduleDateTime(scheduler.next_run, plain(state.settings && state.settings.timezone, plain(scheduler.timezone, schedulesTimezone)));
+      description = finite(scheduler.queued) > 0 ? "Сработавшее расписание ожидает запуска." : next ? "Следующий запуск: " + next + "." : "Включено расписаний: " + count(enabled) + ".";
+      if (current === "paused") description = "Текущая работа на паузе. " + description;
+      tone = "green"; badge = "Расписание"; symbol = "clock";
+    } else if (current === "paused") {
+      title = "Загрузка приостановлена"; description = "Можно продолжить всю очередь или отдельную задачу."; tone = "orange"; badge = "На паузе"; symbol = "pause";
+    } else if (finite(stats.pending) + finite(stats.running) > 0) {
+      description = "Ожидают запуска: " + taskCount(finite(stats.pending) + finite(stats.running)) + ".";
+    } else if (finite(stats.total) === 0) {
+      description = "Запустите сканирование, чтобы создать задачи для исходных папок.";
+    }
+    setText("transfer-title", title); setText("activity-message", description);
+    setText("phase-badge", badge); $("phase-badge").className = "badge " + tone;
+    $("phase-icon").dataset.tone = tone;
+    const phaseUse = $("phase-icon").querySelector("use");
+    if (phaseUse) phaseUse.setAttribute("href", "#i-" + symbol);
+    setText("queue-activity-label", title);
+  }
+
+  function renderStorageCard(kind, plan) {
+    const total = plan[kind];
+    setText("stat-" + kind, total ? count(total.count) : "—");
+    setText("stat-" + kind + "-bytes", total ? bytes(total.bytes) : "Объём неизвестен");
+    ["unlimited", "regular", "unknown"].forEach((mode) => {
+      const value = plan[kind + "_" + mode];
+      setText("stat-" + kind + "-" + mode, value ? fileCount(value.count) + " · " + bytes(value.bytes) : "—");
+      if (mode === "unknown") setHidden("stat-" + kind + "-unknown-row", !value || finite(value.count) === 0);
+    });
+  }
+
   function renderState() {
     const state = snapshot || {};
     renderConnectivity();
     const stats = state.stats || {};
     const sources = Array.isArray(state.sources) ? state.sources : [];
     const activity = state.activity || {};
+    renderApplicationStatus(state);
     const current = phase();
-    const info = state.deletion && state.deletion.resume_available === true && !isBusy() ? ["Удаление приостановлено", "На паузе", "orange", "pause"] : phaseInfo[current] || phaseInfo.idle;
     const total = Math.max(0, finite(stats.total));
     const uploaded = Math.max(0, finite(stats.uploaded));
     const failed = Math.max(0, finite(stats.failed)), skipped = Math.max(0, finite(stats.skipped));
@@ -380,28 +464,25 @@
     setHidden("account-menu-logout", state.authenticated !== true);
     setHidden("account-menu-note", state.authenticated !== true);
     setText("nav-queue-count", count(finite(stats.pending) + finite(stats.running)));
-    setText("transfer-title", info[0]);
-    setText("phase-badge", info[1]);
-    $("phase-badge").className = "badge " + info[2];
-    $("phase-icon").replaceChildren(icon(info[3]));
-    let fallbackMessage = !state.authenticated ? "Подключите аккаунт Mail.ru." : sources.length === 0 ? "Добавьте исходную папку с фото и видео." : total === 0 ? "Нажмите «Начать загрузку»: клиент сам найдёт фото и видео." : "Прогресс задач сохранён. Можно продолжить работу.";
-    setText("activity-message", plain(activity.message, fallbackMessage) || fallbackMessage);
     setText("processed-count", count(processed));
     setText("total-count", count(total));
     setText("progress-percent", percentage.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%");
     $("overall-progress-fill").style.width = percentage + "%";
     $("overall-progress").setAttribute("aria-valuenow", percentage.toFixed(1));
     $("overall-progress").setAttribute("aria-valuetext", "Обработано задач: " + count(processed) + " из " + count(total));
-    setText("transfer-bytes", "Загружено: " + bytes(stats.uploaded_bytes) + " · Объём задач: " + bytes(stats.total_bytes));
+    setText("transfer-bytes", "Загружено: " + bytes(state.storage_plan && state.storage_plan.uploaded && state.storage_plan.uploaded.bytes) + " · Объём задач: " + bytes(stats.total_bytes));
     setText("transfer-outcomes", "Успешно: " + count(uploaded) + (existing ? " · Уже в Облаке: " + count(existing) : "") + " · Ошибок: " + count(failed) + " · Пропущено: " + count(skipped - existing));
     setText("stat-pending", count(finite(stats.pending) + finite(stats.running)));
     const byStatus = stats.bytes_by_status || {};
     setText("stat-pending-bytes", bytes(finite(byStatus.pending) + finite(byStatus.running)));
-    setText("stat-uploaded", count(uploaded));
-    setText("stat-uploaded-bytes", bytes(stats.uploaded_bytes));
+    renderStorageCard("uploaded", state.storage_plan || {});
+    renderStorageCard("existing", state.storage_plan || {});
     setText("stat-failed", count(failed));
+    setText("stat-failed-bytes", bytes(byStatus.failed));
     setText("stat-sources", count(sources.length));
-    setText("stat-skipped", "Пропущено: " + count(skipped - existing) + (existing ? " · Уже есть: " + count(existing) : ""));
+    setText("stat-sources-size", fileCount(total) + " · " + bytes(stats.total_bytes));
+    const existingBytes = finite(state.storage_plan && state.storage_plan.existing && state.storage_plan.existing.bytes);
+    setText("stat-skipped", "Пропущено: " + count(skipped - existing) + " · " + bytes(Math.max(0, finite(byStatus.skipped) - existingBytes)));
     const scan = activity.scan || {};
     setHidden("scan-live", current !== "scanning");
     setText("scan-seen", count(scan.seen));
@@ -510,7 +591,10 @@
     if (plan.uploaded_regular) detail.push("В квоте: " + bytes(plan.uploaded_regular.bytes));
     if (plan.uploaded_unknown && plan.uploaded_unknown.count) detail.push("Режим не определён: " + bytes(plan.uploaded_unknown.bytes));
     setText("plan-uploaded-detail", detail.join(" · "));
-    if ($("scan-warning-dialog").open) renderScanWarning();
+    if ($("scan-warning-dialog").open) {
+      if (scanWarningEligible()) renderScanWarning();
+      else $("scan-warning-dialog").close();
+    }
   }
 
   function renderScanWarning() {
@@ -527,15 +611,19 @@
     $("scan-warning-policy").className = "notice " + (upload ? "warning" : "info");
   }
 
+  function scanWarningEligible() {
+    const scan = snapshot && snapshot.last_scan, regular = snapshot && snapshot.storage_plan && snapshot.storage_plan.regular;
+    return Boolean(scan && scan.complete === true && scan.trigger === "manual" && scan.warning_allowed === true
+      && (snapshot.scan_id ?? scan.scan_id) != null && !["scanning", "reconciling"].includes(phase())
+      && regular && finite(regular.count) > 0);
+  }
+
   function maybeShowScanWarning() {
-    if (!snapshot || !session.authenticated || document.hidden || document.querySelector("dialog[open]")) return;
+    if (!snapshot || !session.authenticated || document.hidden || document.querySelector("dialog[open]") || !scanWarningEligible()) return;
     const scan = snapshot.last_scan;
-    const id = snapshot.scan_id ?? (scan && scan.scan_id);
-    if (!scan || scan.complete !== true || id == null || ["scanning", "reconciling"].includes(phase())) return;
+    const id = snapshot.scan_id ?? scan.scan_id;
     const key = plain(snapshot.account) + ":" + String(id);
     if (warnedScans.has(key)) return;
-    const regular = snapshot.storage_plan && snapshot.storage_plan.regular;
-    if (!regular || finite(regular.count) === 0) return;
     warnedScans.add(key);
     while (warnedScans.size > 100) warnedScans.delete(warnedScans.values().next().value);
     try { sessionStorage.setItem("mail-cloud.scan-warnings.v1", JSON.stringify([...warnedScans])); } catch { /* Memory deduplication still applies when browser storage is unavailable. */ }
@@ -668,15 +756,34 @@
     if (activePage === "schedules" && session.authenticated) loadSchedules();
   }
 
+  function renderJobsSort() {
+    $("jobs-limit").value = String(jobsLimit);
+    document.querySelectorAll("[data-sort-by]").forEach((button) => {
+      const active = button.dataset.sortBy === jobsSortBy;
+      button.parentElement.setAttribute("aria-sort", active ? jobsSort === "asc" ? "ascending" : "descending" : "none");
+      button.setAttribute("aria-label", jobsSortFields[button.dataset.sortBy] + ": сортировать " + (active && jobsSort === "asc" ? "по убыванию" : "по возрастанию"));
+      button.title = active ? jobsSort === "asc" ? "По возрастанию. Нажмите, чтобы изменить порядок." : "По убыванию. Нажмите, чтобы изменить порядок." : "Сортировать по этому столбцу";
+      button.classList.toggle("active", active);
+      button.querySelector("use").setAttribute("href", active ? "#i-chevron" : "#i-sort");
+    });
+  }
+
+  function saveJobsPreferences() {
+    try { localStorage.setItem("mail-cloud.queue.v2", JSON.stringify({ sort_by: jobsSortBy, sort: jobsSort, limit: jobsLimit })); }
+    catch { /* In-memory preferences still apply when browser storage is unavailable. */ }
+  }
+
   async function loadJobs(showLoading = true) {
     if (!session.authenticated || pendingActions.has("password")) return;
     const request = ++jobsRequest, generation = sessionGeneration;
-    const offset = jobsOffset, filter = jobsFilter, sort = jobsSort;
+    const offset = jobsOffset, filter = jobsFilter, sort = jobsSort, sortBy = jobsSortBy, limit = jobsLimit;
+    renderJobsSort();
     if (showLoading) setText("jobs-loading", "Обновляем…");
     try {
-      const query = new URLSearchParams({ status: filter, offset: String(offset), limit: String(jobsLimit), sort });
+      const query = new URLSearchParams({ status: filter, offset: String(offset), limit: String(limit), sort, sort_by: sortBy });
       const result = await api("/api/jobs?" + query.toString());
-      if (request !== jobsRequest || generation !== sessionGeneration || offset !== jobsOffset || filter !== jobsFilter || sort !== jobsSort) return;
+      if (request !== jobsRequest || generation !== sessionGeneration || offset !== jobsOffset || filter !== jobsFilter
+          || sort !== jobsSort || sortBy !== jobsSortBy || limit !== jobsLimit) return;
       jobsTotal = Math.max(0, finite(result.total));
       jobsTotalBytes = typeof result.total_bytes === "number" && Number.isFinite(result.total_bytes) ? Math.max(0, result.total_bytes) : null;
       if (jobsOffset >= jobsTotal && jobsOffset > 0) {
@@ -690,9 +797,9 @@
     }
   }
 
-  function scheduleDateTime(value) {
+  function scheduleDateTime(value, timezone = schedulesTimezone) {
     if (!Number.isFinite(value) || value <= 0) return "";
-    const zone = schedulesTimezone || snapshot && snapshot.settings && snapshot.settings.timezone || "Europe/Moscow";
+    const zone = timezone || snapshot && snapshot.settings && snapshot.settings.timezone || "Europe/Moscow";
     try {
       return new Intl.DateTimeFormat("ru-RU", { timeZone: zone, day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value * 1000));
     } catch { return dateTime(value); }
@@ -878,12 +985,41 @@
     await mutateSchedule("/api/schedules/save", body, { errorId: "schedule-error", close: "schedule-dialog", message: "Расписание сохранено." });
   }
 
-  function taskPrimaryAction(job) {
-    if (["uploaded", "skipped"].includes(job.status) || job.remove_requested === true) return null;
-    if (job.status === "running") return job.paused === true ? null : ["pause", "Остановить", "pause"];
-    if (job.status === "failed") return ["start", "Повторить попытку", "retry"];
-    if (job.paused === true || ["pending", "paused"].includes(job.status)) return ["start", "Запустить", "play"];
-    return null;
+  function taskActions(job) {
+    if (job.remove_requested === true || job.status === "uploaded" || job.status === "skipped" && job.skip_reason === "remote_exists") return [];
+    if (job.status === "running") return job.paused === true ? [] : [["pause", "Остановить", "pause"]];
+    if (job.status === "skipped") return [["return", "Вернуть в очередь", "retry"]];
+    if (job.status === "failed") return [["start", "Повторить попытку", "retry"], ["skip", "Пропустить", "skip"]];
+    if (job.paused === true || ["pending", "paused"].includes(job.status)) return [["start", job.paused === true ? "Продолжить" : "Запустить", "play"], ["skip", "Пропустить", "skip"]];
+    return [];
+  }
+
+  function taskActionDisabledReason(job, action) {
+    if (!connected || !session.authenticated) return "Нет подключения к панели.";
+    if (pendingTaskActions.has(job.id)) return "Предыдущая команда ещё выполняется.";
+    if (!canControlTasks() || job.remove_requested === true) return "Дождитесь завершения текущей операции.";
+    if (action === "start" && snapshot && !snapshot.authenticated) return "Сначала войдите в аккаунт Mail.ru.";
+    if (["start", "return"].includes(action) && job.planned_mode === "regular" && snapshot && snapshot.settings && snapshot.settings.regular_policy !== "upload") {
+      return "Для этой задачи требуется квота. Разрешите её использование в настройках.";
+    }
+    return "";
+  }
+
+  function taskPathMatches(job) {
+    if (typeof job.cloud_path_matches === "boolean") return job.cloud_path_matches;
+    return typeof job.cloud_path === "string" && typeof job.remote_path === "string" && job.cloud_path.normalize("NFC") === job.remote_path.normalize("NFC");
+  }
+
+  function taskCloudURL(job) {
+    return job.cloud_present !== true || job.cloud_deleted_at ? "" : taskLinkURL(job.cloud_url, true);
+  }
+
+  function taskIsCloudStatus(job) {
+    return job.status === "uploaded" || job.status === "skipped" && job.skip_reason === "remote_exists";
+  }
+
+  function storageDescription(mode) {
+    return mode === "unlimited" ? "Хранение: в безлимите." : mode === "regular" ? "Хранение: в квоте." : "Режим хранения не определён.";
   }
 
   function taskState(job) {
@@ -895,12 +1031,10 @@
       if (job.cloud_deleted_at) return ["Ошибка · в корзине", "red"];
       return jobStates.failed;
     }
-    if (job.cloud_present === true || job.status === "uploaded") {
-      if (job.observed_mode === "unlimited") return ["В безлимите", "green"];
-      if (job.observed_mode === "regular") return ["В квоте", "blue"];
-      return [job.status === "skipped" ? "Уже в Облаке" : "Загружена", "green"];
+    if (job.status === "skipped" && job.skip_reason === "remote_exists") {
+      return ["Уже в Облаке", taskPathMatches(job) ? "green" : "yellow"];
     }
-    if (job.status === "skipped" && job.skip_reason === "remote_exists") return ["Уже в Облаке", "green"];
+    if (job.status === "uploaded") return ["Выполнено", job.observed_mode === "unlimited" ? "green" : job.observed_mode === "regular" ? "yellow" : "neutral"];
     return jobStates[job.status] || ["Неизвестно", "neutral"];
   }
 
@@ -920,20 +1054,23 @@
   function createJobView(job) {
     const row = element("tr", "task-row"); row.dataset.taskId = String(job.id);
     const nameCell = element("td", "task-name-cell");
-    const name = element("div", "job-name"), fileIcon = icon("image"), label = element("span");
+    const name = element("a", "job-name"), fileIcon = icon("image"), label = element("span");
+    name.target = "_blank"; name.rel = "noopener noreferrer"; name.dataset.taskControl = "open";
     name.append(fileIcon, label); nameCell.append(name);
     const progressCell = element("td", "task-progress-cell"), progress = element("div", "task-progress");
     const track = element("div", "progress-track"), fill = element("div", "progress-fill"), percentage = element("span", "task-percent");
     track.setAttribute("role", "progressbar"); track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100");
     track.appendChild(fill); progress.append(track, percentage); progressCell.appendChild(progress);
-    const size = element("td", "task-size"), statusCell = element("td", "task-status-cell"), badge = element("span", "badge neutral");
-    statusCell.appendChild(badge);
-    const uploaded = element("td", "task-uploaded"), actionsCell = element("td", "task-actions-cell"), actions = element("div", "task-actions");
-    const menu = element("button", "icon-button task-menu-button"); menu.type = "button"; menu.dataset.taskControl = "menu";
-    menu.setAttribute("aria-haspopup", "menu"); menu.setAttribute("aria-expanded", "false"); menu.setAttribute("aria-controls", "task-action-menu"); menu.appendChild(icon("more", "small"));
+    const size = element("td", "task-size"), statusCell = element("td", "task-status-cell");
+    const cloudLink = element("a", "badge neutral task-status-link"); cloudLink.target = "_blank"; cloudLink.rel = "noopener noreferrer"; cloudLink.dataset.taskControl = "status";
+    const menu = element("button", "badge neutral task-status-button"); menu.type = "button"; menu.dataset.taskControl = "status";
+    const statusLabel = element("span"), statusChevron = icon("chevron", "task-status-chevron"); menu.append(statusLabel, statusChevron);
+    menu.setAttribute("aria-haspopup", "menu"); menu.setAttribute("aria-expanded", "false"); menu.setAttribute("aria-controls", "task-action-menu");
+    statusCell.append(cloudLink, menu);
+    const created = element("td", "task-created task-date"), completed = element("td", "task-completed task-date"), actionsCell = element("td", "task-actions-cell"), actions = element("div", "task-actions");
     const remove = element("button", "icon-button task-remove"); remove.type = "button"; remove.dataset.taskControl = "remove"; remove.appendChild(icon("remove", "small"));
-    actions.append(menu, remove); actionsCell.appendChild(actions); row.append(nameCell, progressCell, size, statusCell, uploaded, actionsCell);
-    const view = { row, name, fileIcon, label, badge, progress, percentage, track, fill, size, uploaded, actions, menu, remove, job, error: "" };
+    actions.appendChild(remove); actionsCell.appendChild(actions); row.append(nameCell, progressCell, size, statusCell, created, completed, actionsCell);
+    const view = { row, name, fileIcon, label, statusCell, cloudLink, statusLabel, statusChevron, progress, percentage, track, fill, size, created, completed, actions, menu, remove, job, error: "" };
     menu.addEventListener("click", () => actionMenuJobId === view.job.id ? closeTaskMenu(true) : openTaskMenu(view));
     menu.addEventListener("keydown", (event) => { if (["ArrowDown", "ArrowUp"].includes(event.key)) { event.preventDefault(); openTaskMenu(view, event.key === "ArrowUp"); } });
     remove.addEventListener("click", () => { if (remove.getAttribute("aria-disabled") !== "true") openDeletion(view.job); });
@@ -944,9 +1081,17 @@
     const job = view.job, pending = pendingTaskActions.get(job.id);
     const allowed = canControlTasks() && !pending && job.remove_requested !== true;
     const name = plain(job.relative_path, plain(job.local_path, "Файл"));
-    view.menu.setAttribute("aria-label", "Действия: " + name);
-    view.menu.title = view.error || "Действия с задачей";
+    const actions = taskActions(job), cloudURL = taskCloudURL(job);
+    const directCloud = taskIsCloudStatus(job) && Boolean(cloudURL);
+    view.cloudLink.hidden = !directCloud; view.menu.hidden = directCloud;
+    if (cloudURL) view.cloudLink.href = cloudURL;
+    else view.cloudLink.removeAttribute("href");
+    const actionable = actions.length > 0 || Boolean(cloudURL);
+    view.menu.disabled = !actionable;
+    view.statusChevron.hidden = !actionable;
+    view.menu.setAttribute("aria-label", taskState(job)[0] + ": " + name + (actionable ? ". Действия с задачей." : ""));
     view.menu.classList.toggle("has-error", Boolean(view.error));
+    if (view.error) view.menu.title = view.error + "\n" + view.statusCell.title;
     view.remove.setAttribute("aria-label", "Удалить задачу: " + name);
     view.remove.setAttribute("aria-disabled", String(!allowed));
     view.remove.title = "Выбрать, что удалить";
@@ -958,28 +1103,42 @@
     const fullName = plain(job.relative_path, plain(job.local_path, "Файл"));
     const name = fullName.split(/[\\/]/).filter(Boolean).pop() || fullName;
     view.label.textContent = name;
+    const sourceURL = taskLinkURL(job.preview_url) || taskLinkURL(job.download_url);
+    if (sourceURL) { view.name.href = sourceURL; view.name.removeAttribute("aria-disabled"); view.name.removeAttribute("tabindex"); }
+    else { view.name.removeAttribute("href"); view.name.setAttribute("aria-disabled", "true"); view.name.tabIndex = -1; }
+    view.name.setAttribute("aria-label", "Открыть файл: " + fullName);
     view.fileIcon.firstElementChild.setAttribute("href", "#i-" + mediaIcon(fullName));
     const reason = planReasons[plain(job.planned_reason)] || plain(job.planned_reason);
     const storageHint = job.planned_mode === "regular" ? "Ожидается загрузка в квоту" : job.planned_mode === "unlimited" ? "Кандидат в безлимит" : "";
     view.name.title = [plain(job.local_path, fullName), plain(job.cloud_path, plain(job.remote_path)), storageHint, reason].filter(Boolean).join("\n");
     const state = taskState(job);
-    view.badge.textContent = state[0]; view.badge.className = "badge " + state[1];
+    view.cloudLink.textContent = state[0]; view.cloudLink.className = "badge " + state[1] + " task-status-link";
+    view.statusLabel.textContent = state[0]; view.menu.className = "badge " + state[1] + " task-status-button";
     let detail = plain(job.last_error) || reason;
-    if (job.status === "skipped" && job.skip_reason === "remote_exists") detail = "Файл уже есть в указанной папке Облака. Повторная передача пропущена.";
+    if (job.status === "skipped" && job.skip_reason === "remote_exists") {
+      detail = taskPathMatches(job) ? "Файл найден по назначенному пути. Повторная передача не требуется." : "Файл найден в другой папке Облака. Повторная передача не требуется.";
+    } else if (job.status === "skipped" && job.skip_reason === "manual_skipped") detail = "Задача пропущена вручную. Её можно вернуть в очередь.";
+    if (job.cloud_present === true || taskIsCloudStatus(job)) {
+      detail += (detail ? "\n" : "") + storageDescription(job.observed_mode);
+      if (job.cloud_path) detail += "\nПуть в Облаке: " + job.cloud_path;
+      if (job.status === "skipped" && job.skip_reason === "remote_exists" && !taskPathMatches(job) && job.remote_path) detail += "\nНазначение источника: " + job.remote_path;
+    }
     if (job.status === "failed" && job.next_attempt != null) detail += (detail ? " · " : "") + "Повтор: " + dateTime(job.next_attempt);
-    view.badge.title = detail || state[0];
-    view.badge.setAttribute("aria-label", state[0] + (detail ? ": " + detail : ""));
+    view.statusCell.title = detail || state[0]; view.cloudLink.title = detail || state[0]; view.menu.title = detail || state[0];
+    view.cloudLink.setAttribute("aria-label", state[0] + ". Показать в Облаке. " + detail);
     view.size.textContent = bytes(job.size);
     view.size.title = count(job.size) + " байт";
-    const at = job.uploaded_at || job.cloud_observed_at;
-    view.uploaded.textContent = dateTime(at) || "—";
-    view.uploaded.title = at ? "Облако подтвердило файл: " + dateTime(at) : "Файл ещё не загружен";
+    view.created.textContent = dateTime(job.created_at) || "—";
+    view.created.title = job.created_at ? "Задача создана: " + dateTime(job.created_at) : "Дата создания неизвестна";
+    view.completed.textContent = dateTime(job.completed_at) || "—";
+    view.completed.title = job.completed_at ? "Обработка задачи завершена: " + dateTime(job.completed_at) : "Задача ещё не завершена";
     const progress = job.progress && typeof job.progress === "object" ? job.progress : null;
     const completed = job.status === "uploaded" || job.cloud_present === true;
     const total = Math.max(0, finite(progress && progress.total, finite(job.size)));
-    const sent = completed ? total : Math.max(0, Math.min(total, finite(progress && progress.sent)));
-    const percent = completed ? 100 : Math.max(0, Math.min(100, finite(progress && progress.percent, total > 0 ? sent / total * 100 : 0)));
-    const stage = completed ? "Передача завершена" : progress ? transferStages[plain(progress.stage)] || "Обработка" : job.status === "skipped" ? "Пропущено" : "Передача ещё не началась";
+    const sent = completed ? total : Math.max(0, Math.min(total, finite(progress && progress.sent, finite(job.progress_bytes))));
+    const percent = completed ? 100 : Math.max(0, Math.min(100, finite(progress && progress.percent, finite(job.progress_percent, total > 0 ? sent / total * 100 : 0))));
+    const paused = job.paused === true || job.status === "paused";
+    const stage = completed ? job.skip_reason === "remote_exists" ? "Файл уже в Облаке" : "Передача завершена" : paused ? "На паузе — прогресс сохранён" : progress ? transferStages[plain(progress.stage)] || "Обработка" : job.status === "skipped" ? "Пропущено" : sent > 0 ? "Сохранённый прогресс" : "Передача ещё не началась";
     const progressLabel = job.status === "skipped" && !completed ? "—" : Math.floor(percent) + "%";
     view.percentage.textContent = progressLabel;
     view.track.setAttribute("aria-label", "Передача: " + fullName);
@@ -987,7 +1146,8 @@
     view.track.setAttribute("aria-valuetext", stage + ": " + progressLabel);
     view.fill.style.width = percent + "%";
     view.progress.classList.toggle("complete", completed);
-    view.progress.classList.toggle("inactive", !progress && !completed);
+    view.progress.classList.toggle("paused", paused && !completed);
+    view.progress.classList.toggle("inactive", !progress && !completed && sent === 0);
     view.progress.title = stage + " · " + bytes(sent) + " / " + bytes(total);
     updateJobControls(view);
   }
@@ -998,17 +1158,19 @@
     if (current === focused.element && current.isConnected && !current.hidden) return;
     if (current && current !== document.body && current !== focused.element && current.isConnected) return;
     const view = jobViews.get(focused.id) || views[Math.min(focused.index, views.length - 1)];
-    const target = view ? focused.control === "remove" ? view.remove : view.menu : $("queue-title");
+    const target = view ? focused.control === "remove" ? view.remove : focused.control === "open" ? view.name : view.cloudLink.hidden ? view.menu : view.cloudLink : $("queue-title");
     target.focus({ preventScroll: true });
   }
 
   function taskMenuItems() { return [...$("task-action-menu").querySelectorAll('[role="menuitem"]')].filter((item) => !item.disabled && !item.hidden); }
   function closeTaskMenu(restoreFocus = false) {
     const view = jobViews.get(actionMenuJobId);
+    const hadMenuFocus = $("task-action-menu").contains(document.activeElement);
     if (view) view.menu.setAttribute("aria-expanded", "false");
     actionMenuJobId = null; actionMenuSignature = "";
     setHidden("task-action-menu", true);
-    if (restoreFocus && view && view.menu.isConnected) view.menu.focus({ preventScroll: true });
+    if (restoreFocus && view && view.menu.isConnected) (view.cloudLink.hidden ? view.menu.disabled ? view.name : view.menu : view.cloudLink).focus({ preventScroll: true });
+    else if (restoreFocus && hadMenuFocus) $("queue-title").focus({ preventScroll: true });
   }
   function positionTaskMenu() {
     const view = jobViews.get(actionMenuJobId), menu = $("task-action-menu");
@@ -1019,20 +1181,22 @@
     menu.style.left = left + "px"; menu.style.top = top + "px";
   }
   function openTaskMenu(view, last = false) {
+    if (view.menu.disabled || view.menu.hidden) return;
     closeTaskMenu(); actionMenuJobId = view.job.id;
     view.menu.setAttribute("aria-expanded", "true"); setHidden("task-action-menu", false);
     updateTaskMenu(); positionTaskMenu();
-    const items = taskMenuItems(); if (items.length) items[last ? items.length - 1 : 0].focus();
+    const items = taskMenuItems();
+    (items.length ? items[last ? items.length - 1 : 0] : $("task-action-menu")).focus();
   }
   function updateTaskMenu() {
     if (actionMenuJobId === null) return;
     const view = jobViews.get(actionMenuJobId);
-    if (!view) { closeTaskMenu(); return; }
-    const job = view.job, action = taskPrimaryAction(job), menu = $("task-action-menu");
-    const openURL = taskLinkURL(job.preview_url) || taskLinkURL(job.download_url);
-    const cloudURL = job.cloud_present === false || job.cloud_deleted_at ? "" : taskLinkURL(job.cloud_url, true);
-    const allowed = canControlTasks() && !pendingTaskActions.has(job.id);
-    const signature = JSON.stringify([job.id, openURL, cloudURL, action, allowed, view.error, job.planned_reason]);
+    if (!view) { closeTaskMenu(true); return; }
+    if (view.menu.hidden || view.menu.disabled) { closeTaskMenu(true); return; }
+    const job = view.job, actions = taskActions(job), menu = $("task-action-menu");
+    const cloudURL = taskCloudURL(job);
+    const disabledReasons = actions.map((action) => taskActionDisabledReason(job, action[0]));
+    const signature = JSON.stringify([job.id, cloudURL, actions, disabledReasons, view.error, job.last_error]);
     if (signature === actionMenuSignature) return;
     actionMenuSignature = signature;
     const focused = menu.contains(document.activeElement) ? document.activeElement.dataset.menuAction : null;
@@ -1044,16 +1208,19 @@
       node.append(icon(symbol, "small"), document.createTextNode(title));
       node.addEventListener("click", () => closeTaskMenu(true)); menu.appendChild(node);
     };
-    link(openURL, "external", "Открыть", "open");
-    link(cloudURL, "cloud", "В Облаке", "cloud");
-    if (action) {
+    link(cloudURL, "cloud", "Показать в Облаке", "cloud");
+    actions.forEach((action, index) => {
       const button = element("button", "task-menu-item"); button.type = "button";
-      button.setAttribute("role", "menuitem"); button.tabIndex = -1; button.dataset.menuAction = action[0]; button.disabled = !allowed;
+      button.setAttribute("role", "menuitem"); button.tabIndex = -1; button.dataset.menuAction = action[0]; button.disabled = Boolean(disabledReasons[index]);
+      if (disabledReasons[index]) button.title = disabledReasons[index];
       button.append(icon(action[2], "small"), document.createTextNode(action[1]));
       button.addEventListener("click", () => { closeTaskMenu(true); performTask(view, action[0]); }); menu.appendChild(button);
-    }
+    });
     if (!menu.children.length) menu.appendChild(element("p", "task-menu-note", "Для этой задачи нет доступных действий."));
-    if (view.error) menu.appendChild(element("p", "task-menu-note error", view.error));
+    const disabledNote = disabledReasons.find(Boolean);
+    if (disabledNote) menu.appendChild(element("p", "task-menu-note", disabledNote));
+    const error = view.error || plain(job.last_error);
+    if (error) menu.appendChild(element("p", "task-menu-note error", error));
     if (focused) {
       const item = [...menu.querySelectorAll("[data-menu-action]")].find((node) => node.dataset.menuAction === focused && !node.disabled);
       (item || taskMenuItems()[0] || view.menu).focus({ preventScroll: true });
@@ -1095,7 +1262,7 @@
   async function performTask(view, action) {
     const job = view.job;
     if (!canControlTasks() || pendingTaskActions.has(job.id) || job.remove_requested === true) return;
-    if (!taskPrimaryAction(job) || taskPrimaryAction(job)[0] !== action) return;
+    if (!taskActions(job).some((item) => item[0] === action) || taskActionDisabledReason(job, action)) return;
     if (action === "pause" && job.paused === true) return;
     pendingTaskActions.set(job.id, action); view.error = ""; updateControls();
     let accepted = false;
@@ -1104,13 +1271,42 @@
       accepted = true;
       await refreshState();
       if (activePage === "queue") await loadJobs(false);
-      toast(action === "pause" ? "Останавливаем выбранную задачу." : "Выбранная задача запущена.");
+      const messages = { pause: "Останавливаем выбранную задачу.", start: "Выбранная задача запущена.", skip: "Задача пропущена. Её можно вернуть в очередь.", return: "Задача возвращена в очередь." };
+      toast(messages[action]);
     } catch (error) {
       view.error = accepted ? "Команда принята, но состояние не удалось обновить. " + error.message : error.message;
       toast(view.error, true);
     } finally {
       pendingTaskActions.delete(job.id); updateControls(); schedulePoll(true);
     }
+  }
+
+  function openQueueExport() {
+    if (!canExportQueue()) return;
+    const filters = ["all", "uploaded_unlimited", "uploaded_regular", "failed", "skipped"];
+    $("export-filter").value = filters.includes(jobsFilter) ? jobsFilter : "all";
+    setText("export-sort-description", "Порядок строк: «" + jobsSortFields[jobsSortBy] + "», " + (jobsSort === "asc" ? "по возрастанию." : "по убыванию."));
+    setError("export-error"); showDialog("export-dialog");
+  }
+
+  function downloadQueueExport(event) {
+    event.preventDefault(); setError("export-error");
+    if (!canExportQueue()) { setError("export-error", "Дождитесь завершения сканирования и проверьте подключение к панели."); return; }
+    const fields = [...document.querySelectorAll('[name="export-field"]:checked')].map((input) => input.value).filter((value) => ["path", "name", "size", "status"].includes(value));
+    if (fields.length === 0) {
+      setError("export-error", "Выберите хотя бы один столбец.");
+      document.querySelector('[name="export-field"]').focus(); return;
+    }
+    const params = new URLSearchParams({ status: $("export-filter").value, fields: fields.join(","),
+      format: $("export-format").value, delimiter: $("export-delimiter").value,
+      header: $("export-header").checked ? "1" : "0", sort_by: jobsSortBy, sort: jobsSort });
+    // Let the browser stream a large export to disk instead of materializing
+    // hundreds of thousands of rows in this tab's JavaScript memory.
+    const download = document.createElement("a");
+    download.href = "/api/jobs/export?" + params.toString();
+    download.download = "mail-cloud-tasks." + ($("export-format").value === "txt" ? "txt" : "csv");
+    download.hidden = true; document.body.appendChild(download); download.click(); download.remove();
+    $("export-dialog").close(); toast("Загрузка списка начата.");
   }
 
   function deleteRequestBody() {
@@ -1435,10 +1631,11 @@
   $("account-menu-logout").addEventListener("click", logoutMail);
   ["logout-panel", "logout-panel-settings"].forEach((id) => $(id).addEventListener("click", logoutPanel));
   $("refresh-connection").addEventListener("click", () => { clearTimeout(pollTimer); poll(); });
-  $("start-upload").addEventListener("click", () => perform("start", "/api/start"));
-  $("pause-upload").addEventListener("click", () => perform("pause", "/api/pause", {}, { message: "Останавливаем текущую работу и сохраняем прогресс…" }));
-  $("scan-folders").addEventListener("click", () => perform("scan", "/api/scan"));
+  ["start-upload", "queue-start-upload"].forEach((id) => $(id).addEventListener("click", () => perform("start", "/api/start")));
+  ["pause-upload", "queue-pause-upload"].forEach((id) => $(id).addEventListener("click", () => perform("pause", "/api/pause", {}, { message: "Останавливаем текущую работу и сохраняем прогресс…" })));
+  ["scan-folders", "queue-scan-folders"].forEach((id) => $(id).addEventListener("click", () => perform("scan", "/api/scan")));
   $("view-errors").addEventListener("click", () => { setFilter("failed"); location.hash = "queue"; if (activePage === "queue") loadJobs(); });
+  $("view-existing").addEventListener("click", () => { setFilter("existing"); location.hash = "queue"; if (activePage === "queue") loadJobs(); });
   ["onboarding-login"].forEach((id) => $(id).addEventListener("click", openMail));
   ["add-source", "empty-add-source", "onboarding-source"].forEach((id) => $(id).addEventListener("click", () => openSource()));
   $("mail-form").addEventListener("submit", async (event) => {
@@ -1483,12 +1680,22 @@
 
   function setFilter(filter) {
     closeTaskMenu();
-    jobsFilter = ["all", "pending", "running", "paused", "uploaded_unlimited", "uploaded_regular", "failed", "skipped"].includes(filter) ? filter : "all";
+    jobsFilter = ["all", "pending", "running", "paused", "uploaded_unlimited", "uploaded_regular", "existing", "failed", "skipped"].includes(filter) ? filter : "all";
     jobsOffset = 0;
     document.querySelectorAll(".filter-tab").forEach((button) => { const active = button.dataset.filter === jobsFilter; button.classList.toggle("active", active); button.setAttribute("aria-pressed", String(active)); });
   }
   document.querySelectorAll(".filter-tab").forEach((button) => button.addEventListener("click", () => { setFilter(button.dataset.filter); loadJobs(); }));
-  $("jobs-sort").addEventListener("change", () => { closeTaskMenu(); jobsSort = $("jobs-sort").value === "desc" ? "desc" : "asc"; jobsOffset = 0; loadJobs(); });
+  document.querySelectorAll("[data-sort-by]").forEach((button) => button.addEventListener("click", () => {
+    const field = button.dataset.sortBy;
+    if (!Object.hasOwn(jobsSortFields, field)) return;
+    closeTaskMenu(); jobsSort = jobsSortBy === field && jobsSort === "asc" ? "desc" : "asc"; jobsSortBy = field;
+    jobsOffset = 0; saveJobsPreferences(); renderJobsSort(); loadJobs();
+  }));
+  $("jobs-limit").addEventListener("change", () => {
+    const value = Number($("jobs-limit").value);
+    closeTaskMenu(); jobsLimit = jobsPageSizes.includes(value) ? value : 50; jobsOffset = 0;
+    saveJobsPreferences(); renderJobsSort(); loadJobs();
+  });
   $("jobs-prev").addEventListener("click", () => { jobsOffset = Math.max(0, jobsOffset - jobsLimit); loadJobs(); });
   $("jobs-next").addEventListener("click", () => { if (jobsOffset + jobsLimit < jobsTotal) { jobsOffset += jobsLimit; loadJobs(); } });
   $("retry-errors").addEventListener("click", () => { $("retry-permanent").checked = false; setError("retry-error"); showDialog("retry-dialog"); });
@@ -1498,6 +1705,8 @@
     finally { $("retry-submit").disabled = false; }
   });
   $("clear-queue").addEventListener("click", () => openDeletion());
+  $("export-queue").addEventListener("click", openQueueExport);
+  $("export-form").addEventListener("submit", downloadQueueExport);
   ["queue-clear-scope", "delete-cloud", "delete-local"].forEach((id) => $(id).addEventListener("change", () => {
     $("delete-local-confirm").value = "";
     scheduleDeletePreview();
@@ -1569,6 +1778,7 @@
     if (success) { settingsDirty = false; if (snapshot) renderSettings(snapshot); }
   });
 
+  renderJobsSort();
   navigate(location.hash.slice(1));
   (async () => {
     try {

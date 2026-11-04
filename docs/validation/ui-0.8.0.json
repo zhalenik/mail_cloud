@@ -1,0 +1,73 @@
+{
+  "target_release": "0.8.0",
+  "checked_at_utc": "2026-11-04T14:49:59+00:00",
+  "source": {
+    "base_commit": "0f0edc7a838a016e11814207d709e899fec303b2",
+    "scope": "release working tree before version bump",
+    "observed_app_version": "0.7.0"
+  },
+  "status": "passed",
+  "browser": "153.0.8010.0",
+  "viewports": [
+    {
+      "width": 1440,
+      "height": 1000
+    },
+    {
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "offline": true,
+  "user_credentials_used": false,
+  "external_network_attempts": 0,
+  "javascript_errors": 0,
+  "checks_passed_total": 135,
+  "suites": [
+    {
+      "name": "UI with local HTTP response fixtures",
+      "checks_passed": 85,
+      "backend": "mock responses; production HTML, CSS and JavaScript",
+      "coverage": [
+        "All six sortable columns in both directions; server query parameters and persisted page size.",
+        "Direct source/cloud links, conditional status menus, keyboard focus and disabled actions.",
+        "Unknown storage modes, same/alternate cloud paths, failed files retained in quota.",
+        "Frozen progress, single-line task rows, overview totals and activity state priority.",
+        "Five export filters, four selectable fields, TXT/CSV options and native browser download.",
+        "Quota warnings gated by manual completed verified scans; automatic/scheduled scans suppressed.",
+        "Desktop/mobile layout and safe text/URL rendering."
+      ],
+      "task_row_height_px": 43
+    },
+    {
+      "name": "UI with production controller and temporary SQLite",
+      "checks_passed": 50,
+      "backend": "WebApplication and WebService through local threaded WSGI; real queue, runner, inventory and export code",
+      "replaced_boundaries": [
+        "Mail login uses offline test tokens.",
+        "Cloud transport, quota, metadata and byte transfer use FakeCloud from tests/test_runner.py with controlled pause fixtures."
+      ],
+      "coverage": [
+        "Panel password setup, logout/login, session cookie and CSRF-protected actions.",
+        "Cyrillic source registration, six synthetic media tasks and complete cloud reconciliation.",
+        "Exact/alternate cloud matches with separate storage totals and only one new quota candidate.",
+        "Six sorts, page-size selection, manual skip and return without uploading.",
+        "Authenticated JPEG preview and Unicode M4V download.",
+        "Individual unlimited photo upload and ordinary M4V upload without false metadata error.",
+        "Task pause checkpoint and saved authorization survive WebApplication/WebService reinitialization.",
+        "Paused task resumes; real CSV export has UTF-8 BOM and quotes a delimiter inside a filename.",
+        "Fresh scans replace task IDs, requeue deleted cloud objects and match renamed local files without duplicate tasks."
+      ],
+      "source_tasks": 6,
+      "export_rows": 6,
+      "fresh_scan_count": 4,
+      "confirmed_unlimited_uploads": 2,
+      "confirmed_regular_uploads": 1
+    }
+  ],
+  "limitations": [
+    "No live Mail account, actual cloud quota or real media eligibility was tested; media and credentials were synthetic.",
+    "Restart coverage reinitializes WebApplication and WebService with persisted temporary state; it does not restart a Docker container or a NAS.",
+    "The working tree was tested before its version constant was updated; this report does not validate a published container image."
+  ]
+}
