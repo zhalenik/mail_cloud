@@ -15,7 +15,7 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-ARG VERSION=0.7.0
+ARG VERSION=0.8.0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Mail Cloud Photo Client" \
       org.opencontainers.image.description="Resumable photo and video import with a browser interface" \

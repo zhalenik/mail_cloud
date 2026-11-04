@@ -1,0 +1,157 @@
+{
+  "release": "0.8.0",
+  "checked_at_utc": "2026-11-04T15:01:18.491313+00:00",
+  "scope": "Installed wheel and offline local release gates; container is separately gated in GitHub Actions before publication",
+  "status": "passed",
+  "environment": {
+    "python": "3.12.14",
+    "sqlite": "3.53.1",
+    "os": "Linux",
+    "architecture": "x86_64"
+  },
+  "application_tests": {
+    "count": 649,
+    "seconds": 102.319,
+    "installed_isolated_import": true
+  },
+  "release_safeguard_tests": 19,
+  "package": {
+    "version": "0.8.0",
+    "dependencies_checked": true,
+    "resources_checked": true,
+    "timezone_fallback_checked": true,
+    "cli_entry_points_checked": true,
+    "wheel_sha256": "0df3c4d7a3c7c0a0578d9f16aa827e8628241dcbc1f759b3a92b33e23812f9fb"
+  },
+  "historical_upgrade_cases": 7,
+  "browser_checks": 135,
+  "cloud_inventory_objects": 300000,
+  "secret_review": {
+    "scanner": "gitleaks 8.30.1",
+    "confirmed_secret_findings": 0,
+    "historical_checksum_false_positives": 2,
+    "false_positive_verification": "Both are SHA-256 hashes matching historical api.py/auth.py blobs at the v0.7.0 source commit",
+    "private_account_address_path_matches": 0
+  },
+  "live_mail_account_used": false,
+  "user_media_used": false,
+  "truenas_accessed": false,
+  "source_files": [
+    {
+      "path": "mailru_photos/__init__.py",
+      "sha256": "c357dd56f80424ba4d4004162493b58e1e97809db99aba612c975d06a56079e6"
+    },
+    {
+      "path": "mailru_photos/__main__.py",
+      "sha256": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
+    },
+    {
+      "path": "mailru_photos/api.py",
+      "sha256": "7c663414518497cb9feb58f3ed899c073502b8bdd0d4818c4d70b807c8af15bf"
+    },
+    {
+      "path": "mailru_photos/auth.py",
+      "sha256": "5724d875199a2e5950370f9a220ba2470761b248c743ebcfa3a3c922b08c4127"
+    },
+    {
+      "path": "mailru_photos/cli.py",
+      "sha256": "1534718af600cbacf712a0ebfe1674ea7155fad665974511285b5db1590b4605"
+    },
+    {
+      "path": "mailru_photos/content.py",
+      "sha256": "169a51b7f0504fb2222b7db3787a6790869ace54d12fb6f46a373d406d661158"
+    },
+    {
+      "path": "mailru_photos/deletion.py",
+      "sha256": "88ed9199ce290ec2b72e531475121b8660a27a0cf8b028d28395719962156e2e"
+    },
+    {
+      "path": "mailru_photos/export.py",
+      "sha256": "092c9a185a17ae9f4209020f2047ae29a8e5d65b0591774eac3d6b08072956d3"
+    },
+    {
+      "path": "mailru_photos/inventory.py",
+      "sha256": "bed6e5d39f78c4694e9b0f8f1642d09c433682395dadea9b02f6ca253824e99a"
+    },
+    {
+      "path": "mailru_photos/media.py",
+      "sha256": "25b4550ae8e4d391386e42fba1068f5c8291fdf2bdebc89f3f2ef6b834bcd00b"
+    },
+    {
+      "path": "mailru_photos/metadata.py",
+      "sha256": "9b81855012aff374a83646c6ae12a3012a741b20f0075378208d6c58407b735d"
+    },
+    {
+      "path": "mailru_photos/queue.py",
+      "sha256": "0df83f8d96333963c13d6736ce027aeec18f44fb7e92f6c36d7d4d65956d0ba0"
+    },
+    {
+      "path": "mailru_photos/reconcile.py",
+      "sha256": "6b7ab168c85c890db7c8d87dfdb2ebfec05a25c4d43d02ce2460478d8ce3d8f9"
+    },
+    {
+      "path": "mailru_photos/runner.py",
+      "sha256": "c91924b414ce57902118d301e7569f5055e6970593c8fe5e3386f7e8e1913faa"
+    },
+    {
+      "path": "mailru_photos/scheduler.py",
+      "sha256": "a0c7b654c300e4164c03e87987901b687f0319d03c7bc9b7d2f90fb1dc4d81b0"
+    },
+    {
+      "path": "mailru_photos/transport.py",
+      "sha256": "758ec704f2990917326be0e4f8bad0a5476c95d2ff8e1351f331e57fa8716561"
+    },
+    {
+      "path": "mailru_photos/web.py",
+      "sha256": "9ab8a7211c6459065a58c7f0bf0f988256b3c154c344cb92f6152d81ecb71558"
+    },
+    {
+      "path": "mailru_photos/web_service.py",
+      "sha256": "3a7a9e95819562f6ee0b8b698d313b3f99d46d36f296d170f4ba52dbf7c21292"
+    },
+    {
+      "path": "mailru_photos/web_static/app.js",
+      "sha256": "9b17aa369078aae1981133d8c85edbdfd321a783c94c2fc0172f526d7fea84e8"
+    },
+    {
+      "path": "mailru_photos/web_static/index.html",
+      "sha256": "01575420ead4b39780a2cca5f56de623f34623973bb74b636912d03756706948"
+    },
+    {
+      "path": "mailru_photos/web_static/style.css",
+      "sha256": "d79d8b7c78d732d475b55e1f6fb39e085335f78c0ee62e43a0aea71b0ea49960"
+    },
+    {
+      "path": "scripts/benchmark_inventory.py",
+      "sha256": "9c152886dfe72c3aad5b9aa4f5fd96d9ef87a73f8212c9ce07f66b45d1dd8a71"
+    },
+    {
+      "path": "scripts/benchmark_queue.py",
+      "sha256": "5d86ae670e5ac0ddd8fde77933bdee4f8a7b283d308c57380df90105cd1d8e6c"
+    },
+    {
+      "path": "scripts/build_sqlite.py",
+      "sha256": "451e2234dc96fc8e5d70ada62dbbb9d31189b35a304860c0c6b681d84645e9dd"
+    },
+    {
+      "path": "scripts/check_package.py",
+      "sha256": "0fdb03eff901617d973e3f5d721164494add4b1a57b32538cfa61820afb0af7b"
+    },
+    {
+      "path": "scripts/check_upgrade.py",
+      "sha256": "6685ad8d91593c2ef530d7002d497538eb46ce2d8367b61978255af998175264"
+    },
+    {
+      "path": "scripts/release.py",
+      "sha256": "2c71604d0b8b93c71c15bafbe71e94771c21363ddd99a789fa5001807b5a8888"
+    },
+    {
+      "path": "scripts/smoke_container.py",
+      "sha256": "59ee12675e983197fbd444a4df8a2771c0a07eeddd001f6745cf8172854e27b8"
+    },
+    {
+      "path": "scripts/tests/test_release.py",
+      "sha256": "a7a1096aba65b25f01d695f079bd4f893e3853a008f74b79aeceac6e1971aa9f"
+    }
+  ]
+}

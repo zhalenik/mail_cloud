@@ -191,7 +191,7 @@ def smoke(image: str, *, version: str | None = None) -> None:
                                                         "unexpected_unlimited_action": "keep"}, session["csrf"])
                 require(changed["settings"]["regular_policy"] == "upload", "Quota policy was not saved")
                 require(changed["settings"]["unexpected_unlimited_action"] == "keep", "Unexpected outcome policy was not saved")
-                require(initial["settings"]["remote_reconcile"] is False, "Remote comparison must be opt-in")
+                require(initial["settings"]["remote_reconcile"] is True, "Fresh remote comparison must default to enabled")
                 require(initial["quota"] is None, "An account-free image must not invent quota values")
                 sources, _ = request("/api/sources/add", {"path":"/photos/Семейный архив", "alias":"Семья", "remote_prefix":"/Архив/Семья"}, session["csrf"])
                 source_id = sources["sources"][0]["id"]
@@ -226,6 +226,37 @@ def smoke(image: str, *, version: str | None = None) -> None:
                 regular_tasks, _ = request("/api/jobs?status=uploaded_regular&sort=desc")
                 require(regular_tasks["total"] == 0 and regular_tasks["total_bytes"] == 0,
                         "Empty observed storage filter returned unexpected totals")
+                require(task["created_at"] is not None and task["completed_at"] is None,
+                        "Pending tasks must have distinct created and completion dates")
+                for field in ("name", "progress", "status", "size", "created_at", "completed_at"):
+                    for order in ("asc", "desc"):
+                        sorted_tasks, _ = request(f"/api/jobs?sort_by={field}&sort={order}&limit=200")
+                        require(sorted_tasks["jobs"][0]["id"] == task["id"] and sorted_tasks["limit"] == 200,
+                                "Server-side sorting or page size failed")
+                request("/api/tasks/skip", {"id": task["id"]}, session["csrf"])
+                skipped, _ = request("/api/jobs?status=skipped")
+                require(skipped["total"] == 1, "Manual skip did not update filtered totals")
+                request("/api/tasks/return", {"id": task["id"]}, session["csrf"])
+                returned, _ = request("/api/jobs?status=pending")
+                require(returned["total"] == 1, "Return to queue must not start an account-free task")
+                body, headers = request("/api/jobs/export?format=csv&fields=name,size&delimiter=semicolon&header=1")
+                require(body.startswith(b"\xef\xbb\xbf") and "снимок.png" in body.decode("utf-8-sig"),
+                        "Queue export must preserve UTF-8 filenames and a CSV BOM")
+                require(headers.get("Content-Disposition", "").startswith("attachment"), "Queue export is not a download")
+                request("/api/scan", {}, session["csrf"])
+                deadline = time.monotonic() + 30
+                while True:
+                    scanned, _ = request("/api/state")
+                    if scanned["activity"]["phase"] != "scanning":
+                        break
+                    require(time.monotonic() < deadline, "Fresh fixture rescan did not finish")
+                    time.sleep(0.1)
+                fresh, _ = request("/api/jobs")
+                require(fresh["total"] == 1 and fresh["jobs"][0]["id"] > task["id"],
+                        "Rescan must replace tasks without duplicating the source")
+                task = fresh["jobs"][0]
+                require(scanned["last_scan"]["cloud_pending"] is True and scanned["last_scan"]["warning_allowed"] is False,
+                        "Without an account the scan must not claim a completed cloud comparison")
                 schedules, _ = request("/api/schedules/save", {"name":"Ночной архив", "source_ids":[source_id],
                     "time":"23:45", "mode":"weekly", "weekdays":[1,2,3,4,5,6,7], "month_days":[],
                     "enabled":False}, session["csrf"])
