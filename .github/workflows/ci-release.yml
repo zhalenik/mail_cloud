@@ -12,6 +12,10 @@ permissions:
   contents: read
 
 jobs:
+  browser:
+    name: Browser interaction gate
+    uses: ./.github/workflows/browser-validation.yml
+
   test:
     name: Installed package and release safeguards
     runs-on: ubuntu-24.04
@@ -70,7 +74,7 @@ jobs:
   release:
     name: Publish immutable version and promote stable
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: test
+    needs: [test, browser]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:

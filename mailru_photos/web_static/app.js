@@ -84,6 +84,10 @@
   let removingSourceId = null;
   let sourcesSignature = null;
   let sourcesOffset = 0;
+  let sourcesTotal = 0, sourcesPage = [], sourcesLoaded = false, sourcesRequest = 0;
+  const knownSources = new Map();
+  let scheduleSourceOffset = 0, scheduleSourceTotal = 0, scheduleSourcePage = [], scheduleSourceRequest = 0, scheduleSearchTimer = null;
+  const selectedScheduleSources = new Set();
   let settingsDirty = false;
   let connected = true;
   let accessBusy = false;
@@ -279,9 +283,8 @@
     let value, resolvedSourceId = sourceId;
     try { value = await api("/api/state" + (sourceId !== null ? "?source_id=" + encodeURIComponent(sourceId) : "")); }
     catch (error) {
-      if (sourceId === null || ![400, 404].includes(error.status) || generation !== sessionGeneration || sourceId !== currentViewSourceId) throw error;
+      if (sourceId === null || !(error.status === 404 && error.code === "source_not_found") || generation !== sessionGeneration || sourceId !== currentViewSourceId) throw error;
       const all = await api("/api/state");
-      if (Array.isArray(all.sources) && all.sources.some((source) => source.id === sourceId)) throw error;
       if (generation !== sessionGeneration || sourceId !== currentViewSourceId) return;
       currentViewSourceId = null; resolvedSourceId = null; jobsOffset = 0; value = all;
       toast("Источник больше не существует. Показаны все источники.");
@@ -305,6 +308,7 @@
       await refreshState();
       if (pendingActions.has("password")) return;
       if (activePage === "queue") await loadJobs(false);
+      if (activePage === "sources") await loadSources(false);
       if (activePage === "schedules") await loadSchedules(false);
       if (activePage === "plans") await loadPlans(false);
       if (planWizard.inventory && $("plan-wizard").open) await refreshInventory();
@@ -337,7 +341,7 @@
 
   function updateControls() {
     if (!snapshot) return;
-    const hasSources = Array.isArray(snapshot.sources) && snapshot.sources.length > 0;
+    const hasSources = finite(snapshot.sources_total, Array.isArray(snapshot.sources) ? snapshot.sources.length : 0) > 0;
     const busy = isBusy();
     const transient = anyAction();
     const current = phase();
@@ -469,9 +473,12 @@
   function renderState() {
     const state = snapshot || {};
     renderConnectivity();
-    renderSourceScope();
     const stats = state.stats || {};
     const sources = Array.isArray(state.sources) ? state.sources : [];
+    rememberSources(sources);
+    if (state.selected_source) rememberSources([state.selected_source]);
+    sourcesTotal = finite(state.sources_total, sources.length);
+    renderSourceScope();
     const activity = state.activity || {};
     renderApplicationStatus(state);
     const current = phase();
@@ -506,7 +513,7 @@
     renderStorageCard("existing", state.storage_plan || {});
     setText("stat-failed", count(failed));
     setText("stat-failed-bytes", bytes(byStatus.failed));
-    setText("stat-sources", count(sources.length));
+    setText("stat-sources", count(sourcesTotal));
     setText("stat-sources-size", fileCount(total) + " · " + bytes(stats.total_bytes));
     const existingBytes = finite(state.storage_plan && state.storage_plan.existing && state.storage_plan.existing.bytes);
     setText("stat-skipped", "Пропущено: " + count(skipped - existing) + " · " + bytes(Math.max(0, finite(byStatus.skipped) - existingBytes)));
@@ -529,7 +536,7 @@
     renderOnboarding(state, sources);
     renderActiveFiles(Array.isArray(activity.current_files) ? activity.current_files : []);
     renderEvents(Array.isArray(state.events) ? state.events : []);
-    renderSources(sources);
+    if (!sourcesLoaded && sourcesOffset === 0) { sourcesPage = sources; renderSources(sourcesPage, sourcesTotal); }
     renderSettings(state);
     renderQuota(state);
     renderStoragePlan(state);
@@ -590,7 +597,7 @@
   }
 
   function renderOnboarding(state, sources) {
-    const completed = [state.authenticated === true, sources.length > 0];
+    const completed = [state.authenticated === true, finite(state.sources_total, sources.length) > 0];
     setHidden("onboarding", completed.every(Boolean));
     setText("setup-count", completed.filter(Boolean).length + " из 2");
     ["account", "sources"].forEach((name, index) => {
@@ -602,7 +609,7 @@
       node.querySelector("button").hidden = completed[index];
     });
     setText("step-account-text", completed[0] ? plain(state.account, "Вход сохранён") : "Войдите с паролем приложения");
-    setText("step-sources-text", completed[1] ? "Подключено папок: " + count(sources.length) : "Откуда читать и куда загружать файлы");
+    setText("step-sources-text", completed[1] ? "Подключено источников: " + count(finite(state.sources_total, sources.length)) : "Откуда читать и куда загружать файлы");
   }
 
   function renderStoragePlan(state) {
@@ -731,7 +738,9 @@
   function scopeUsesPlan() {
     const sources = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources : [];
     if (currentViewSourceId !== null) return Boolean(sourceById(currentViewSourceId) && sourceById(currentViewSourceId).owner_key);
-    return sources.length > 0 && sources.every((source) => source.owner_key);
+    const total = finite(snapshot && snapshot.sources_total, sources.length);
+    if (typeof (snapshot && snapshot.manual_sources_total) === "number") return total > 0 && snapshot.manual_sources_total === 0;
+    return total === sources.length && total > 0 && sources.every((source) => source.owner_key);
   }
   function startCurrentScope() {
     if (scopeUsesPlan() && !(snapshot && snapshot.deletion && snapshot.deletion.resume_available)) { location.hash = "plans"; return; }
@@ -759,14 +768,32 @@
     await selectSourceScope(id, "overview");
     await perform("start", "/api/start", sourceScopeBody());
   }
-  function renderSources(sources) {
-    setHidden("sources-empty", sources.length > 0);
-    if (sourcesOffset >= sources.length && sourcesOffset > 0) sourcesOffset = Math.max(0, Math.floor((sources.length - 1) / 50) * 50);
-    const page = sources.slice(sourcesOffset, sourcesOffset + 50);
-    setText("sources-page-label", sources.length ? "Источники " + count(sourcesOffset + 1) + "–" + count(sourcesOffset + page.length) + " из " + count(sources.length) : "");
-    $("sources-prev").disabled = sourcesOffset === 0; $("sources-next").disabled = sourcesOffset + 50 >= sources.length;
-    setHidden("sources-pagination", sources.length <= 50);
-    const signature = JSON.stringify([sourcesOffset, page]);
+  function rememberSources(sources) {
+    sources.forEach((source) => { if (!source || typeof source.id !== "number") return; knownSources.delete(source.id); knownSources.set(source.id, source); });
+    while (knownSources.size > 200) {
+      const key = [...knownSources.keys()].find((id) => id !== currentViewSourceId && id !== editingSourceId && id !== removingSourceId);
+      if (key === undefined) break; knownSources.delete(key);
+    }
+  }
+  async function loadSources(showLoading = true) {
+    if (!session.authenticated || pendingActions.has("password")) return;
+    const request = ++sourcesRequest, generation = sessionGeneration, offset = sourcesOffset;
+    if (showLoading) setText("sources-loading", "Обновляем…");
+    try {
+      const result = await api(queryURL("/api/sources", { offset, limit: 50 }));
+      if (request !== sourcesRequest || generation !== sessionGeneration || offset !== sourcesOffset) return;
+      sourcesTotal = finite(result.total); sourcesPage = Array.isArray(result.sources) ? result.sources : []; sourcesLoaded = true;
+      if (sourcesOffset >= sourcesTotal && sourcesOffset > 0) { sourcesOffset = Math.max(0, Math.floor(Math.max(0, sourcesTotal - 1) / 50) * 50); return loadSources(showLoading); }
+      rememberSources(sourcesPage); renderSources(sourcesPage, sourcesTotal); setText("sources-loading", ""); updateControls();
+    } catch (error) { if (request === sourcesRequest && !error.staleSession) setText("sources-loading", error.message); }
+  }
+  function renderSources(sources, total = sources.length) {
+    setHidden("sources-empty", total > 0);
+    const page = sources.slice(0, 50);
+    setText("sources-page-label", total ? "Источники " + count(sourcesOffset + 1) + "–" + count(sourcesOffset + page.length) + " из " + count(total) : "");
+    $("sources-prev").disabled = sourcesOffset === 0; $("sources-next").disabled = sourcesOffset + 50 >= total;
+    setHidden("sources-pagination", total <= 50);
+    const signature = JSON.stringify([sourcesOffset, total, page]);
     if (signature === sourcesSignature) return;
     sourcesSignature = signature;
     const list = $("sources-list"); list.replaceChildren();
@@ -832,6 +859,7 @@
     setText("breadcrumb-page", pageNames[activePage]);
     document.title = pageNames[activePage] + " · Фотоархив";
     if (activePage === "queue" && session.authenticated) loadJobs();
+    if (activePage === "sources" && session.authenticated) loadSources();
     if (activePage === "schedules" && session.authenticated) loadSchedules();
     if (activePage === "plans" && session.authenticated) loadPlans();
     if (activePage === "settings" && session.authenticated) loadNotifications();
@@ -895,11 +923,13 @@
     const available = canManageSchedules(), saving = pendingActions.has("schedule");
     ["add-schedule", "empty-add-schedule"].forEach((id) => { $(id).disabled = !available; });
     document.querySelectorAll("[data-schedule-action]").forEach((button) => { button.disabled = !available; });
-    $("schedule-submit").disabled = !available || !snapshot || !Array.isArray(snapshot.sources) || !snapshot.sources.some((source) => !source.owner_key);
+    $("schedule-submit").disabled = !available || selectedScheduleSources.size === 0;
     $("schedule-remove-submit").disabled = !available;
     setText("schedule-submit", saving ? "Сохраняем…" : "Сохранить расписание");
     setText("schedule-remove-submit", saving ? "Удаляем…" : "Удалить расписание");
     $("schedule-form").querySelectorAll("input,fieldset,button").forEach((input) => { if (input.id !== "schedule-submit") input.disabled = saving; });
+    $("schedule-source-prev").disabled = !available || scheduleSourceOffset === 0;
+    $("schedule-source-next").disabled = !available || scheduleSourceOffset + 50 >= scheduleSourceTotal;
     $("schedule-remove-dialog").querySelectorAll("[data-close-dialog]").forEach((button) => { button.disabled = saving; });
   }
 
@@ -944,7 +974,8 @@
       const repeat = element("span", "schedule-repeat-label", days); repeat.title = days; clock.appendChild(repeat);
       const info = element("div", "schedule-info"), title = element("h2", "", plain(schedule.name, "Расписание"));
       const selected = Array.isArray(schedule.source_ids) ? schedule.source_ids : [];
-      const sourceNames = selected.map((id) => { const source = sources.find((value) => value.id === id); return source ? plain(source.alias, source.path) : "Источник недоступен"; });
+      const sourceNames = selected.slice(0, 5).map((id) => { const source = sourceById(id); return source ? plain(source.alias, source.path) : "Источник № " + id; });
+      if (selected.length > 5) sourceNames.push("ещё " + count(selected.length - 5));
       const sourceLine = element("p", "schedule-source-summary", sourceNames.length ? sourceNames.join(" · ") : "Исходные папки не выбраны");
       sourceLine.title = sourceNames.join("\n"); info.append(title, sourceLine);
       const next = element("p", "schedule-next", schedule.queued ? "Ожидает завершения текущей операции" : !schedule.enabled ? "Новые запуски выключены" : schedule.next_run ? "Следующий запуск: " + scheduleDateTime(schedule.next_run) : "Нет доступной даты запуска");
@@ -1010,17 +1041,38 @@
     const weekdays = value && Array.isArray(value.weekdays) ? value.weekdays : [1, 2, 3, 4, 5, 6, 7];
     document.querySelectorAll('[name="schedule-weekday"]').forEach((input) => { input.checked = weekdays.includes(Number(input.value)); });
     setText("schedule-timezone-hint", "Часовой пояс: " + schedulesTimezone);
-    const selected = value && Array.isArray(value.source_ids) ? value.source_ids : [];
-    const sourceList = $("schedule-source-list"); sourceList.replaceChildren();
-    const sources = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources.filter((source) => !source.owner_key) : [];
-    sources.forEach((source) => {
-      const label = element("label", "checkbox-row schedule-source-choice"), checkbox = element("input"), body = element("span");
-      checkbox.type = "checkbox"; checkbox.name = "schedule-source"; checkbox.value = String(source.id); checkbox.checked = selected.includes(source.id);
-      body.append(element("strong", "", plain(source.alias, "Источник")), element("small", "", sourceMembers(source).map((member) => plain(member.path)).join(" · ")));
-      label.append(checkbox, body); sourceList.appendChild(label);
-    });
-    setHidden("schedule-no-sources", sources.length > 0);
-    updateScheduleMode(); updateScheduleControls(); showDialog("schedule-dialog");
+    selectedScheduleSources.clear();
+    (value && Array.isArray(value.source_ids) ? value.source_ids : []).forEach((id) => selectedScheduleSources.add(id));
+    scheduleSourceOffset = 0; scheduleSourceTotal = 0; scheduleSourcePage = []; scheduleSourceRequest += 1;
+    $("schedule-source-search").value = ""; $("schedule-source-list").replaceChildren();
+    renderScheduleSourceSelection(); updateScheduleMode(); updateScheduleControls(); showDialog("schedule-dialog"); loadScheduleSourcePage();
+  }
+  function renderScheduleSourceSelection() {
+    setText("schedule-source-selected", "Выбрано источников: " + count(selectedScheduleSources.size));
+    document.querySelectorAll('[name="schedule-source"]').forEach((input) => { input.checked = selectedScheduleSources.has(Number(input.value)); });
+    updateScheduleControls();
+  }
+  async function loadScheduleSourcePage() {
+    const request = ++scheduleSourceRequest, generation = sessionGeneration, offset = scheduleSourceOffset, query = $("schedule-source-search").value.trim();
+    setText("schedule-source-page-label", "Ищем источники…");
+    try {
+      const result = await api(queryURL("/api/sources", { kind: "manual", offset, limit: 50, q: query || null }));
+      if (request !== scheduleSourceRequest || generation !== sessionGeneration || !$("schedule-dialog").open || query !== $("schedule-source-search").value.trim()) return;
+      scheduleSourcePage = Array.isArray(result.sources) ? result.sources : []; scheduleSourceTotal = finite(result.total);
+      rememberSources(scheduleSourcePage); const container = $("schedule-source-list"); container.replaceChildren();
+      scheduleSourcePage.forEach((source) => {
+        const label = element("label", "checkbox-row schedule-source-choice"), checkbox = element("input"), body = element("span");
+        checkbox.type = "checkbox"; checkbox.name = "schedule-source"; checkbox.value = String(source.id); checkbox.checked = selectedScheduleSources.has(source.id);
+        checkbox.addEventListener("change", () => { if (checkbox.checked) selectedScheduleSources.add(source.id); else selectedScheduleSources.delete(source.id); renderScheduleSourceSelection(); });
+        body.append(element("strong", "", plain(source.alias, "Источник")), element("small", "", sourceMembers(source).map((member) => plain(member.path)).join(" · ")));
+        label.append(checkbox, body); container.appendChild(label);
+      });
+      setHidden("schedule-no-sources", scheduleSourceTotal > 0);
+      setText("schedule-no-sources", query ? "Нет подходящих источников. Измените поиск; ранее выбранные источники сохраняются." : "Добавьте обычную исходную группу. Партии плана используют свой календарь и здесь не выбираются.");
+      setText("schedule-source-page-label", scheduleSourceTotal ? count(offset + 1) + "–" + count(offset + scheduleSourcePage.length) + " из " + count(scheduleSourceTotal) : "");
+      renderScheduleSourceSelection();
+    } catch (error) { if (request === scheduleSourceRequest && !error.staleSession) setText("schedule-source-page-label", error.message); }
+    updateScheduleControls();
   }
   function openScheduleRemoval(id) {
     if (!canManageSchedules()) return;
@@ -1048,7 +1100,7 @@
 
   async function saveSchedule(event) {
     event.preventDefault(); if (!canManageSchedules()) return;
-    const sourceIds = [...document.querySelectorAll('[name="schedule-source"]:checked')].map((input) => Number(input.value));
+    const sourceIds = [...selectedScheduleSources];
     if (!sourceIds.length) { setError("schedule-error", "Выберите хотя бы одну исходную папку."); return; }
     const mode = $("schedule-monthly").checked ? "monthly" : "weekly";
     const weekdays = [...document.querySelectorAll('[name="schedule-weekday"]:checked')].map((input) => Number(input.value));
@@ -1516,6 +1568,7 @@
       if (options.close) $(options.close).close();
       await refreshState();
       if (activePage === "queue") await loadJobs(false);
+      if (activePage === "sources") await loadSources(false);
       if (options.message) toast(options.message);
       return true;
     } catch (error) {
@@ -1533,7 +1586,8 @@
     setError("mail-error"); showDialog("mail-dialog");
   }
   function sourceById(id) {
-    return snapshot && Array.isArray(snapshot.sources) ? snapshot.sources.find((source) => source.id === id) : null;
+    if (snapshot && snapshot.selected_source && snapshot.selected_source.id === id) return snapshot.selected_source;
+    return knownSources.get(id) || (snapshot && Array.isArray(snapshot.sources) ? snapshot.sources.find((source) => source.id === id) : null);
   }
   let sourceMembershipEditable = true;
   function addSourcePathRow(path = "", removable = true) {
@@ -1647,12 +1701,12 @@
   // Planning pages only fetch folder and batch pages; file lists stay on the server.
   const planStepNames = ["root", "folders", "settings", "preview"];
   const batchStates = { queued: ["В очереди", "neutral"], running: ["Выполняется", "blue"], paused: ["Приостановлена", "orange"], completed: ["Выполнена", "green"], completed_with_errors: ["Завершена с ошибками", "orange"], deleting: ["Очистка Облака", "orange"] };
-  const planStates = { draft: ["Черновик", "neutral"], building: ["Формируется", "blue"], activating: ["Подготовка источников", "blue"], active: ["По расписанию", "blue"], running: ["Выполняется", "blue"], paused: ["Приостановлен", "orange"], completed: ["Выполнен", "green"], completed_with_errors: ["Завершён с ошибками", "orange"], attention: ["Требуется внимание", "orange"] };
+  const planStates = { draft: ["Черновик", "neutral"], building: ["Формируется", "blue"], activating: ["Подготовка источников", "blue"], rolling_back: ["Отмена активации", "orange"], active: ["По расписанию", "blue"], running: ["Выполняется", "blue"], paused: ["Приостановлен", "orange"], completed: ["Выполнен", "green"], completed_with_errors: ["Завершён с ошибками", "orange"], attention: ["Требуется внимание", "orange"] };
   let plans = [], plansOffset = 0, plansTotal = 0, plansRequest = 0;
   let selectedPlanId = null, selectedPlan = null, planBatches = [], batchesOffset = 0, batchesTotal = 0;
   let planDetailRequest = 0, planDraftSignature = "", planListSignature = "", draggedBatchId = null;
   const batchViews = new Map();
-  const planWizard = { step: "root", inventory: null, plan: null, building: false, request: 0, treeRevision: null, treeEpoch: 0, treeBusy: 0, expanded: new Set(), nodes: new Map() };
+  const planWizard = { step: "root", inventory: null, plan: null, building: false, request: 0, treeRevision: null, treeEpoch: 0, treeBusy: 0, inventoryRequest: 0, expanded: new Set(), nodes: new Map(), pages: new Map() };
   let editingBatchTimeId = null, batchAction = null, cleanupAfterPause = null;
   let notificationsDirty = false, notificationsLoaded = false, notificationsPending = false, notificationsRequest = 0;
   let notificationsConfig = null;
@@ -1696,13 +1750,14 @@
     const days = Array.isArray(settings.weekdays) ? settings.weekdays.map((day) => names[day - 1]).filter(Boolean).join(", ") : "все дни";
     return "Не чаще раза в " + count(finite(settings.interval_days, 1)) + " сут. · " + days + " · " + plain(settings.time, "02:00") + " · " + plain(settings.timezone, "Europe/Moscow");
   }
+  function planIsChanging() { return Boolean(selectedPlan && ["building", "activating", "rolling_back"].includes(selectedPlan.status)); }
   function updatePlanControls() {
     const available = Boolean(session.authenticated && snapshot && connected && !pendingActions.has("password")), saving = pendingActions.has("plan");
     ["add-plan", "empty-add-plan"].forEach((id) => { $(id).disabled = !available || saving || isBusy(); });
     $("plan-select").disabled = !available || saving || !plans.length;
     $("plans-prev").disabled = !available || saving || plansOffset === 0;
     $("plans-next").disabled = !available || saving || plansOffset + 50 >= plansTotal;
-    ["plan-configure", "plan-recalculate", "plan-activate"].forEach((id) => { $(id).disabled = !available || saving || !selectedPlan; });
+    ["plan-configure", "plan-recalculate", "plan-activate"].forEach((id) => { $(id).disabled = !available || saving || !selectedPlan || planIsChanging(); });
     $("plan-delete").disabled = !available || saving || isBusy() || !selectedPlan || ["building", "activating"].includes(selectedPlan.status);
     $("plan-delete-confirm").disabled = !available || saving || isBusy();
     $("batches-prev").disabled = !available || saving || batchesOffset === 0;
@@ -1711,8 +1766,8 @@
     $("plan-wizard-back").disabled = saving || planWizard.treeBusy > 0 || planWizard.building;
     const inventory = planWizard.inventory, ready = inventory && ["ready", "incomplete"].includes(inventory.status) && finite(inventory.selected_count) > 0 && finite(inventory.selected_errors) === 0;
     $("plan-wizard-next").disabled = !available || saving || planWizard.step === "folders" && (!ready || planWizard.treeBusy > 0) || planWizard.step === "preview" && (!planWizard.plan || planWizard.building || planWizard.plan.status !== "draft" || finite(planWizard.plan.batch_count) === 0);
-    ["plan-calendar-save", "batch-time-save", "batch-action-confirm"].forEach((id) => { $(id).disabled = !available || saving; });
-    if (batchAction && batchAction.kind === "cleanup") $("batch-action-confirm").disabled = !available || saving || !batchAction.preview || finite(batchAction.preview.count) === 0;
+    ["plan-calendar-save", "batch-time-save", "batch-action-confirm"].forEach((id) => { $(id).disabled = !available || saving || planIsChanging(); });
+    if (batchAction && batchAction.kind === "cleanup") $("batch-action-confirm").disabled = !available || saving || planIsChanging() || !batchAction.preview || finite(batchAction.preview.count) === 0;
     batchViews.forEach((view) => updateBatchControls(view, available && !saving));
   }
   async function planMutation(path, body, options = {}) {
@@ -1822,11 +1877,11 @@
     card.append(order, info, side);
     const view = { batch, card, number, up, down, title, badge, oversized, members, volume, progress, fill, result, message, date, actions, actionSignature: "" };
     up.addEventListener("click", () => moveBatch(view.batch, "up")); down.addEventListener("click", () => moveBatch(view.batch, "down")); date.addEventListener("click", () => openBatchTime(view.batch));
-    card.addEventListener("dragstart", (event) => { if (view.batch.status !== "queued" || pendingActions.has("plan")) { event.preventDefault(); return; } draggedBatchId = String(view.batch.id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", draggedBatchId); card.classList.add("dragging"); });
+    card.addEventListener("dragstart", (event) => { if (!card.draggable || view.batch.status !== "queued" || pendingActions.has("plan")) { event.preventDefault(); return; } draggedBatchId = String(view.batch.id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", draggedBatchId); card.classList.add("dragging"); });
     card.addEventListener("dragend", () => { draggedBatchId = null; document.querySelectorAll(".batch-card").forEach((item) => item.classList.remove("dragging", "drag-target")); });
     card.addEventListener("dragover", (event) => { if (draggedBatchId && draggedBatchId !== String(view.batch.id) && view.batch.status === "queued") { event.preventDefault(); event.dataTransfer.dropEffect = "move"; card.classList.add("drag-target"); } });
     card.addEventListener("dragleave", (event) => { if (!card.contains(event.relatedTarget)) card.classList.remove("drag-target"); });
-    card.addEventListener("drop", async (event) => { event.preventDefault(); const moving = draggedBatchId; draggedBatchId = null; card.classList.remove("drag-target"); if (!moving || moving === String(view.batch.id) || view.batch.status !== "queued") return; if (await planMutation("/api/plans/batch/move", { id: moving, before_id: view.batch.id }, { message: "Порядок партий и даты обновлены." })) await loadPlanDetail(false); });
+    card.addEventListener("drop", async (event) => { event.preventDefault(); const moving = draggedBatchId; draggedBatchId = null; card.classList.remove("drag-target"); if (!moving || moving === String(view.batch.id) || view.batch.status !== "queued" || planIsChanging()) return; if (await planMutation("/api/plans/batch/move", { id: moving, before_id: view.batch.id }, { message: "Порядок партий и даты обновлены." })) await loadPlanDetail(false); });
     return view;
   }
   function updateBatchView(view, batch) {
@@ -1837,12 +1892,12 @@
     view.members.textContent = members.map((member) => typeof member === "string" ? member : plain(member.relative_path, plain(member.path))).filter(Boolean).join(" · ") + (finite(batch.member_count) > members.length ? " · ещё " + count(batch.member_count - members.length) : "");
     view.members.title = view.members.textContent;
     const total = finite(summary.total, finite(summary.total_count, finite(batch.file_count)));
-    const done = Math.min(total, finite(summary.uploaded) + finite(summary.skipped) + finite(summary.failed));
+    const done = Math.min(total, finite(summary.uploaded) + finite(summary.skipped) + finite(summary.permanent_failures, finite(summary.failed)));
     const terminal = ["completed", "completed_with_errors"].includes(batch.status), percent = terminal ? 100 : total > 0 ? Math.min(100, Math.floor(done / total * 100)) : 0;
-    view.volume.textContent = fileCount(finite(batch.file_count)) + " · " + bytes(batch.total_bytes);
+    view.volume.textContent = typeof summary.total === "number" ? fileCount(summary.total) + " · " + bytes(summary.total_bytes) : "По плану: " + fileCount(finite(batch.file_count)) + " · " + bytes(batch.total_bytes);
     view.fill.style.width = percent + "%"; view.progress.setAttribute("aria-valuenow", String(percent)); view.progress.setAttribute("aria-label", "Обработано задач партии " + view.title.textContent); view.progress.setAttribute("aria-valuetext", percent + "% · " + count(done) + " из " + count(total));
     view.result.textContent = batch.started_at ? "Обработано: " + count(done) + " из " + count(total) + " · Загружено: " + bytes(summary.uploaded_bytes) + (finite(summary.failed) ? " · Ошибок: " + count(summary.failed) : "") : "Сканирование и проверка начнутся по расписанию.";
-    view.message.textContent = plain(batch.message); view.message.hidden = !view.message.textContent;
+    view.message.textContent = plain(batch.message); view.message.dataset.tone = state[1]; view.message.hidden = !view.message.textContent;
     view.date.textContent = (batch.finished_at ? "Завершена " + scheduleDateTime(batch.finished_at, planZone()) : batch.started_at ? "Начата " + scheduleDateTime(batch.started_at, planZone()) : scheduleDateTime(batch.scheduled_for, planZone()) || "Дата ещё не назначена");
     view.date.title = batch.status === "queued" ? "Изменить дату · " + planZone() : planZone();
     view.card.draggable = batch.status === "queued"; view.card.classList.toggle("batch-queued", batch.status === "queued");
@@ -1861,12 +1916,13 @@
     updateBatchControls(view, connected && !pendingActions.has("plan"));
   }
   function updateBatchControls(view, available) {
-    const batch = view.batch, mutable = available && batch.status === "queued";
+    const batch = view.batch, mutable = available && !planIsChanging() && batch.status === "queued";
+    view.card.draggable = mutable;
     view.up.disabled = !mutable || finite(batch.position) === 0; view.down.disabled = !mutable || finite(batch.position) >= batchesTotal - 1;
     view.date.disabled = !mutable; view.date.classList.toggle("editable", mutable);
     view.actions.querySelectorAll("button").forEach((button) => {
       const action = button.dataset.batchAction, needsIdle = ["start", "resume", "cleanup", "delete"].includes(action);
-      button.disabled = !available || needsIdle && isBusy() || action === "start" && selectedPlan && selectedPlan.status !== "active";
+      button.disabled = !available || action !== "queue" && planIsChanging() || needsIdle && isBusy() || action === "start" && selectedPlan && selectedPlan.status !== "active";
     });
   }
   function renderBatches() {
@@ -1900,7 +1956,7 @@
   }
   function openPlanWizard(inventory = null) {
     if (!session.authenticated || pendingActions.has("plan")) return;
-    $("plan-wizard-form").reset(); planWizard.request += 1; planWizard.inventory = inventory; planWizard.plan = null; planWizard.building = false; planWizard.treeRevision = null; planWizard.treeEpoch += 1; planWizard.expanded.clear(); planWizard.nodes.clear();
+    $("plan-wizard-form").reset(); planWizard.request += 1; planWizard.inventory = inventory; planWizard.plan = null; planWizard.building = false; planWizard.treeRevision = null; planWizard.treeEpoch += 1; planWizard.expanded.clear(); planWizard.nodes.clear(); planWizard.pages.clear();
     fillCalendar("plan"); $("plan-name").value = inventory ? plain(inventory.root).split(/[\\/]/).filter(Boolean).pop() || "Архив" : "";
     $("plan-root").value = inventory ? plain(inventory.root) : ""; $("plan-destination").value = "/Фото";
     showPlanStep(inventory ? "folders" : "root"); showDialog("plan-wizard");
@@ -1909,10 +1965,10 @@
   async function refreshInventory() {
     const current = planWizard.inventory;
     if (!current || !$("plan-wizard").open) return;
-    const request = planWizard.request, generation = sessionGeneration;
+    const request = planWizard.request, fetchRequest = ++planWizard.inventoryRequest, generation = sessionGeneration;
     try {
       const inventory = inventoryResult(await api(queryURL("/api/plans/inventory", { id: current.id })));
-      if (request !== planWizard.request || generation !== sessionGeneration || !planWizard.inventory || inventory.id !== planWizard.inventory.id) return;
+      if (request !== planWizard.request || fetchRequest !== planWizard.inventoryRequest || generation !== sessionGeneration || !planWizard.inventory || inventory.id !== planWizard.inventory.id) return;
       planWizard.inventory = inventory; renderInventory();
       if (["ready", "incomplete"].includes(inventory.status) && inventory.revision !== planWizard.treeRevision) await reloadPlanTree();
     } catch (error) { if (!error.staleSession) setError("plan-wizard-error", error.message); }
@@ -1933,16 +1989,17 @@
     await loadTreePage(container, null, 0, epoch, true); container.scrollTop = scroll;
   }
   function forgetTreeChildren(container) {
-    container.querySelectorAll("[data-folder-id]").forEach((node) => planWizard.nodes.delete(String(node.dataset.folderId))); container.replaceChildren();
+    container.querySelectorAll("[data-folder-id]").forEach((node) => { const id = String(node.dataset.folderId); planWizard.nodes.delete(id); planWizard.pages.delete(id); planWizard.expanded.delete(id); }); container.replaceChildren();
   }
   async function loadTreePage(container, parentId, offset, epoch = planWizard.treeEpoch, root = false) {
     if (!planWizard.inventory || epoch !== planWizard.treeEpoch) return;
     if (planWizard.nodes.size >= 1000) { container.appendChild(element("p", "field-hint", "Сверните несколько веток, чтобы открыть другие. Одновременно показано не более 1000 папок.")); return; }
+    const pageKey = parentId === null ? "root" : String(parentId), previousLoaded = planWizard.pages.get(pageKey) || 0;
     const loading = element("p", "field-hint", "Читаем папки…"); container.appendChild(loading); planWizard.treeBusy += 1; updatePlanControls();
     try {
       const result = await api(queryURL("/api/plans/tree", { inventory_id: planWizard.inventory.id, parent_id: parentId, offset, limit: Math.min(100, 1000 - planWizard.nodes.size) }));
       if (epoch !== planWizard.treeEpoch || !container.isConnected) return;
-      loading.remove(); const folders = Array.isArray(result.folders) ? result.folders : [];
+      loading.remove(); const folders = Array.isArray(result.folders) ? result.folders : [], reopen = []; let rendered = 0;
       for (const folder of folders) {
         const id = String(folder.id); if (planWizard.nodes.size >= 1000) break;
         const node = element("div", "plan-tree-node"); node.dataset.folderId = id;
@@ -1955,24 +2012,27 @@
         toggle.title = folder.inherited_excluded ? "Исключена вместе с родительской папкой" : partial ? "Часть вложенных папок исключена. Нажмите, чтобы исключить всю ветку." : excluded ? "Вернуть в план" : "Исключить из плана"; toggle.appendChild(icon(excluded ? "close" : "check"));
         name.title = plain(folder.path); size.textContent = fileCount(folder.total_count) + " · " + bytes(folder.total_bytes) + (partial ? " · включено " + fileCount(folder.selected_count) : "") + (finite(folder.error_count) ? " · ошибки: " + count(folder.error_count) : "");
         info.append(name, size); row.append(expand, toggle, icon("folder"), info); node.appendChild(row);
-        const children = element("div", "plan-tree-children"); children.hidden = true; node.appendChild(children); container.appendChild(node); planWizard.nodes.set(id, node);
+        const children = element("div", "plan-tree-children"); children.hidden = true; node.appendChild(children); container.appendChild(node); planWizard.nodes.set(id, node); rendered += 1;
         const open = async () => {
           children.hidden = false; expand.setAttribute("aria-expanded", "true"); expand.setAttribute("aria-label", "Свернуть " + plain(folder.name)); planWizard.expanded.add(id);
           if (!children.childElementCount) await loadTreePage(children, folder.id, 0, epoch);
         };
-        expand.addEventListener("click", async () => { if (children.hidden) await open(); else { children.hidden = true; expand.setAttribute("aria-expanded", "false"); expand.setAttribute("aria-label", "Раскрыть " + plain(folder.name)); planWizard.expanded.delete(id); forgetTreeChildren(children); } });
+        expand.addEventListener("click", async () => { if (children.hidden) await open(); else { children.hidden = true; expand.setAttribute("aria-expanded", "false"); expand.setAttribute("aria-label", "Раскрыть " + plain(folder.name)); planWizard.expanded.delete(id); planWizard.pages.delete(id); forgetTreeChildren(children); } });
         toggle.addEventListener("click", async () => {
           if (pendingActions.has("plan")) return;
           const result = await planMutation("/api/plans/exclude", { inventory_id: planWizard.inventory.id, folder_id: folder.id, excluded: !excluded }, { errorId: "plan-wizard-error" });
           if (result) { planWizard.treeRevision = null; await refreshInventory(); }
         });
-        if (hasChildren && (planWizard.expanded.has(id) || root)) await open();
+        if (hasChildren && (planWizard.expanded.has(id) || root)) reopen.push(open);
       }
-      const next = offset + folders.length;
-      if (next < finite(result.total) && folders.length) {
+      const next = offset + rendered;
+      planWizard.pages.set(pageKey, Math.max(previousLoaded, next));
+      if (next < previousLoaded && next < finite(result.total) && rendered && planWizard.nodes.size < 1000) await loadTreePage(container, parentId, next, epoch);
+      else if (next < finite(result.total) && rendered) {
         const more = element("button", "text-button tree-more", "Следующие папки · осталось " + count(result.total - next)); more.type = "button";
         more.addEventListener("click", () => { more.remove(); loadTreePage(container, parentId, next, epoch); }); container.appendChild(more);
       }
+      for (const open of reopen) { if (epoch === planWizard.treeEpoch) await open(); }
     } catch (error) { if (epoch === planWizard.treeEpoch) { loading.remove(); const retry = element("button", "text-button", "Повторить чтение папок"); retry.type = "button"; retry.addEventListener("click", () => { retry.remove(); loadTreePage(container, parentId, offset, epoch, root); }); container.append(element("p", "form-error", error.message), retry); } }
     finally { planWizard.treeBusy = Math.max(0, planWizard.treeBusy - 1); updatePlanControls(); }
   }
@@ -1985,7 +2045,7 @@
         if (!name || !root || !remote.startsWith("/")) throw new Error("Укажите название, каталог сервера и путь в Облаке, начиная с /.");
         if (planWizard.inventory && root === planWizard.inventory.root && ["ready", "incomplete", "scanning"].includes(planWizard.inventory.status)) { showPlanStep("folders"); await refreshInventory(); return; }
         const result = await planMutation("/api/plans/inspect", { root }, { errorId: "plan-wizard-error" });
-        if (result) { planWizard.inventory = inventoryResult(result); planWizard.plan = null; planWizard.building = false; planWizard.treeRevision = null; planWizard.expanded.clear(); showPlanStep("folders"); renderInventory(); await refreshState(); await refreshInventory(); }
+        if (result) { planWizard.inventory = inventoryResult(result); planWizard.plan = null; planWizard.building = false; planWizard.treeRevision = null; planWizard.expanded.clear(); planWizard.pages.clear(); showPlanStep("folders"); renderInventory(); await refreshState(); await refreshInventory(); }
       } else if (planWizard.step === "folders") { showPlanStep("settings"); $("plan-target-count").focus(); }
       else if (planWizard.step === "settings") {
         const targetCount = Number($("plan-target-count").value), gib = Number($("plan-target-gib").value), tolerance = Number($("plan-tolerance").value);
@@ -2099,7 +2159,7 @@
   function updateNotificationControls() {
     const available = Boolean(session.authenticated && connected && !pendingActions.has("password")), saving = pendingActions.has("notifications");
     $("notifications-fields").disabled = !available || saving; $("notifications-enabled").disabled = !available || saving;
-    $("smtp-save").disabled = !available || saving; $("smtp-test").disabled = !available || saving || !notificationsLoaded || notificationsDirty || notificationsPending;
+    $("smtp-save").disabled = !available || saving; $("smtp-test").disabled = !available || saving || !notificationsLoaded || notificationsDirty;
     $("smtp-test").title = notificationsDirty ? "Сначала сохраните изменённые настройки" : "Отправить тестовое письмо сохранённым получателям";
     $("smtp-import").disabled = !available || saving;
   }
@@ -2293,8 +2353,8 @@
   ["start-upload", "queue-start-upload"].forEach((id) => $(id).addEventListener("click", startCurrentScope));
   ["pause-upload", "queue-pause-upload"].forEach((id) => $(id).addEventListener("click", () => perform("pause", "/api/pause", {}, { message: "Останавливаем текущую работу и сохраняем прогресс…" })));
   ["scan-folders", "queue-scan-folders"].forEach((id) => $(id).addEventListener("click", () => perform("scan", "/api/scan", sourceScopeBody())));
-  $("sources-prev").addEventListener("click", () => { sourcesOffset = Math.max(0, sourcesOffset - 50); if (snapshot) { renderSources(snapshot.sources || []); updateControls(); } });
-  $("sources-next").addEventListener("click", () => { if (snapshot && sourcesOffset + 50 < snapshot.sources.length) { sourcesOffset += 50; renderSources(snapshot.sources); updateControls(); } });
+  $("sources-prev").addEventListener("click", () => { sourcesOffset = Math.max(0, sourcesOffset - 50); loadSources(); });
+  $("sources-next").addEventListener("click", () => { if (sourcesOffset + 50 < sourcesTotal) { sourcesOffset += 50; loadSources(); } });
   $("sources-scan-all").addEventListener("click", () => scanSource(null));
   $("source-add-path").addEventListener("click", () => { addSourcePathRow().focus(); updateSourcePreview(); });
   document.querySelectorAll("[data-clear-source-scope]").forEach((button) => button.addEventListener("click", () => selectSourceScope(null)));
@@ -2386,8 +2446,12 @@
   $("scan-warning-settings").addEventListener("click", () => { $("scan-warning-dialog").close(); location.hash = "settings"; });
   ["add-schedule", "empty-add-schedule"].forEach((id) => $(id).addEventListener("click", () => openSchedule()));
   ["schedule-weekly", "schedule-monthly"].forEach((id) => $(id).addEventListener("change", updateScheduleMode));
-  $("schedule-select-all").addEventListener("click", () => document.querySelectorAll('[name="schedule-source"]').forEach((input) => { input.checked = true; }));
-  $("schedule-select-none").addEventListener("click", () => document.querySelectorAll('[name="schedule-source"]').forEach((input) => { input.checked = false; }));
+  $("schedule-select-all").addEventListener("click", () => { scheduleSourcePage.forEach((source) => selectedScheduleSources.add(source.id)); renderScheduleSourceSelection(); });
+  $("schedule-select-none").addEventListener("click", () => { selectedScheduleSources.clear(); renderScheduleSourceSelection(); });
+  $("schedule-source-prev").addEventListener("click", () => { scheduleSourceOffset = Math.max(0, scheduleSourceOffset - 50); loadScheduleSourcePage(); });
+  $("schedule-source-next").addEventListener("click", () => { if (scheduleSourceOffset + 50 < scheduleSourceTotal) { scheduleSourceOffset += 50; loadScheduleSourcePage(); } });
+  $("schedule-source-search").addEventListener("input", () => { clearTimeout(scheduleSearchTimer); scheduleSourceRequest += 1; scheduleSourceOffset = 0; scheduleSearchTimer = setTimeout(loadScheduleSourcePage, 250); });
+  $("schedule-dialog").addEventListener("close", () => { clearTimeout(scheduleSearchTimer); scheduleSourceRequest += 1; });
   $("schedule-form").addEventListener("submit", saveSchedule);
   $("schedule-remove-form").addEventListener("submit", async (event) => {
     event.preventDefault(); if (removingScheduleId === null) return;
