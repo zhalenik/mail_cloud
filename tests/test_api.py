@@ -589,9 +589,8 @@ class UploadBehaviorTests(unittest.TestCase):
                     self.assertFalse(any(r['stream_body'] is not None or r['method'] == 'POST' for r in fake.requests))
                     self.assertEqual(self.saved, [])
 
-    def test_regular_no_missing_or_malformed_native_ack_becomes_success(self):
-        for raw in (b'', b'\x00', b'\x00\x06', b'\x00\x01short', b'\x00\x00extra',
-                    b'\x01', b'\x04', b'\x05', b'\x09', b'\x0c', b'\xfe'):
+    def test_regular_no_missing_or_nonzero_native_ack_becomes_success(self):
+        for raw in (b'', b'\x01', b'\x04', b'\x05', b'\x09', b'\x0c', b'\xfe'):
             with self.subTest(raw=raw):
                 self.saved.clear()
                 self.confirmed.clear()
@@ -603,6 +602,38 @@ class UploadBehaviorTests(unittest.TestCase):
                 self.assertEqual(self.saved, [self.digest])
                 self.assertEqual(self.confirmed, [])
                 self.assertEqual(fake.requests[-1]['method'], 'POST')
+
+    def test_regular_success_status_with_optional_revision_still_verifies_remote_file(self):
+        # M1 AddResultOK is one status byte; revision extensions are opaque.
+        # Unlike v0.7.0, valid acceptance must reach the independent stat.
+        for raw in (b'\x00', b'\x00\x06future-format', b'\x00\x01short', b'\x00\x00extra'):
+            with self.subTest(raw=raw):
+                self.saved.clear()
+                self.confirmed.clear()
+                api, fake, _ = self.regular_api([
+                    response(404), self.quota_response(), response(201, headers={'x-valid-for': '0'}),
+                    response(data=raw), self.stat_response(),
+                ])
+                result = self.regular_upload(api)
+                self.assertTrue(result['stat_matched'])
+                self.assertEqual(result['storage_mode'], 'regular')
+                self.assertEqual(self.confirmed, [self.digest])
+                self.assertEqual(fake.requests[-1]['method'], 'GET')
+                self.assertFalse(fake.sequence)
+
+    def test_regular_positive_status_alone_never_completes_missing_or_changed_file(self):
+        for observed in (response(404), self.stat_response(digest='0' * 40),
+                         self.stat_response(size=self.identity.size + 1),
+                         response(data={'hash': self.digest, 'size': self.identity.size, 'path': '/other.jpg'})):
+            with self.subTest(observed=observed):
+                self.confirmed.clear()
+                api, _, _ = self.regular_api([
+                    response(404), self.quota_response(), response(201, headers={'x-valid-for': '0'}),
+                    response(data=b'\x00'), observed, observed, observed, observed,
+                ])
+                with patch.object(api, '_wait'), self.assertRaises(ProtocolError):
+                    self.regular_upload(api)
+                self.assertEqual(self.confirmed, [self.digest], 'Accepted operation remains recoverable')
 
     def test_regular_native_no_space_is_fatal_and_bad_blob_is_retryable(self):
         for status, code, retryable, fatal in ((7, 'CONDITION/OVERQUOTA', False, True),
@@ -1130,6 +1161,222 @@ class UploadBehaviorTests(unittest.TestCase):
         self.assertEqual(self.saved, [self.digest])
         self.assertEqual(next(r["stream_body"] for r in fake.requests if r["stream_body"] is not None), self.data)
         self.assertFalse(fake.sequence)
+
+
+class InventoryReadTests(unittest.TestCase):
+    digest = 'AB' * 20
+    _unspecified = object()
+
+    def api(self, sequence):
+        wire, tokens = FakeHTTP(sequence), TokensStub()
+        return CloudAPI(tokens, transport_factory=lambda: wire), wire, tokens
+
+    def folder(self, items=None, *, home='/', count=_unspecified, **changes):
+        items = [] if items is None else items
+        if count is self._unspecified:
+            count = {'files': sum(item.get('kind') == 'file' for item in items),
+                     'folders': sum(item.get('kind') != 'file' for item in items)}
+        body = {'home': home, 'kind': 'folder', 'list': items, 'count': count,
+                'tree': 'test-tree', 'rev': 7, 'grev': 11, **changes}
+        return response(data={'status': 200, 'body': body})
+
+    def file(self, path='/photo.jpg', **changes):
+        return {'kind': 'file', 'home': path, 'hash': self.digest.lower(), 'size': 123, **changes}
+
+    def test_paged_private_listing_preserves_identity_and_exact_storage_flags(self):
+        api, wire, _ = self.api([
+            self.folder([self.file('/Архив/лето.jpg', is_unlim_upload=True, nodeid=42),
+                         {'kind': 'camera-upload', 'home': '/Архив/Фотографии с телефона'}],
+                        home='/Архив', count={'files': 2, 'folders': 1}),
+            self.folder([self.file('/Архив/зима.m4v', is_unlim_upload=False)], home='/Архив',
+                        count={'files': 2, 'folders': 1}),
+        ])
+        first = api.list_folder('/Архив', limit=2)
+        last = api.list_folder('/Архив', offset=first['next_offset'], limit=2)
+        self.assertEqual(first['total'], 3)
+        self.assertEqual(first['next_offset'], 2)
+        self.assertEqual(first['listed_paths'], ['/Архив/лето.jpg', '/Архив/Фотографии с телефона'])
+        self.assertIsNone(last['next_offset'])
+        self.assertEqual(first['revision'], last['revision'])
+        self.assertEqual(first['items'][0], {'kind': 'file', 'path': '/Архив/лето.jpg',
+            'hash': self.digest, 'size': 123, 'is_unlim_upload': True, 'nodeid': '42'})
+        self.assertEqual(first['items'][1], {'kind': 'folder', 'path': '/Архив/Фотографии с телефона'})
+        self.assertIs(last['items'][0]['is_unlim_upload'], False)
+        for index, request in enumerate(wire.requests):
+            parsed = urlsplit(request['url'])
+            self.assertEqual((request['method'], parsed.netloc, parsed.path),
+                             ('POST', 'cloud.mail.ru', '/api/m1/folder'))
+            self.assertEqual(parse_qs(parsed.query), {'access_token': ['OLD-TOKEN'],
+                'offset': [str(index * 2)], 'limit': ['2']})
+            self.assertEqual(parse_qs(request['body'].decode('ascii')), {'home': ['/Архив']})
+            self.assertIsNone(request['stream_body'])
+        self.assertFalse(wire.sequence)
+
+    def test_missing_or_nonboolean_flag_never_means_quota_or_unlimited(self):
+        for extra in ({}, {'is_unlim_upload': None}, {'is_unlim_upload': 'false'},
+                      {'is_unlim_upload': 0}, {'is_unlim_upload': 1}, {'is_unlim_upload': []}):
+            with self.subTest(extra=extra):
+                api, _, _ = self.api([self.folder([self.file(**extra)])])
+                item = api.list_folder()['items'][0]
+                self.assertNotIn('is_unlim_upload', item)
+                self.assertNotIn('storage_mode', item)
+
+    def test_filters_mounts_and_virtual_collections_without_losing_page_offset(self):
+        items = [{'kind': 'mounted', 'home': '/Чужая папка', 'weblink': 'https://example.invalid'},
+                 {'kind': 'trashbin', 'home': '/Корзина'},
+                 {'kind': 'public', 'home': '/Публичная коллекция'},
+                 {'kind': 'folder', 'home': '/Trash'}]
+        api, wire, _ = self.api([self.folder(items, count={'files': 1, 'folders': 4}),
+                                self.folder([self.file('/owned.jpg', weblink='public-link')],
+                                            count={'files': 1, 'folders': 4})])
+        first = api.list_folder(limit=4)
+        last = api.list_folder(offset=first['next_offset'], limit=4)
+        self.assertEqual((first['listed'], first['excluded'], first['next_offset']), (4, 3, 4))
+        self.assertEqual(first['listed_paths'], ['/Чужая папка', '/Корзина', '/Публичная коллекция', '/Trash'])
+        self.assertEqual(first['items'], [{'kind': 'folder', 'path': '/Trash'}],
+                         'An ordinary user folder named Trash is still part of the own tree')
+        self.assertEqual(last['items'][0]['path'], '/owned.jpg', 'Own published files are still own files')
+        self.assertIsNone(last['next_offset'])
+        self.assertEqual(len(wire.requests), 2, 'No public link or mounted share is fetched')
+
+    def test_camera_and_own_shared_directories_are_traversable(self):
+        api, _, _ = self.api([self.folder([{'kind': 'shared', 'home': '/Shared'},
+                                           {'kind': 'camera-upload', 'home': '/Camera Uploads'}])])
+        self.assertEqual(api.list_folder()['items'], [{'kind': 'folder', 'path': '/Shared'},
+                                                    {'kind': 'folder', 'path': '/Camera Uploads'}])
+
+    def test_all_excluded_page_is_not_reported_as_end_of_folder(self):
+        api, _, _ = self.api([self.folder([{'kind': 'mounted', 'home': '/Foreign'}],
+                                         count={'files': 1, 'folders': 1})])
+        page = api.list_folder(limit=1)
+        self.assertEqual(page['items'], [])
+        self.assertEqual(page['next_offset'], 1)
+        self.assertEqual(page['listed_paths'], ['/Foreign'])
+
+    def test_empty_folder_can_omit_optional_list_but_nonempty_folder_cannot(self):
+        empty = {'status': 200, 'body': {'home': '/', 'kind': 'folder', 'count': {'files': 0, 'folders': 0}}}
+        api, _, _ = self.api([response(data=empty)])
+        self.assertEqual(api.list_folder(), {'path': '/', 'items': [], 'total': 0, 'next_offset': None,
+                                            'revision': None, 'listed': 0, 'excluded': 0, 'listed_paths': []})
+        empty['body']['count']['files'] = 1
+        api, _, _ = self.api([response(data=empty)])
+        with self.assertRaises(ProtocolError):
+            api.list_folder()
+
+    def test_unknown_shapes_never_become_empty_complete_inventory(self):
+        for changes in ({'list': None}, {'list': {}}, {'count': None}, {'kind': 'mounted'},
+                        {'kind': []}, {'kind': 'unexpected'}, {'home': '/wrong'},
+                        {'count': {'files': 0}}, {'count': {'files': False, 'folders': 0}},
+                        {'count': {'files': -1, 'folders': 0}},
+                        {'count': {'files': str(1 << 63), 'folders': 0}},
+                        {'count': {'files': (1 << 63) - 1, 'folders': 1}},
+                        {'tree': {}}, {'rev': -1}, {'grev': False}):
+            with self.subTest(changes=changes):
+                api, _, _ = self.api([self.folder(**changes)])
+                with self.assertRaises(ProtocolError):
+                    api.list_folder()
+
+    def test_incomplete_or_overflowing_pages_are_not_absence_evidence(self):
+        cases = [([], {'files': 1, 'folders': 0}, 0, 500),
+                 ([self.file()], {'files': 0, 'folders': 0}, 0, 500),
+                 ([self.file()], {'files': 1, 'folders': 0}, 1, 500),
+                 ([], {'files': 0, 'folders': 0}, 1, 500),
+                 ([self.file(), self.file('/second.jpg')], {'files': 2, 'folders': 0}, 0, 1)]
+        for items, count, offset, limit in cases:
+            with self.subTest(count=count, offset=offset, limit=limit):
+                api, _, _ = self.api([self.folder(items, count=count)])
+                with self.assertRaises(ProtocolError):
+                    api.list_folder(offset=offset, limit=limit)
+
+    def test_short_server_page_can_continue_when_total_has_not_been_reached(self):
+        api, _, _ = self.api([self.folder([self.file()], count={'files': 1001, 'folders': 0})])
+        self.assertEqual(api.list_folder(limit=500)['next_offset'], 1)
+
+    def test_invalid_hash_size_kind_and_path_reject_the_whole_page(self):
+        for changes in ({'hash': 'short'}, {'hash': 'GG' * 20}, {'hash': None},
+                        {'size': -1}, {'size': True}, {'kind': None}, {'kind': []},
+                        {'kind': 'unknown'}, {'home': '/outside/photo.jpg'}, {'home': 'relative'},
+                        {'home': '/'}, {'home': '/a/../photo.jpg'}, {'home': '/x\x00.jpg'},
+                        {'home': '/bad\ud800.jpg'}):
+            with self.subTest(changes=changes):
+                api, _, _ = self.api([self.folder([self.file(**changes)])])
+                with self.assertRaises(ProtocolError):
+                    api.list_folder()
+
+    def test_case_and_unicode_normalized_duplicates_are_rejected(self):
+        for names in (('/Photo.jpg', '/photo.JPG'), ('/e\u0301.jpg', '/é.jpg')):
+            with self.subTest(names=names):
+                api, _, _ = self.api([self.folder([self.file(name) for name in names])])
+                with self.assertRaises(ProtocolError):
+                    api.list_folder()
+
+    def test_nfc_path_and_nodeid_normalization_preserve_actual_server_home(self):
+        api, wire, _ = self.api([self.folder([self.file('/é/e\u0301.jpg', nodeid=123)], home='/é')])
+        page = api.list_folder('/e\u0301')
+        self.assertEqual(page['items'][0]['path'], '/é/é.jpg')
+        self.assertEqual(page['items'][0]['nodeid'], '123')
+        self.assertEqual(parse_qs(wire.requests[0]['body'].decode()), {'home': ['/é']})
+
+    def test_bad_caller_arguments_do_not_make_network_requests(self):
+        for kwargs in ({'path': ''}, {'path': '/folder/'}, {'path': '/a/../b'}, {'offset': -1},
+                       {'offset': True}, {'offset': '0'}, {'limit': True}, {'limit': 0},
+                       {'limit': 1001}, {'limit': '500'}):
+            with self.subTest(kwargs=kwargs):
+                api, wire, _ = self.api([])
+                with self.assertRaises(ValueError):
+                    api.list_folder(**kwargs)
+                self.assertEqual(wire.requests, [])
+
+    def test_http_and_json_failures_cannot_look_like_empty_folder(self):
+        for item in (response(404), response(405), response(data={'status': 404}),
+                     response(data={'status': 403}), response(data=b'bad json'), response(data=[])):
+            with self.subTest(item=item):
+                api, _, _ = self.api([item])
+                with self.assertRaises(ProtocolError):
+                    api.list_folder()
+
+    def test_folder_post_read_retries_transient_failure_with_same_page(self):
+        api, wire, _ = self.api([response(503), TransportError('offline', category='timeout'), self.folder()])
+        with patch.object(api, '_wait') as wait:
+            self.assertEqual(api.list_folder()['total'], 0)
+        self.assertEqual(len(wire.requests), 3)
+        self.assertEqual(len({(r['method'], r['url'], r['body']) for r in wire.requests}), 1)
+        self.assertEqual([call.args for call in wait.call_args_list], [(1,), (2,)])
+
+    def test_folder_retry_flag_cannot_enable_retries_for_mutations(self):
+        for method, url in (('POST', API_BASE + '/api/v1/private/add'),
+                            ('POST', 'https://cloclo1.datacloudmail.ru'),
+                            ('GET', 'https://cloud.mail.ru/api/m1/folder'),
+                            ('PUT', 'https://cloud.mail.ru/api/m1/folder')):
+            with self.subTest(method=method, url=url):
+                api, wire, _ = self.api([])
+                with self.assertRaises(ValueError):
+                    api._request(method, url, folder_read=True)
+                self.assertEqual(wire.requests, [])
+
+    def test_cancelled_listing_never_starts_network_or_swallows_stop(self):
+        api, wire, _ = self.api([])
+        api.stop.set()
+        with self.assertRaises(Cancelled):
+            api.list_folder()
+        self.assertEqual(wire.requests, [])
+
+    def test_stat_keeps_current_boolean_and_checks_explicit_path(self):
+        for flag in (True, False):
+            api, _, _ = self.api([response(data={'hash': self.digest, 'size': 123,
+                                                'home': '/é.jpg', 'is_unlim_upload': flag})])
+            result = api.stat('/e\u0301.jpg')
+            self.assertEqual(result['path'], '/é.jpg')
+            self.assertIs(result['is_unlim_upload'], flag)
+        api, _, _ = self.api([response(data={'hash': self.digest, 'size': 123, 'path': '/other.jpg'})])
+        with self.assertRaises(ProtocolError):
+            api.stat('/wanted.jpg')
+
+    def test_stat_http_405_is_not_evidence_that_a_file_was_deleted(self):
+        api, _, _ = self.api([response(405)])
+        with self.assertRaises(RemoteError) as error:
+            api.stat('/photo.jpg')
+        self.assertEqual(error.exception.status, 405)
 
 
 class TransportBoundaryTests(unittest.TestCase):

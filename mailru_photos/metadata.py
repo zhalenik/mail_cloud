@@ -129,37 +129,22 @@ def encode_add_file(path: str, size: int, mtime_seconds: int, digest: str) -> by
 
 
 def parse_add_file_response(raw: bytes) -> int:
-    """Read a create-only commit status and validate a positive revision.
+    """Read the operation's status byte, leaving optional metadata opaque.
 
-    Both the status and revision type are single bytes, including statuses
-    253/254. A success without the complete BaseRevision is not confirmation.
-    Flags 3 request neither an auto-renamed name nor a node-id section, so no
-    other trailing fields are expected. Nonzero statuses are left to the
-    caller; even NOT_MODIFIED (12) is not positive commit evidence here.
+    The Mail backend in rclone reads the single AddResult status; revision
+    bytes are not part of its success predicate. Demanding one exact revision
+    layout rejected otherwise accepted commits as the server evolved. A zero
+    status confirms acceptance, not the final object's identity: the caller
+    must still read the requested path and verify its full hash and size.
+    Empty responses are not acknowledgements. Even NOT_MODIFIED (12) remains
+    nonzero and must not be promoted to a newly accepted create-only commit.
+
+    Primary implementation: rclone/rclone, backend/mailru/mailru.go,
+    Object.addFileMetaData and backend/mailru/api/bin.go AddResult constants.
     """
     if not raw:
         raise MetadataProtocolError("Empty add-file response")
-    status = raw[0]
-    if status != 0:
-        return status
-    if len(raw) < 2:
-        raise MetadataProtocolError("Missing add-file revision")
-    revision_type, offset = raw[1], 2
-    if revision_type not in range(6):
-        raise MetadataProtocolError("Unknown add-file revision type")
-    revision_count = 2 if revision_type in (3, 4) else 1 if revision_type in (1, 2, 5) else 0
-    for _ in range(revision_count):
-        # TreeID is always 12 bytes, followed by one unsigned revision value.
-        if len(raw) < offset + 12:
-            raise MetadataProtocolError("Truncated add-file tree id")
-        _, offset = read_varint(raw, offset + 12)
-    if revision_type == 5:
-        if len(raw) < offset + 12:
-            raise MetadataProtocolError("Truncated add-file redirect tree id")
-        offset += 12
-    if offset != len(raw):
-        raise MetadataProtocolError("Unexpected trailing add-file fields")
-    return status
+    return raw[0]
 
 
 def encode_quota() -> bytes:

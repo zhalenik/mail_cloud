@@ -302,13 +302,19 @@ class CloudAPI:
 
     def _request(self, method: str, url: str, *, headers: dict[str, str] | None = None,
                  body: bytes = b"", stream=None, length=None, authenticated: bool = True,
-                 token_query: bool = False, token_parameter: str = "token", progress=None) -> Response:
+                 token_query: bool = False, token_parameter: str = "token", progress=None,
+                 folder_read: bool = False) -> Response:
         check_cancelled(self.request_stop)
         if token_parameter not in {"token", "access_token"}:
             raise ValueError("Unsupported OAuth query parameter")
-        # Retry only reads. A failed PUT/POST may already have been accepted;
+        # Retry only reads. M1's folder read happens to use POST, with no cloud
+        # mutation. No other POST may opt into retries through this flag.
+        if folder_read and (method != "POST" or urlsplit(url)._replace(query="", fragment="").geturl()
+                            != QUOTA_BASE + "/api/m1/folder" or stream is not None):
+            raise ValueError("Only the private folder listing can be retried as a POST read")
+        # A failed PUT/POST mutation may already have been accepted;
         # retrying those belongs to the durable upload/reconciliation workflow.
-        read_only = method == "GET" and not body and stream is None
+        read_only = (method == "GET" and not body and stream is None) or folder_read
         network_attempts = 3 if read_only else 1
         for attempt in range(2):
             actual_headers = dict(headers or {})
@@ -444,7 +450,7 @@ class CloudAPI:
     def stat(self, path: str) -> dict[str, Any] | None:
         path = _remote_path(path)
         response = self._request("GET", API_BASE + "/api/v1/private/stat" + quote(path, safe="/"))
-        if response.status in (404, 405):
+        if response.status == 404:
             return None
         self._require(response, 200)
         data = _json(response)
@@ -452,7 +458,20 @@ class CloudAPI:
         digest = data.get("hash")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", digest):
             raise ProtocolError("Сервер не вернул ожидаемый хеш файла.")
-        result = {"size": size, "hash": digest.upper()}
+        # The read URL supplies the identity when older servers omit a path.
+        # An explicit conflicting path must never be silently ignored.
+        reported_path = path
+        for key in ("path", "home"):
+            if key in data:
+                try:
+                    checked = _remote_path(data[key])
+                    checked.encode("utf-8")
+                except (ValueError, UnicodeError):
+                    raise FileVerificationError("Сервер вернул некорректный путь проверяемого файла.") from None
+                if checked.casefold() != path.casefold():
+                    raise FileVerificationError("Сервер вернул другой путь проверяемого файла.")
+                reported_path = checked
+        result = {"size": size, "hash": digest.upper(), "path": reported_path}
         if "nodeid" in data:
             result["nodeid"] = _node_id(data["nodeid"])
         if "type" in data:
@@ -460,6 +479,119 @@ class CloudAPI:
         if type(data.get("is_unlim_upload")) is bool:
             result["is_unlim_upload"] = data["is_unlim_upload"]
         return result
+
+    def list_folder(self, path: str = "/", *, offset: int = 0, limit: int = 500) -> dict[str, Any]:
+        """Read one bounded page of the authenticated account's own tree.
+
+        Wire grounding: rclone's Mail backend listM1 uses POST /api/m1/folder
+        with form field home and query parameters offset/limit/access_token.
+        Its FolderInfoResponse supplies direct-child count, home, kind and
+        list, and may include tree/rev/grev. Those revisions are returned for
+        per-directory consistency checks; they are NOT a documented global
+        snapshot token. Callers must discard incomplete inventories.
+
+        total/next_offset and listed_paths describe the raw page, including
+        excluded mounted shares and virtual collections. The latter permits
+        cross-page overlap detection without retaining excluded objects.
+        File hash, size, and canonical home
+        are required. Optional billing is copied only when an exact boolean
+        is_unlim_upload was returned; a missing flag remains unknown.
+        No public URL, recycle-bin endpoint, or foreign mount is followed.
+        """
+        path = "/" if path == "/" else _remote_path(path)
+        if type(offset) is not int or not 0 <= offset <= (1 << 63) - 1:
+            raise ValueError("Folder offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Folder page size must be between 1 and 1000")
+        response = self._require(self._request(
+            "POST", QUOTA_BASE + "/api/m1/folder?" + urlencode({"offset": offset, "limit": limit}),
+            token_query=True, token_parameter="access_token", folder_read=True,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=urlencode({"home": path}).encode("ascii"),
+        ), 200)
+        payload = _json(response)
+        status = _integer(payload.get("status"), "status")
+        if status != 200:
+            raise RemoteError(status, "REMOTE_ERROR")
+        body = payload.get("body")
+        own_folders = {"folder", "camera-upload", "shared"}
+        excluded_kinds = {"mounted", "public", "trash", "trashbin", "album", "collection", "recent", "search"}
+        if (not isinstance(body, dict) or not isinstance(body.get("kind"), str)
+                or body["kind"] not in own_folders):
+            raise ProtocolError("Облако не подтвердило чтение собственной папки; сверка не завершена.")
+
+        def checked_path(value, *, root=False):
+            try:
+                result = "/" if root and value == "/" else _remote_path(value)
+                result.encode("utf-8")
+                return result
+            except (ValueError, UnicodeError):
+                raise ProtocolError("В списке Облака получен некорректный путь; сверка не завершена.") from None
+
+        home = checked_path(body.get("home"), root=True)
+        if home.casefold() != path.casefold():
+            raise ProtocolError("Список Облака относится к другой папке; сверка не завершена.")
+        count = body.get("count")
+        if not isinstance(count, dict):
+            raise ProtocolError("Облако не сообщило число элементов папки; сверка не завершена.")
+        total = _integer(count.get("files"), "count.files") + _integer(count.get("folders"), "count.folders")
+        if total > (1 << 63) - 1:
+            raise ProtocolError("Некорректное число элементов папки Облака.")
+        raw_items = body.get("list")
+        # Some empty-folder responses omit the optional list field. A missing
+        # list for a nonempty folder must never imply that its files vanished.
+        if raw_items is None and "list" not in body and total == 0:
+            raw_items = []
+        if not isinstance(raw_items, list):
+            raise ProtocolError("Облако не вернуло список элементов папки; сверка не завершена.")
+        if (len(raw_items) > limit or offset > total or offset + len(raw_items) > total
+                or (not raw_items and offset < total)):
+            raise ProtocolError("Пагинация списка Облака неполна или изменилась; повторите сверку.")
+        items, listed_paths, seen, excluded = [], [], set(), 0
+        for raw in raw_items:
+            check_cancelled(self.request_stop)
+            if not isinstance(raw, dict):
+                raise ProtocolError("Некорректная запись списка Облака; сверка не завершена.")
+            child = checked_path(raw.get("home"))
+            if posixpath.dirname(child).casefold() != home.casefold() or child.casefold() in seen:
+                raise ProtocolError("Список Облака содержит повторный или посторонний путь; сверка не завершена.")
+            seen.add(child.casefold())
+            listed_paths.append(child)
+            kind = raw.get("kind")
+            if not isinstance(kind, str):
+                raise ProtocolError("В списке Облака неизвестный тип объекта; сверка не завершена.")
+            if kind in excluded_kinds:
+                excluded += 1
+                continue
+            if kind in own_folders:
+                item = {"kind": "folder", "path": child}
+            elif kind == "file":
+                digest = raw.get("hash")
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", digest):
+                    raise ProtocolError("В списке Облака нет полного хеша файла; сверка не завершена.")
+                item = {"kind": "file", "path": child, "hash": digest.upper(),
+                        "size": _integer(raw.get("size"), "size")}
+                if type(raw.get("is_unlim_upload")) is bool:
+                    item["is_unlim_upload"] = raw["is_unlim_upload"]
+            else:
+                raise ProtocolError("В списке Облака неизвестный тип объекта; сверка не завершена.")
+            node = _node_id(raw.get("nodeid"))
+            if node:
+                item["nodeid"] = node
+            items.append(item)
+        revision = {}
+        if "tree" in body:
+            if not isinstance(body["tree"], str) or not body["tree"] or len(body["tree"]) > 256:
+                raise ProtocolError("Облако вернуло некорректный идентификатор дерева.")
+            revision["tree"] = body["tree"]
+        for key in ("rev", "grev"):
+            if key in body:
+                revision[key] = _integer(body[key], key)
+        next_offset = offset + len(raw_items)
+        return {"path": home, "items": items, "total": total,
+                "next_offset": next_offset if next_offset < total else None,
+                "revision": revision or None, "listed": len(raw_items), "excluded": excluded,
+                "listed_paths": listed_paths}
 
     def _trash_stat(self, path: str) -> dict[str, Any] | None:
         """Read M1's explicit file kind before a file-only trash operation."""
@@ -798,7 +930,7 @@ class CloudAPI:
         Callers must obtain the user's opt-in before choosing this operation.
         It is never called as a fallback from upload_photo. The native APK's
         create-only metadata operation is used, with no overwrite/rename.
-        A complete success response is saved before checking the remote file;
+        A positive operation status is saved before checking the remote file;
         hash equality alone cannot recover an ambiguous earlier commit.
         """
         remote_path = _remote_path(remote_path)
@@ -855,7 +987,7 @@ class CloudAPI:
         try:
             status = parse_add_file_response(response.body)
         except MetadataProtocolError:
-            raise ProtocolError("Сервер не вернул полное подтверждение обычной загрузки в ответе метаданных.") from None
+            raise ProtocolError("Сервер не вернул статус принятия обычной загрузки; подтвердить создание файла нельзя.") from None
         if status in (4, 9, 12):
             raise RemoteConflict("Облако не подтвердило создание нового файла: путь уже существует или конфликтует. "
                                  "Перезапись и автоматическое переименование отключены.")

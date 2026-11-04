@@ -99,25 +99,24 @@ class MetadataWireFormatTests(unittest.TestCase):
             with self.subTest(size=size, timestamp=timestamp), self.assertRaises(ValueError):
                 encode_add_file("/ok", size, timestamp, "00" * 20)
 
-    def test_regular_add_success_requires_a_complete_known_revision(self):
+    def test_regular_add_success_reads_status_without_assuming_revision_shape(self):
         first, second = bytes(range(12)), bytes(range(12, 24))
         revisions = (
+            b"",
             b"\x00",
             b"\x01" + first + b"\xac\x02",
             b"\x02" + first + b"\x01",
             b"\x03" + first + b"\x00" + second + b"\xff\x01",
             b"\x04" + first + b"\x01" + second + b"\x00",
             b"\x05" + first + b"\xac\x02" + second,
+            b"\x06future-server-revision-format",
+            b"\x00extension",
         )
         for revision in revisions:
-            with self.subTest(revision_type=revision[0]):
+            with self.subTest(revision=revision):
                 self.assertEqual(parse_add_file_response(b"\x00" + revision), 0)
-                for cut in range(1, len(revision) + 1):
-                    with self.assertRaises(MetadataProtocolError):
-                        parse_add_file_response((b"\x00" + revision)[:-cut])
-        for wire in (b"", b"\x00\x06", b"\x00\x00unexpected", b"\x00\x01" + first + b"\xff" * 10):
-            with self.subTest(wire=wire), self.assertRaises(MetadataProtocolError):
-                parse_add_file_response(wire)
+        with self.assertRaises(MetadataProtocolError):
+            parse_add_file_response(b"")
 
     def test_regular_add_nonzero_status_is_one_raw_byte_not_varint(self):
         for status in (1, 4, 5, 7, 9, 12, 253, 254, 255):

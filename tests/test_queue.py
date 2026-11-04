@@ -17,6 +17,7 @@ from mailru_photos.media import UNLIMITED_MAX_BYTES
 from mailru_photos.queue import (
     FileChangedError, Queue, QueueBusyError, QueueConfigurationError, QueueError,
     MEDIA_EXTENSIONS, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, SCHEMA_VERSION, ScanCollisionError, SourceUnavailableError, StaleClaimError,
+    _NEW_SORT_INDEX_NAMES,
 )
 
 
@@ -989,7 +990,16 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.queue.get_job(job_id)["remote_path"], "/ChangedDestination/photo.jpg")
         self.assertIsNone(self.queue.claim())
 
+    def schema_four_task_fixture(self):
+        for name in _NEW_SORT_INDEX_NAMES:
+            self.queue._db.execute(f"DROP INDEX IF EXISTS {name}")
+        self.queue._db.execute("DROP TABLE IF EXISTS rescan_intents")
+        for column in ("name_sort", "progress_bytes", "completed_at"):
+            self.queue._db.execute(f"ALTER TABLE jobs DROP COLUMN {column}")
+        self.queue._db.execute("PRAGMA user_version=4")
+
     def schema_two_controls_fixture(self):
+        self.schema_four_task_fixture()
         self.queue._db.execute("DROP TABLE commit_evidence")
         for name in ("jobs_pending", "jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry",
                      "jobs_retry_unlimited", "jobs_retry_regular", "jobs_paused", "jobs_paused_created", "jobs_reconcile",
@@ -2353,6 +2363,7 @@ class QueueTests(unittest.TestCase):
         self.queue.release(resumed)
 
     def schema_three_policy_fixture(self):
+        self.schema_four_task_fixture()
         self.queue._db.execute("DROP TABLE cloud_observations")
         for name in ("jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry_unlimited", "jobs_retry_regular",
                      "jobs_reconcile", "jobs_current_created", "jobs_current_status_created", "jobs_paused_created",
@@ -2382,7 +2393,7 @@ class QueueTests(unittest.TestCase):
                                ("B" * 40, ids["existing.jpg"]))
         self.schema_three_policy_fixture()
         with Queue(self.db, destination="/Archive") as upgraded:
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(upgraded.get_job(ids["ordinary.m4v"])["planned_mode"], "regular")
             self.assertFalse(upgraded.get_job(ids["pending.m4v"])["cloud_present"])
             self.assertFalse(upgraded.get_job(ids["failed.jpg"])["cloud_present"])
@@ -2428,7 +2439,7 @@ class QueueTests(unittest.TestCase):
         self.queue.release(pending)
         self.schema_three_policy_fixture()
         with Queue(self.db, destination="/Archive") as upgraded:
-            copies = list((self.base / "backups").glob("queue-schema3-before4-*.sqlite3"))
+            copies = list((self.base / "backups").glob(f"queue-schema3-before{SCHEMA_VERSION}-*.sqlite3"))
             self.assertEqual(len(copies), 1)
             with sqlite3.connect(copies[0]) as backup:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 3)
@@ -2445,7 +2456,7 @@ class QueueTests(unittest.TestCase):
             with Queue(self.db, destination="/Archive") as reopened:
                 self.assertEqual(reopened._db.total_changes, 0)
             self.assertEqual(upgraded._db.execute("PRAGMA data_version").fetchone()[0], data_version)
-            self.assertEqual(list((self.base / "backups").glob("queue-schema3-before4-*.sqlite3")), copies)
+            self.assertEqual(list((self.base / "backups").glob(f"queue-schema3-before{SCHEMA_VERSION}-*.sqlite3")), copies)
 
     def test_failed_backup_prevents_any_schema_upgrade_and_leaves_no_partial_copy(self):
         self.photo()
@@ -2464,7 +2475,430 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(list((self.base / "backups").glob("*.sqlite3")), [])
         with Queue(self.db, destination="/Archive") as upgraded:
             self.assertEqual(upgraded.stats()["pending"], 1)
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+
+    def test_fresh_rescan_replaces_selected_tasks_and_detaches_completed_history(self):
+        second = self.base / "unselected"; second.mkdir()
+        other = self.queue.add_root(second, "other")
+        self.photo("done.jpg", b"completed")
+        self.photo("skipped.jpg", b"manually skipped")
+        self.photo("keep.jpg", b"other source", root=second)
+        self.queue.scan()
+        old = {row["relative_path"]: row for row in self.queue.list_jobs()}
+        done = self.queue.claim(job_id=old["done.jpg"]["id"])
+        self.queue.mark_uploaded(done, remote_hash="A" * 40, verified_metadata={"is_unlim_upload": True})
+        self.queue.request_control(old["skipped.jpg"]["id"], "skip")
+        preserved = self.queue.get_job(old["keep.jpg"]["id"])
+        self.assertEqual(self.queue.reset_for_scan([1]), 2)
+        self.assertEqual(self.queue.list_jobs(), [preserved])
+        self.assertIsNone(self.queue.get_job(done.id, include_missing=True))
+        self.assertEqual(len(self.queue.upload_history(done.id)), 1)
+        self.assertIsNone(self.queue.upload_history(done.id)[0]["job_id"])
+        self.assertIsNone(self.queue.cloud_history(done.id)[0]["job_id"])
+        self.assertFalse(self.queue.get_metadata("last_scan")["complete"])
+        self.assertEqual(self.queue.get_metadata("last_scan")["root_ids"], [1])
+        scanned = self.queue.scan(root_ids=[1])
+        self.assertEqual((scanned.added, scanned.unchanged), (2, 0))
+        rebuilt = [row for row in self.queue.list_jobs() if row["root_id"] == 1]
+        self.assertTrue(all(row["id"] > max(value["id"] for value in old.values()) for row in rebuilt))
+        self.assertTrue(all(row["status"] == "pending" and not row["cloud_present"] for row in rebuilt))
+        self.assertTrue(all(row["completed_at"] is None and row["progress_bytes"] == 0 for row in rebuilt))
+        self.assertEqual(self.queue.get_job(preserved["id"]), preserved)
+        self.assertEqual(self.queue.stats(root_ids=[other.id])["total"], 1)
+
+    def test_completed_upload_is_not_restored_as_an_intent_after_fresh_scan(self):
+        path = self.photo()
+        self.queue.scan()
+        old = self.queue.claim()
+        self.queue.save_commit_intent(old, "A" * 40)
+        self.queue.confirm_unlimited_commit(old, "A" * 40)
+        self.queue.mark_uploaded(old, remote_hash="A" * 40, verified_metadata={"is_unlim_upload": True})
+        self.queue.reset_for_scan()
+        self.queue.scan()
+        current = self.queue.find_current_job(1, path)
+        self.assertNotEqual(current["id"], old.id)
+        self.assertEqual(current["status"], "pending")
+        self.assertFalse(current["cloud_present"])
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM rescan_intents").fetchone()[0], 0)
+        job = self.queue.claim(job_id=current["id"])
+        self.assertIsNone(self.queue.get_commit_intent(job), "Old completed proof cannot claim a deleted cloud file still exists")
+        self.queue.release(job)
+        self.assertIsNone(self.queue.find_current_job(99, path))
+        self.assertIsNone(self.queue.find_current_job(1, self.source / "absent.jpg"))
+
+    def test_unresolved_rescan_intent_is_lazy_durable_and_does_not_claim_presence(self):
+        path = self.photo("accepted.m4v")
+        self.queue.scan()
+        old = self.queue.claim()
+        self.queue.save_commit_intent(old, "A" * 40, storage_mode="regular")
+        self.queue.confirm_regular_commit(old, "A" * 40)
+        self.queue.record_cloud_observation(old, mode="regular", remote_hash="A" * 40,
+                                            metadata={"is_unlim_upload": False, "commit_accepted": True})
+        self.queue.mark_failed(old, "interrupted final stat", retry_delay=None)
+        self.queue.reset_for_scan()
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM commit_intents").fetchone()[0], 0)
+        with Queue(self.db, destination="/Archive") as reopened:
+            self.assertFalse(reopened.get_metadata("last_scan")["complete"])
+            reopened.scan()
+            candidate = reopened.reconcile_candidates()[0]
+            current = reopened.find_current_job(1, path)
+            self.assertEqual(candidate["id"], current["id"], "The old failed task must participate in fresh reconciliation")
+            self.assertFalse(current["cloud_present"])
+            self.assertIsNone(current["observed_mode"])
+            job = reopened.claim(job_id=current["id"])
+            recovered = reopened.get_commit_intent(job)
+            self.assertEqual(recovered["storage_mode"], "regular")
+            self.assertTrue(recovered["regular_confirmed"])
+            self.assertIs(recovered["storage_observation"]["is_unlim_upload"], False)
+            self.assertFalse(reopened.get_job(job.id)["cloud_present"], "Recovery receipts require a fresh remote check")
+            self.assertEqual(reopened._db.execute("SELECT COUNT(*) FROM rescan_intents").fetchone()[0], 0)
+            reopened.release(job)
+        self.assertTrue(all(row["job_id"] is None for row in self.queue.commit_history(old.id)))
+
+    def test_fresh_existing_match_clears_old_error_and_resolves_recovery_ledger(self):
+        from mailru_photos.api import cloud_hash
+        path = self.photo("accepted.m4v", b"already accepted")
+        digest, _ = cloud_hash(path)
+        self.queue.scan()
+        old = self.queue.claim()
+        self.queue.save_commit_intent(old, digest, storage_mode="regular")
+        self.queue.confirm_regular_commit(old, digest)
+        self.queue.mark_failed(old, "server meta acknowledgement was incomplete", retry_delay=None)
+        self.queue.reset_for_scan()
+        self.queue.scan()
+        candidate = self.queue.reconcile_candidates()[0]
+        actual = "/Другая папка/переименованное видео.m4v"
+        self.assertTrue(self.queue.mark_remote_existing(candidate, remote_hash=digest,
+            remote_path=actual, storage_mode="regular", remote_id="existing-node",
+            evidence={"is_unlim_upload": False, "inventory_verified": True}))
+        current = self.queue.get_job(candidate["id"])
+        self.assertEqual((current["status"], current["skip_reason"]), ("skipped", "remote_exists"))
+        self.assertIsNone(current["last_error"])
+        self.assertEqual(current["cloud_path"], actual)
+        self.assertEqual(current["remote_path"], candidate["remote_path"])
+        self.assertFalse(current["cloud_path_matches"])
+        self.assertEqual(current["observed_mode"], "regular")
+        self.assertEqual(current["progress_percent"], 100)
+        self.assertIsNotNone(current["completed_at"])
+        self.assertIsNone(current["uploaded_at"])
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM rescan_intents").fetchone()[0], 0)
+        self.assertEqual(self.queue.jobs_summary("failed")["total"], 0)
+        self.assertEqual(self.queue.jobs_summary("existing")["total"], 1)
+        self.assertEqual(self.queue.jobs_summary("skipped")["total"], 0)
+        self.assertEqual(self.queue.stats()["existing_regular_count"], 1)
+        self.assertEqual(self.queue.stats()["transferred_regular_count"], 0)
+        self.assertEqual(self.queue.stats()["planned_regular_count"], 0)
+
+    def test_rescan_recovery_refuses_changed_source_and_changed_target(self):
+        self.photo("source-changed.jpg", b"original")
+        self.photo("target-changed.jpg", b"same")
+        self.queue.scan()
+        old = {row["relative_path"]: row for row in self.queue.list_jobs()}
+        for row in old.values():
+            job = self.queue.claim(job_id=row["id"])
+            self.queue.save_commit_intent(job, "A" * 40)
+            self.queue.release(job)
+        self.queue.reset_for_scan()
+        self.photo("source-changed.jpg", b"new and larger bytes")
+        self.queue.update_root(1, "/new-target")
+        self.queue.scan()
+        for row in self.queue.list_jobs():
+            job = self.queue.claim(job_id=row["id"])
+            self.assertIsNone(self.queue.get_commit_intent(job))
+            self.assertIsNone(job.storage_mode)
+            self.queue.release(job)
+
+    def test_reset_refuses_running_task_and_rolls_back_malformed_recovery(self):
+        self.photo("first.jpg")
+        self.photo("second.jpg")
+        self.queue.scan()
+        first = self.queue.claim()
+        self.queue.save_commit_intent(first, "A" * 40)
+        with self.assertRaises(QueueBusyError):
+            self.queue.reset_for_scan()
+        self.assertEqual(self.queue.stats()["total"], 2)
+        self.queue.mark_failed(first, "uncertain", retry_delay=None)
+        second = self.queue.claim()
+        self.queue.save_commit_intent(second, "B" * 40)
+        self.queue.mark_failed(second, "uncertain", retry_delay=None)
+        self.queue._db.execute("UPDATE commit_intents SET intent_json='invalid' WHERE job_id=?", (second.id,))
+        before = self.queue.list_jobs()
+        with self.assertRaises(QueueError):
+            self.queue.reset_for_scan()
+        self.assertEqual(self.queue.list_jobs(), before)
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM rescan_intents").fetchone()[0], 0)
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM commit_intents").fetchone()[0], 2)
+
+    def test_progress_survives_pause_recovery_and_rejects_an_obsolete_claim(self):
+        self.photo(contents=b"x" * 100)
+        self.queue.scan()
+        first = self.queue.claim()
+        self.assertEqual(self.queue.record_progress(first, 70), 70)
+        self.queue.request_control(first.id, "pause")
+        self.queue.release(first)
+        paused = self.queue.get_job(first.id)
+        self.assertEqual((paused["progress_bytes"], paused["progress_percent"]), (70, 70))
+        self.assertIsNone(paused["completed_at"])
+        with self.assertRaises(StaleClaimError):
+            self.queue.record_progress(first, 100)
+        with Queue(self.db, destination="/Archive") as reopened:
+            self.assertEqual(reopened.get_job(first.id)["progress_bytes"], 70)
+            reopened.request_control(first.id, "start")
+            resumed = reopened.claim(job_id=first.id)
+            self.assertEqual(resumed.progress_bytes, 70)
+            self.assertEqual(reopened.record_progress(resumed, 10), 70)
+            reopened.record_progress(resumed, 85)
+            self.assertEqual(reopened.recover_running(), 1)
+            self.assertEqual(reopened.get_job(first.id)["progress_bytes"], 85)
+            with self.assertRaises(StaleClaimError):
+                reopened.record_progress(resumed, 100)
+            last = reopened.claim(job_id=first.id)
+            self.assertEqual(reopened.record_progress(last, 200), 100)
+            for invalid in (-1, True, 5.5, "10"):
+                with self.assertRaises(ValueError):
+                    reopened.record_progress(last, invalid)
+            reopened.release(last)
+
+    def test_changed_source_resets_progress_and_completion(self):
+        self.photo(contents=b"x" * 100)
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.record_progress(job, 80)
+        self.queue.mark_failed(job, "terminal", retry_delay=None)
+        self.assertIsNotNone(self.queue.get_job(job.id)["completed_at"])
+        self.photo(contents=b"new source contents")
+        self.assertEqual(self.queue.scan().changed, 1)
+        changed = self.queue.get_job(job.id)
+        self.assertEqual(changed["progress_bytes"], 0)
+        self.assertEqual(changed["progress_percent"], 0)
+        self.assertIsNone(changed["completed_at"])
+
+    def test_manual_skip_and_return_preserve_intent_and_do_not_start_a_worker(self):
+        self.photo("manual.m4v")
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.save_commit_intent(job, "A" * 40, storage_mode="regular")
+        self.queue.record_progress(job, 5)
+        self.queue.release(job)
+        skipped = self.queue.request_control(job.id, "skip")
+        self.assertEqual(skipped["skip_reason"], "manual_skipped")
+        self.assertIsNotNone(skipped["completed_at"])
+        self.assertEqual(self.queue.apply_regular_policy(True), {"skipped": 0, "resumed": 0})
+        self.assertIsNone(self.queue.claim())
+        returned = self.queue.request_control(job.id, "return")
+        self.assertEqual(returned["status"], "pending")
+        self.assertEqual(returned["attempts"], 0)
+        self.assertIsNone(returned["claim_token"])
+        self.assertIsNone(returned["completed_at"])
+        self.assertEqual(returned["progress_bytes"], 5)
+        resumed = self.queue.claim(job_id=job.id)
+        self.assertEqual(self.queue.get_commit_intent(resumed)["cloud_hash"], "A" * 40)
+        with self.assertRaises(QueueBusyError):
+            self.queue.request_control(job.id, "skip")
+        with self.assertRaises(QueueBusyError):
+            self.queue.request_control(job.id, "return")
+        self.queue.release(resumed)
+
+    def test_completion_timestamp_means_terminal_result_and_resets_on_retry(self):
+        self.photo(contents=b"x" * 100)
+        self.queue.scan()
+        job = self.queue.claim()
+        created = self.queue.get_job(job.id)["created_at"]
+        self.queue.mark_failed(job, "retryable", retry_delay=5, now=created + 1)
+        self.assertIsNone(self.queue.get_job(job.id)["completed_at"])
+        again = self.queue.claim(now=created + 6)
+        self.queue.mark_failed(again, "terminal", retry_delay=None, now=created + 7)
+        self.assertEqual(self.queue.get_job(job.id)["completed_at"], created + 7)
+        self.queue.retry_failed(include_permanent=True)
+        self.assertIsNone(self.queue.get_job(job.id)["completed_at"])
+        finished = self.queue.claim()
+        self.queue.mark_uploaded(finished, remote_hash="A" * 40, verified_metadata={"is_unlim_upload": True})
+        row = self.queue.get_job(job.id)
+        self.assertEqual(row["completed_at"], row["uploaded_at"])
+        self.assertEqual(row["created_at"], created)
+        self.assertEqual((row["progress_bytes"], row["progress_percent"]), (100, 100))
+        self.queue.record_task_error(job.id, "failed management action")
+        self.assertIsNotNone(self.queue.get_job(job.id)["completed_at"])
+        self.queue.request_control(job.id, "start")
+        self.assertIsNone(self.queue.get_job(job.id)["completed_at"])
+
+    def test_existing_counts_are_separate_from_transfers_and_true_skips(self):
+        for name, size in (("existing-unlimited.jpg", 3), ("existing-regular.m4v", 5),
+                           ("existing-unknown.jpg", 7), ("uploaded.jpg", 11), ("error.m4v", 13), ("skipped.jpg", 17)):
+            self.photo(name, b"x" * size)
+        self.queue.scan()
+        rows = {row["relative_path"]: row for row in self.queue.list_jobs()}
+        for name, mode in (("existing-unlimited.jpg", "unlimited"), ("existing-regular.m4v", "regular"),
+                           ("existing-unknown.jpg", "unknown")):
+            self.queue.mark_remote_existing(rows[name], remote_hash="A" * 40, storage_mode=mode)
+        uploaded = self.queue.claim(job_id=rows["uploaded.jpg"]["id"])
+        self.queue.mark_uploaded(uploaded, remote_hash="B" * 40, verified_metadata={"is_unlim_upload": True})
+        error = self.queue.claim(job_id=rows["error.m4v"]["id"])
+        self.queue.record_cloud_observation(error, mode="regular", remote_hash="C" * 40)
+        self.queue.mark_failed(error, "accepted but later stat failed", retry_delay=None)
+        self.queue.request_control(rows["skipped.jpg"]["id"], "skip")
+        stats = self.queue.stats()
+        self.assertEqual((stats["existing_total_count"], stats["existing_total_bytes"]), (3, 15))
+        self.assertEqual((stats["existing_unlimited_count"], stats["existing_regular_count"], stats["existing_unknown_count"]), (1, 1, 1))
+        self.assertEqual((stats["transferred_total_count"], stats["transferred_total_bytes"]), (2, 24))
+        self.assertEqual((stats["transferred_unlimited_bytes"], stats["transferred_regular_bytes"]), (11, 13))
+        self.assertEqual((stats["uploaded_total_count"], stats["uploaded_total_bytes"]), (5, 39))
+        self.assertEqual((stats["skipped_tasks_count"], stats["skipped_tasks_bytes"]), (1, 17))
+        self.assertEqual(self.queue.jobs_summary("existing"), {"total": 3, "total_bytes": 15})
+        self.assertEqual(self.queue.jobs_summary("skipped"), {"total": 1, "total_bytes": 17})
+        self.assertEqual(self.queue.jobs_summary("uploaded_regular"), {"total": 2, "total_bytes": 18})
+        with self.assertRaises(QueueBusyError):
+            self.queue.request_control(rows["existing-regular.m4v"]["id"], "return")
+
+    def test_existing_adoption_checks_optional_ctime_and_does_not_infer_storage(self):
+        path = self.photo("Фото/А.jpg")
+        self.queue.scan()
+        candidate = self.queue.reconcile_candidates()[0]
+        self.assertFalse(self.queue.mark_remote_existing({**candidate, "ctime_ns": path.stat().st_ctime_ns - 1}, remote_hash="A" * 40))
+        with self.assertRaises(QueueError):
+            self.queue.mark_remote_existing(candidate, remote_hash="A" * 40, storage_mode="regular", evidence={"is_unlim_upload": True})
+        self.assertTrue(self.queue.mark_remote_existing({**candidate, "ctime_ns": path.stat().st_ctime_ns}, remote_hash="A" * 40))
+        row = self.queue.get_job(candidate["id"])
+        self.assertEqual(row["observed_mode"], "unknown")
+        self.assertTrue(row["cloud_path_matches"])
+        self.assertEqual(row["status_label"], "Уже в облаке")
+
+    def test_all_table_sort_fields_apply_to_whole_filtered_queue_and_pages(self):
+        for name, size in (("a.jpg", 100), ("z.jpg", 10), ("б.jpg", 50)):
+            self.photo(name, b"x" * size)
+        self.queue.scan()
+        rows = {row["relative_path"]: row for row in self.queue.list_jobs()}
+        a, z, b = (rows[name]["id"] for name in ("a.jpg", "z.jpg", "б.jpg"))
+        job = self.queue.claim(job_id=a); self.queue.record_progress(job, 50); self.queue.mark_failed(job, "error", retry_delay=None, now=100)
+        job = self.queue.claim(job_id=z); self.queue.mark_uploaded(job, remote_hash="A" * 40)
+        self.queue._db.execute("UPDATE jobs SET completed_at=200 WHERE id=?", (z,))
+        job = self.queue.claim(job_id=b); self.queue.record_progress(job, 10); self.queue.request_control(b, "pause"); self.queue.release(job)
+        for identifier, created in ((a, 30), (z, 10), (b, 20)):
+            self.queue._db.execute("UPDATE jobs SET created_at=? WHERE id=?", (created, identifier))
+        expected = {"name": [a, z, b], "size": [z, b, a], "progress": [b, a, z], "status": [z, b, a],
+                    "created_at": [z, b, a], "completed_at": [b, a, z]}
+        for field, ascending in expected.items():
+            for direction, order in (("asc", ascending), ("desc", ascending[::-1])):
+                with self.subTest(field=field, direction=direction):
+                    actual = self.queue.list_jobs(sort_by=field, sort=direction, summary=True)
+                    self.assertEqual([row["id"] for row in actual], order)
+                    self.assertEqual(self.queue.list_jobs(sort_by=field, sort=direction, limit=1, offset=1)[0]["id"], order[1])
+                    self.assertEqual(self.queue.list_jobs("failed", sort_by=field, sort=direction)[0]["id"], a)
+        for value in ("size DESC; DROP TABLE jobs", "id", "", [], None):
+            with self.assertRaises(ValueError):
+                self.queue.list_jobs(sort_by=value)
+        self.assertEqual(self.queue.stats()["total"], 3)
+
+    def test_filename_sort_uses_basename_unicode_casefold_and_stable_ties(self):
+        for name in ("Z/б.jpg", "A/а.jpg", "Б.jpg", "Ё.jpg", "a/Ё.jpg"):
+            self.photo(name)
+        self.queue.scan()
+        rows = {row["relative_path"]: row["id"] for row in self.queue.list_jobs()}
+        expected = [rows["A/а.jpg"], *sorted((rows["Z/б.jpg"], rows["Б.jpg"])), *sorted((rows["Ё.jpg"], rows["a/Ё.jpg"]))]
+        self.assertEqual([row["id"] for row in self.queue.list_jobs(sort_by="name")], expected)
+        self.assertEqual([row["id"] for row in self.queue.list_jobs(sort_by="name", sort="desc")], expected[::-1])
+
+    def test_sorted_skip_filters_do_not_walk_thirty_thousand_other_skips(self):
+        self.photo("target.jpg")
+        self.queue.scan()
+        target_id = 30001
+        self.queue._db.execute("UPDATE jobs SET id=?,status='skipped',skip_reason='manual_skipped'", (target_id,))
+        with self.queue._transaction():
+            self.queue._db.execute("""
+                WITH RECURSIVE prefix(n) AS (
+                    VALUES(1) UNION ALL SELECT n+1 FROM prefix WHERE n<30000
+                )
+                INSERT INTO jobs(id,root_id,relative_path,name_sort,local_path,local_key,remote_path,remote_key,
+                                 size,mtime_ns,device,inode,status,skip_reason,next_attempt,created_at,updated_at)
+                SELECT n,1,'prefix-'||n||'.jpg','prefix-'||n||'.jpg','/fixture/prefix-'||n,'prefix-'||n,
+                       '/Archive/camera/prefix-'||n,'/archive/camera/prefix-'||n,
+                       1,0,0,'0','skipped','remote_exists',NULL,0,0 FROM prefix
+            """)
+        for selected in ("skipped", "existing"):
+            if selected == "existing":
+                self.queue._db.execute(
+                    "UPDATE jobs SET skip_reason=CASE WHEN id=? THEN 'remote_exists' ELSE 'manual_skipped' END",
+                    (target_id,),
+                )
+            for field in ("name", "progress", "status", "size", "created_at", "completed_at"):
+                for direction in ("asc", "desc"):
+                    with self.subTest(filter=selected, field=field, direction=direction):
+                        steps = 0
+                        def count_steps():
+                            nonlocal steps
+                            steps += 1
+                            return 0
+                        self.queue._db.set_progress_handler(count_steps, 1000)
+                        try:
+                            page = self.queue.list_jobs(selected, limit=1, sort_by=field, sort=direction)
+                        finally:
+                            self.queue._db.set_progress_handler(None, 0)
+                        self.assertEqual([row["id"] for row in page], [target_id])
+                        self.assertLess(steps, 30, "A rare skip category scanned the other category's prefix")
+
+    def test_export_stream_uses_one_snapshot_and_closes_on_early_stop(self):
+        for name in ("a.jpg", "b.jpg", "c.jpg"):
+            self.photo(name)
+        self.queue.scan()
+        ids = {row["name"]: row["id"] for row in self.queue.list_jobs()}
+        with Queue(self.db, destination="/Archive") as reader:
+            statements = []
+            reader._db.set_trace_callback(statements.append)
+            stream = reader.iter_export(sort_by="name", batch_size=1)
+            self.assertEqual(next(stream)["id"], ids["a.jpg"])
+            self.queue.request_control(ids["b.jpg"], "skip")
+            rest = list(stream)
+            self.assertEqual([row["name"] for row in rest], ["b.jpg", "c.jpg"])
+            self.assertEqual(rest[0]["status"], "pending", "A download must not mix snapshots midway")
+            queries = [sql for sql in statements if " FROM jobs " in sql]
+            self.assertEqual(len(queries), 1)
+            self.assertNotIn("OFFSET", queries[0])
+            skipped = list(reader.iter_export("skipped", sort_by="name", sort="desc"))
+            self.assertEqual([row["id"] for row in skipped], [ids["b.jpg"]])
+            early = reader.iter_export(batch_size=1)
+            next(early); early.close()
+            self.queue.request_control(ids["c.jpg"], "skip")
+            self.assertEqual(len(list(reader.iter_export("skipped"))), 2)
+        for invalid in (0, 1001, True, 1.5):
+            with self.assertRaises(ValueError):
+                list(self.queue.iter_export(batch_size=invalid))
+
+    def test_schema_four_upgrade_adds_sort_keys_and_only_known_completion_dates(self):
+        for name in ("done.jpg", "failed.jpg", "existing.jpg", "paused.jpg"):
+            self.photo(name, b"x" * 100)
+        self.queue.scan()
+        ids = {row["name"]: row["id"] for row in self.queue.list_jobs()}
+        done = self.queue.claim(job_id=ids["done.jpg"]); self.queue.mark_uploaded(done, remote_hash="A" * 40)
+        failed = self.queue.claim(job_id=ids["failed.jpg"]); self.queue.mark_failed(failed, "old failure", retry_delay=None)
+        candidate = next(row for row in self.queue.reconcile_candidates() if row["id"] == ids["existing.jpg"])
+        self.queue.mark_remote_existing(candidate, remote_hash="B" * 40)
+        self.queue.request_control(ids["paused.jpg"], "pause")
+        self.schema_four_task_fixture()
+        with Queue(self.db, destination="/Archive") as upgraded:
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            self.assertEqual(upgraded.get_job(done.id)["completed_at"], upgraded.get_job(done.id)["uploaded_at"])
+            self.assertEqual(upgraded.get_job(done.id)["progress_bytes"], 100)
+            self.assertEqual(upgraded.get_job(ids["existing.jpg"])["completed_at"], upgraded.get_job(ids["existing.jpg"])["cloud_observed_at"])
+            self.assertIsNone(upgraded.get_job(failed.id)["completed_at"])
+            self.assertTrue(upgraded.get_job(ids["paused.jpg"])["paused"])
+            self.assertEqual([row["name"] for row in upgraded.list_jobs(sort_by="name")], ["done.jpg", "existing.jpg", "failed.jpg", "paused.jpg"])
+            backups = list((self.base / "backups").glob(f"queue-schema4-before{SCHEMA_VERSION}-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            with sqlite3.connect(backups[0]) as old:
+                self.assertEqual(old.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertNotIn("progress_bytes", {row[1] for row in old.execute("PRAGMA table_info(jobs)")})
+            with Queue(self.db, destination="/Archive") as again:
+                self.assertEqual(again._db.total_changes, 0)
+
+    def test_schema_four_upgrade_rolls_back_new_columns_and_ledger_on_failure(self):
+        self.photo(); self.queue.scan()
+        self.schema_four_task_fixture()
+        with patch.object(Queue, "_create_queue_indexes", side_effect=OSError("offline migration interruption")), self.assertRaises(OSError):
+            Queue(self.db, destination="/Archive")
+        self.assertEqual(self.queue._db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertNotIn("progress_bytes", {row["name"] for row in self.queue._db.execute("PRAGMA table_info(jobs)")})
+        self.assertIsNone(self.queue._db.execute("SELECT 1 FROM sqlite_master WHERE name='rescan_intents'").fetchone())
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
 
     def test_scoped_scan_never_prunes_or_discovers_unselected_sources(self):
         second = self.base / "second-source"

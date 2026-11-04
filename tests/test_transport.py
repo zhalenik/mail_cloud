@@ -14,6 +14,70 @@ from unittest import mock
 from mailru_photos import transport
 
 
+class ResponseLimitTests(unittest.TestCase):
+    def test_folder_response_is_bounded_before_json_and_discarded_connection_is_closed(self):
+        from types import SimpleNamespace
+        from mailru_photos.api import CloudAPI
+
+        class UnboundedIncoming:
+            status = 200
+            will_close = False
+
+            def __init__(self):
+                self.read_sizes = []
+                self.bytes_produced = 0
+
+            def read(self, amount=None):
+                if amount is None or amount < 0:
+                    raise AssertionError("A cloud listing must not read an unbounded response")
+                self.read_sizes.append(amount)
+                self.bytes_produced += amount
+                # Lazily stand in for a server ignoring limit=500 and sending
+                # gigabytes. Only the explicitly requested bounded prefix exists.
+                return b" " * amount
+
+            def getheaders(self):
+                return [("Content-Length", str(8 * 1024 ** 3)), ("Content-Type", "application/json")]
+
+        incoming = UnboundedIncoming()
+        connection = mock.Mock()
+        connection.getresponse.return_value = incoming
+        client = transport.HTTP()
+        self.addCleanup(client.close)
+        tokens = SimpleNamespace(access_token=lambda **_: "OFFLINE-FIXTURE-TOKEN",
+                                 tokens=SimpleNamespace(client_id="cloud-android"))
+        api = CloudAPI(tokens, transport_factory=lambda **_: client)
+        self.addCleanup(api.close_thread)
+        with mock.patch.object(client, "_new_connection", return_value=connection), \
+                mock.patch.object(api, "_wait"), \
+                mock.patch("mailru_photos.api._json") as parse:
+            with self.assertRaises(transport.TransportError):
+                api.list_folder("/", limit=500)
+        self.assertTrue(incoming.read_sizes)
+        self.assertLessEqual(len(incoming.read_sizes), 3, "A read-only retry must also be bounded")
+        self.assertTrue(all(size == 2 * 1024 * 1024 + 1 for size in incoming.read_sizes))
+        self.assertEqual(incoming.bytes_produced, len(incoming.read_sizes) * (2 * 1024 * 1024 + 1))
+        self.assertEqual(connection.close.call_count, len(incoming.read_sizes))
+        self.assertFalse(client._connections)
+        parse.assert_not_called()
+
+    def test_response_exactly_at_cap_remains_usable(self):
+        incoming = mock.Mock()
+        incoming.status = 200
+        incoming.will_close = False
+        incoming.read.return_value = b" " * (2 * 1024 * 1024)
+        incoming.getheaders.return_value = []
+        connection = mock.Mock()
+        connection.getresponse.return_value = incoming
+        client = transport.HTTP()
+        self.addCleanup(client.close)
+        with mock.patch.object(client, "_new_connection", return_value=connection):
+            result = client.request("POST", "https://cloud.mail.ru/api/m1/folder?limit=500", body=b"home=%2F")
+        self.assertEqual(len(result.body), 2 * 1024 * 1024)
+        incoming.read.assert_called_once_with(2 * 1024 * 1024 + 1)
+        connection.close.assert_not_called()
+
+
 class UnicodeLoopbackTests(unittest.TestCase):
     def test_cyrillic_folders_and_nfd_names_cross_real_http_encoder_in_utf8(self):
         # Exercise stdlib request-line/header serialization and actual socket

@@ -1,0 +1,349 @@
+{
+  "benchmark": "cloud-inventory-v0.8.0",
+  "count": 300000,
+  "page_size": 500,
+  "environment": {
+    "python": "3.12.14",
+    "sqlite": "3.53.1",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "cpu_count": 9,
+    "inventory_source_sha256": "bed6e5d39f78c4694e9b0f8f1642d09c433682395dadea9b02f6ca253824e99a",
+    "benchmark_source_sha256": "9c152886dfe72c3aad5b9aa4f5fd96d9ef87a73f8212c9ce07f66b45d1dd8a71"
+  },
+  "scope": {
+    "production_inventory_unmodified": true,
+    "real_sqlite": true,
+    "journal_mode": "WAL",
+    "synchronous": "FULL",
+    "virtual_remote_listing": true,
+    "synthetic_remote_hashes": true,
+    "remote_pages_generated_lazily": true,
+    "network_requests": false,
+    "account_access": false,
+    "media_uploads_or_deletions": false,
+    "real_local_hash_files": 512,
+    "real_local_hash_file_bytes": 4096,
+    "limitations": [
+      "Local indexing timings describe this benchmark machine only.",
+      "No Mail API latency, rate limiting, live response shape or service consistency is measured.",
+      "No 1 TB archive is read; only small local files exercise the ctime cache.",
+      "This is not a claim of throughput or total application memory on a TrueNAS server."
+    ]
+  },
+  "baseline_rss_mb": 20.5234375,
+  "measurements": {
+    "initial_refresh": {
+      "seconds": 23.205200092999803,
+      "result": {
+        "cloud_files": 300000,
+        "cloud_folders": 33,
+        "cloud_pages": 603,
+        "excluded": 2,
+        "endpoint_calls": 603,
+        "moved_files": 0,
+        "deleted_files": 0
+      },
+      "rss_mb": 31.5546875,
+      "peak_rss_mb": 31.5546875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6217112,
+        "shm": 32768
+      }
+    },
+    "initial_lookup_every_file": {
+      "seconds": 6.587648277998596,
+      "result": {
+        "matched": 300000,
+        "found_at_other_path": 0,
+        "deleted_absent": 0,
+        "actual_storage_modes": {
+          "unlimited": 260690,
+          "regular": 28965,
+          "unknown": 10345
+        }
+      },
+      "rss_mb": 31.60546875,
+      "peak_rss_mb": 31.60546875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6217112,
+        "shm": 32768
+      }
+    },
+    "first_changed_refresh": {
+      "seconds": 15.273840251000365,
+      "result": {
+        "cloud_files": 295000,
+        "cloud_folders": 33,
+        "cloud_pages": 593,
+        "excluded": 2,
+        "endpoint_calls": 593,
+        "moved_files": 10000,
+        "deleted_files": 5000
+      },
+      "rss_mb": 31.90625,
+      "peak_rss_mb": 31.90625,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "first_changed_lookup_every_file": {
+      "seconds": 6.402785385000243,
+      "result": {
+        "matched": 295000,
+        "found_at_other_path": 10000,
+        "deleted_absent": 5000,
+        "actual_storage_modes": {
+          "unlimited": 256345,
+          "regular": 28482,
+          "unknown": 10173
+        }
+      },
+      "rss_mb": 31.90625,
+      "peak_rss_mb": 31.90625,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "second_changed_refresh": {
+      "seconds": 12.772254416000578,
+      "result": {
+        "cloud_files": 290000,
+        "cloud_folders": 32,
+        "cloud_pages": 583,
+        "excluded": 2,
+        "endpoint_calls": 583,
+        "moved_files": 20000,
+        "deleted_files": 10000
+      },
+      "rss_mb": 31.91015625,
+      "peak_rss_mb": 31.91015625,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "second_changed_lookup_every_file": {
+      "seconds": 7.126073625999197,
+      "result": {
+        "matched": 290000,
+        "found_at_other_path": 20000,
+        "deleted_absent": 10000,
+        "actual_storage_modes": {
+          "unlimited": 252000,
+          "regular": 28000,
+          "unknown": 10000
+        }
+      },
+      "rss_mb": 31.91015625,
+      "peak_rss_mb": 31.91015625,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "cancelled_refresh": {
+      "seconds": 1.6297242269993149,
+      "result": {
+        "last_progress": {
+          "cloud_files": 50000,
+          "cloud_folders": 7,
+          "cloud_pages": 102,
+          "excluded": 2
+        },
+        "endpoint_calls": 102,
+        "partial_index_rejected": true
+      },
+      "rss_mb": 31.91015625,
+      "peak_rss_mb": 31.91015625,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "complete_refresh_after_cancellation": {
+      "seconds": 13.118240212999808,
+      "result": {
+        "cloud_files": 290000,
+        "cloud_folders": 32,
+        "cloud_pages": 583,
+        "excluded": 2,
+        "endpoint_calls": 583,
+        "moved_files": 20000,
+        "deleted_files": 10000
+      },
+      "rss_mb": 31.92578125,
+      "peak_rss_mb": 31.92578125,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "recovered_lookup_every_file": {
+      "seconds": 8.844425555998896,
+      "result": {
+        "matched": 290000,
+        "found_at_other_path": 20000,
+        "deleted_absent": 10000,
+        "actual_storage_modes": {
+          "unlimited": 252000,
+          "regular": 28000,
+          "unknown": 10000
+        }
+      },
+      "rss_mb": 31.92578125,
+      "peak_rss_mb": 31.92578125,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "invalid_pages": {
+      "seconds": 0.12185215600038646,
+      "result": {
+        "incomplete": {
+          "rejected": true,
+          "endpoint_calls": 4
+        },
+        "repeated": {
+          "rejected": true,
+          "endpoint_calls": 5
+        },
+        "revision_changed": {
+          "rejected": true,
+          "endpoint_calls": 4
+        },
+        "subsequent_refresh": {
+          "complete": true,
+          "cloud_files": 1500
+        }
+      },
+      "rss_mb": 32.6796875,
+      "peak_rss_mb": 33.04296875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "local_hash_first_read": {
+      "seconds": 0.03746757200133288,
+      "result": {
+        "files": 512
+      },
+      "rss_mb": 32.73046875,
+      "peak_rss_mb": 33.04296875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      }
+    },
+    "local_hash_unchanged_second_read": {
+      "seconds": 0.01502946599975985,
+      "result": {
+        "files": 512
+      },
+      "rss_mb": 32.73046875,
+      "peak_rss_mb": 33.04296875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      },
+      "actual_hash_calculations": 0
+    },
+    "local_hash_renamed_and_rewritten": {
+      "seconds": 0.014215545999832102,
+      "result": {
+        "files": 512
+      },
+      "rss_mb": 32.796875,
+      "peak_rss_mb": 33.04296875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 6476672,
+        "shm": 32768
+      },
+      "renamed": 51,
+      "rewritten_same_size_and_mtime": 51,
+      "actual_hash_calculations": 102
+    },
+    "close_checkpoint": {
+      "seconds": 0.018717433000347228,
+      "result": null,
+      "rss_mb": 32.765625,
+      "peak_rss_mb": 33.04296875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 0,
+        "shm": 0
+      }
+    },
+    "local_hash_after_restart": {
+      "seconds": 0.0082392450003681,
+      "result": {
+        "files": 512
+      },
+      "rss_mb": 32.8359375,
+      "peak_rss_mb": 33.04296875,
+      "disk_bytes": {
+        "db": 197455872,
+        "wal": 0,
+        "shm": 32768
+      },
+      "actual_hash_calculations": 0
+    }
+  },
+  "assertions": [
+    "Initial listing uses real SQLite and matches every virtual remote file by full hash plus size.",
+    "Two complete subsequent refreshes remove deleted paths instead of trusting the previous index.",
+    "Moved files are found by content at their current different cloud path.",
+    "Missing storage flag remains unknown; exact false is regular and exact true is unlimited.",
+    "Every refresh rereads all cloud pages; local history never substitutes for a cloud listing.",
+    "Foreign mounts and virtual trash entries are counted for pagination but never traversed.",
+    "Cancellation invalidates partial and old matches; a following full refresh recovers.",
+    "Content lookup uses the size/hash SQLite index; no whole-cloud Python collection is built.",
+    "Truncated pages, repeated-page paths and revision changes fail closed; next refresh succeeds.",
+    "Real tiny-file hashing is cached across repeated reads and restart on Linux with unchanged identity and ctime.",
+    "Renamed files are checked at the new path; same-size rewrites with restored mtime invalidate the Linux ctime cache.",
+    "Closing checkpoints and truncates the inventory WAL; reopening requires a fresh remote listing before matching."
+  ],
+  "plans": {
+    "content_lookup": [
+      [
+        3,
+        0,
+        61,
+        "SEARCH files USING INDEX files_content (size=? AND hash=?)"
+      ]
+    ]
+  },
+  "max_generated_page_items": 500,
+  "max_requested_page_limit": 500,
+  "total_virtual_endpoint_calls": 2464,
+  "peak_observed_disk_bytes": {
+    "db": 197455872,
+    "wal": 6476672,
+    "shm": 32768
+  },
+  "final_disk_bytes": {
+    "db": 197455872,
+    "wal": 0,
+    "shm": 0
+  },
+  "final_rss_mb": 32.83984375,
+  "peak_rss_mb": 33.04296875,
+  "observed_peak_rss_mb": 32.83984375,
+  "total_seconds": 96.44772302500132
+}
