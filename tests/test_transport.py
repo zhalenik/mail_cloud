@@ -1,14 +1,110 @@
-"""Offline HTTP proxy boundary tests; no real sockets or credentials."""
+"""HTTP boundary tests using mocks or loopback sockets, never real accounts."""
 
 import base64
 import io
 import json
 import socket
 import ssl
+import threading
+import tempfile
+import unicodedata
 import unittest
 from unittest import mock
 
 from mailru_photos import transport
+
+
+class UnicodeLoopbackTests(unittest.TestCase):
+    def test_cyrillic_folders_and_nfd_names_cross_real_http_encoder_in_utf8(self):
+        # Exercise stdlib request-line/header serialization and actual socket
+        # traffic. The only connection factory is redirected to loopback;
+        # production HTTPS domain validation stays intact and is still called.
+        import http.client
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from pathlib import Path
+        from types import SimpleNamespace
+        from urllib.parse import unquote, urlsplit
+        from mailru_photos.api import CloudAPI, FileIdentity, cloud_hash
+        from mailru_photos.metadata import encode_mkdir
+
+        for remote_input in ('/Семья/Отпуск/ёж #?%.jpg', '/Семья/Отпуск/е\u0308ж #?%.jpg'):
+            with self.subTest(remote=remote_input), tempfile.TemporaryDirectory() as directory:
+                local = Path(directory) / 'Папка на диске' / 'е\u0308ж #?%.jpg'
+                local.parent.mkdir()
+                local.write_bytes(b'\xff\xd8\xff' + bytes(range(256)) * 4)
+                digest, identity = cloud_hash(local)
+                remote = unicodedata.normalize('NFC', remote_input)
+                requests = []
+                state = {'committed': False}
+
+                class Handler(BaseHTTPRequestHandler):
+                    def log_message(self, *_):
+                        pass
+
+                    def handle_request(self):
+                        raw = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                        requests.append((self.command, self.path, dict(self.headers), raw))
+                        target = urlsplit(self.path).path
+                        status, headers = 200, {}
+                        if target == '/m':
+                            body = b'https://metadata.cloud.mail.ru/'
+                        elif self.command == 'GET' and target.startswith('/api/v1/private/stat/'):
+                            if state['committed']:
+                                body = json.dumps({'hash': digest, 'size': identity.size}).encode('utf-8')
+                            else:
+                                status, body = 404, b'{}'
+                        elif self.command == 'POST' and target == '/':
+                            body = b'\x00\x01'
+                        elif self.command == 'PUT':
+                            status, body, headers = 201, b'', {'X-Valid-for': '0'}
+                        elif self.command == 'POST' and target == '/api/v1/private/add':
+                            payload = json.loads(raw.decode('utf-8'))
+                            state['committed'] = True
+                            body = json.dumps({'name': payload['path'].rsplit('/', 1)[1],
+                                               'path': payload['path'], 'is_unlim_upload': True},
+                                              ensure_ascii=False).encode('utf-8')
+                        else:
+                            status, body = 500, b'{}'
+                        self.send_response(status)
+                        for name, value in headers.items():
+                            self.send_header(name, value)
+                        self.send_header('Content-Length', str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                    do_GET = do_POST = do_PUT = handle_request
+
+                server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+
+                class LoopbackHTTP(transport.HTTP):
+                    def _new_connection(self, _host):
+                        return http.client.HTTPConnection(*server.server_address, timeout=5)
+
+                tokens = SimpleNamespace(access_token=lambda **_: 'LOOPBACK-TEST-TOKEN',
+                                         tokens=SimpleNamespace(client_id='cloud-android'))
+                api = CloudAPI(tokens, transport_factory=LoopbackHTTP)
+                try:
+                    result = api.upload_photo(str(local), remote_input, expected=FileIdentity.from_stat(local.stat()),
+                                              save_intent=lambda _: None, save_confirmation=lambda _: None)
+                finally:
+                    api.close_thread()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=5)
+                self.assertEqual(result['path'], remote)
+                self.assertIs(result['verified'], True)
+                self.assertTrue(all(target.isascii() for _, target, _, _ in requests))
+                stats = [unquote(urlsplit(target).path) for method, target, _, _ in requests
+                         if method == 'GET' and '/private/stat' in target]
+                self.assertEqual(stats, ['/api/v1/private/stat' + remote] * 2)
+                metadata = [body for method, target, _, body in requests
+                            if method == 'POST' and urlsplit(target).path == '/']
+                self.assertEqual(metadata, [encode_mkdir('/Семья'), encode_mkdir('/Семья/Отпуск')])
+                commit = next(body for method, target, _, body in requests if '/private/add' in target)
+                self.assertIn('/Семья/Отпуск/'.encode('utf-8'), commit)
+                self.assertEqual(json.loads(commit)['path'], remote)
 
 
 class ProxyTransportTests(unittest.TestCase):
