@@ -447,12 +447,16 @@ class WebServiceTests(unittest.TestCase):
 
     def test_disabled_reconciliation_does_not_call_optional_module(self):
         self.photos_count(1)
+        self.service.settings(remote_reconcile=False)
         with patch('mailru_photos.reconcile.reconcile', side_effect=AssertionError('Disabled optional pass')) as reconcile:
             self.service.scan(); state = self.done()
             self.assertFalse(reconcile.called)
         self.assertTrue(state['last_scan']['complete'])
         self.assertEqual(state['stats']['pending'], 1)
         self.assertEqual(self.cloud.account_calls, 1, 'Scan refreshes account quota for its storage estimate')
+        self.service.close()
+        replacement = self.make_service()
+        self.assertFalse(replacement.snapshot()['settings']['remote_reconcile'], 'A saved opt-out must survive the new default')
 
     def test_optional_reconciliation_marks_existing_without_new_upload_or_proof(self):
         self.photos_count(1)
@@ -476,14 +480,16 @@ class WebServiceTests(unittest.TestCase):
         replacement = self.make_service()
         self.assertTrue(replacement.snapshot()['settings']['remote_reconcile'])
 
-    def test_optional_module_failure_leaves_scan_and_normal_uploader_usable(self):
+    def test_incomplete_reconciliation_blocks_pipeline_until_explicitly_disabled(self):
         self.photos_count(2)
         self.service.settings(remote_reconcile=True)
         with patch('mailru_photos.reconcile.reconcile', side_effect=RuntimeError('Optional module fixture failure')):
             self.service.scan(); state = self.done()
-        self.assertTrue(state['last_scan']['complete'])
+        self.assertFalse(state['last_scan']['complete'])
+        self.assertTrue(state['last_scan']['local_complete'])
         self.assertEqual(state['stats']['pending'], 2)
-        self.assertEqual(state['activity']['phase'], 'idle')
+        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertEqual(self.cloud.upload_calls, [])
         self.service.settings(remote_reconcile=False)
         self.service.start(); state = self.done()
         self.assertEqual(state['stats']['uploaded'], 2)
@@ -496,19 +502,21 @@ class WebServiceTests(unittest.TestCase):
             self.service.scan(); state = self.done()
         self.assertFalse(state['authenticated'])
         self.assertTrue(state['quota']['stale'])
-        self.assertTrue(state['last_scan']['complete'])
+        self.assertFalse(state['last_scan']['complete'])
+        self.assertTrue(state['last_scan']['local_complete'])
         self.assertEqual(state['stats']['pending'], 1)
-        self.assertEqual(state['activity']['phase'], 'idle')
+        self.assertEqual(state['activity']['phase'], 'error')
         self.assertEqual(self.cloud.commits, [])
 
     def test_pipeline_does_not_upload_after_optional_comparison_loses_auth(self):
         self.photos_count(2)
         self.service.settings(remote_reconcile=True)
-        with patch.object(self.cloud, 'stat', side_effect=RemoteError(403)):
+        with patch.object(self.cloud, 'list_folder', side_effect=RemoteError(403)):
             self.service.start(); state = self.done()
         self.assertFalse(state['authenticated'])
         self.assertEqual(state['activity']['phase'], 'error')
-        self.assertTrue(state['last_scan']['complete'])
+        self.assertFalse(state['last_scan']['complete'])
+        self.assertTrue(state['last_scan']['local_complete'])
         self.assertEqual(state['stats']['pending'], 2)
         self.assertEqual(self.cloud.account_calls, 1, 'Only the comparison may validate this rejected account')
         self.assertEqual(self.cloud.quota_calls, 0)
@@ -618,7 +626,7 @@ class WebServiceTests(unittest.TestCase):
         self.assertTrue(all(item['unlimited_upload'] is True for item in self.cloud.commits))
         self.assertEqual(len(self.cloud.commits), 1)
 
-    def test_upgrade_rescans_old_photo_filter_once_and_retains_completed_photos(self):
+    def test_upgrade_rescans_old_photo_filter_once_and_finds_prior_photos(self):
         from mailru_photos.queue import PHOTO_EXTENSIONS
         self.photos_count(1)
         self.service.start()
@@ -632,9 +640,10 @@ class WebServiceTests(unittest.TestCase):
         self.assertFalse(replacement.snapshot()['last_scan']['complete'])
         replacement.start()
         state = self.done(replacement)
-        self.assertEqual(state['stats']['uploaded'], 2, state)
+        self.assertEqual(state['stats']['uploaded'], 1, state)
+        self.assertEqual(state['stats']['existing'], 1, state)
         self.assertEqual(len(self.cloud.commits), 2)
-        self.assertEqual(replacement.jobs()['jobs'][0]['id'], photo_id)
+        self.assertNotIn(photo_id, [row['id'] for row in replacement.jobs()['jobs']])
         replacement.close()
         self.assertTrue(self.make_service().snapshot()['last_scan']['complete'])
 
@@ -733,7 +742,7 @@ class WebServiceTests(unittest.TestCase):
         write_json(self.state / 'web_settings.json', {'workers': 3, 'auto_resume': False, 'preflight_check': True})
         replacement = self.make_service()
         self.assertEqual(replacement.snapshot()['settings'],
-                         {'workers': 3, 'auto_resume': False, 'remote_reconcile': False, 'regular_policy': 'skip',
+                         {'workers': 3, 'auto_resume': False, 'remote_reconcile': True, 'regular_policy': 'skip',
                           'unexpected_unlimited_action': 'trash', 'timezone': 'UTC'})
 
     def test_container_lifecycle_logs_do_not_echo_private_messages(self):
@@ -962,7 +971,7 @@ class WebServiceTests(unittest.TestCase):
         replacement = self.make_service()
         self.assertFalse(replacement.resume_if_requested())
         state = replacement.snapshot()
-        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'remote_reconcile': False,
+        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'remote_reconcile': True,
                                             'regular_policy': 'skip', 'unexpected_unlimited_action': 'trash', 'timezone': 'UTC'})
         self.assertEqual(state['activity']['phase'], 'paused')
 
@@ -1271,7 +1280,10 @@ class WebServiceTests(unittest.TestCase):
             self.assertGreater(paused['stats']['pending'], 0)
             self.service.settings(workers=3)
             self.service.start()
-            self.service._thread.join(timeout=15)
+            # Four panels at 1 ms intentionally contend with workers far more
+            # than the browser does. Bound deadlocks without turning this
+            # race/consistency test into a CPU-throughput gate on loaded CI.
+            self.service._thread.join(timeout=45)
             self.assertIsNone(self.service._operation)
         finally:
             polling_stop.set()
@@ -1328,6 +1340,30 @@ class WebServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.control_task(other['id'], 'pause')
         self.assertEqual(self.service.jobs('pending')['total'], 2)
+
+    def test_manual_skip_and_return_update_only_the_selected_task_without_starting(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        task = self.service.jobs(sort_by='name')['jobs'][0]
+        self.service.control_task(task['id'], 'skip')
+        skipped = self.service.jobs('skipped')['jobs']
+        self.assertEqual([row['id'] for row in skipped], [task['id']])
+        self.assertEqual(skipped[0]['skip_reason'], 'manual_skipped')
+        self.assertIsNotNone(skipped[0]['completed_at'])
+        self.assertIsNone(self.service._operation)
+        self.assertEqual(self.cloud.upload_calls, [])
+        self.service.control_task(task['id'], 'return')
+        self.assertIsNone(self.service._operation)
+        self.assertEqual(self.service.jobs('skipped')['total'], 0)
+        self.assertEqual(self.service.jobs('pending')['total'], 2)
+        returned = next(row for row in self.service.jobs()['jobs'] if row['id'] == task['id'])
+        self.assertIsNone(returned['completed_at'])
+        self.assertEqual(returned['created_at'], task['created_at'])
+        self.assertEqual(self.cloud.upload_calls, [])
+        self.service.control_task(task['id'], 'start')
+        state = self.done()
+        self.assertEqual((state['stats']['uploaded'], state['stats']['pending']), (1, 1))
+        self.assertEqual([item['path'] for item in self.cloud.commits], [task['remote_path']])
 
     def test_restart_resumes_only_the_interrupted_single_task(self):
         self.photos_count(3)

@@ -74,6 +74,7 @@ class FakeCloud(CloudAPI):
         self.barrier = barrier
         self._active_uploads = 0
         self.max_active_uploads = 0
+        self.folder_calls = []
 
     def _check_stopped(self):
         check_cancelled(self.request_stop)
@@ -149,6 +150,29 @@ class FakeCloud(CloudAPI):
     def _request(self, method, url, *, body=b"", **kwargs):
         self._check_stopped()
         parsed = urlsplit(url)
+        if method == 'POST' and parsed.path == '/api/m1/folder':
+            path = parse_qs(body.decode('ascii'))['home'][0]
+            query = parse_qs(parsed.query)
+            offset, limit = int(query.get('offset', ['0'])[0]), int(query.get('limit', ['500'])[0])
+            prefix = path.rstrip('/') + '/'
+            entries = {}
+            with self._fake_lock:
+                self.folder_calls.append((path, offset, limit))
+                for remote_path, value in self.remote.items():
+                    if not remote_path.startswith(prefix):
+                        continue
+                    tail = remote_path[len(prefix):]
+                    if '/' in tail:
+                        child = prefix + tail.split('/', 1)[0]
+                        entries[child] = {'kind': 'folder', 'home': child}
+                    else:
+                        entries[remote_path] = {'kind': 'file', 'home': remote_path, **value}
+            items = [entries[key] for key in sorted(entries)]
+            content = {'kind': 'folder', 'home': path,
+                       'count': {'files': sum(x['kind'] == 'file' for x in items),
+                                 'folders': sum(x['kind'] == 'folder' for x in items)},
+                       'list': items[offset:offset + limit]}
+            return Response(200, {}, json.dumps({'status': 200, 'body': content}).encode())
         if method == 'GET' and parsed.path == '/api/m1/file':
             path = parse_qs(parsed.query)['home'][0]
             with self._fake_lock:

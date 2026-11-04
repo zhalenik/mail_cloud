@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .auth import AuthError
 from .content import ContentError, FileResponse, open_task_content
+from .export import QueueExportResponse, options as export_options
 from .queue import QueueBusyError, QueueConfigurationError, QueueError, _file_lock
 
 MAX_BODY = 16384
@@ -340,7 +341,7 @@ class WebApplication:
         except Exception:
             # Do not expose arbitrary exception strings, credentials or traces.
             status, value, content_type = 500, {"error": {"message": "Не удалось выполнить запрос. Очередь сохранена.", "code": "internal_error"}}, "application/json"
-        if isinstance(value, FileResponse):
+        if isinstance(value, (FileResponse, QueueExportResponse)):
             try:
                 start_response(f"{value.status} {HTTPStatus(value.status).phrase}", value.headers)
             except BaseException:
@@ -361,6 +362,9 @@ class WebApplication:
 
     def _api(self, path: str, method: str, data: dict, environ: dict):
         query = parse_qs(environ.get("QUERY_STRING", ""), max_num_fields=16)
+        if path == "/api/jobs/export" and method in {"GET", "HEAD"}:
+            parameters = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True, max_num_fields=16)
+            return self.service.export_jobs(export_options(parameters), head=method == "HEAD")
         content = re.fullmatch(r"/api/tasks/([0-9]+)/content", path)
         if content is not None and method in {"GET", "HEAD"}:
             options = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True, max_num_fields=4)
@@ -380,13 +384,14 @@ class WebApplication:
                 return self.service.snapshot()
             if path == "/api/jobs":
                 status = query.get("status", ["all"])[0]
-                if status not in {"all", "pending", "running", "uploaded", "failed", "skipped", "paused",
+                if status not in {"all", "pending", "running", "uploaded", "failed", "skipped", "paused", "existing",
                                    "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"}:
                     raise WebError(400, "Неизвестный фильтр очереди.")
                 return self.service.jobs(status=None if status == "all" else status,
-                                         limit=_integer(query.get("limit", ["50"])[0], 1, 100),
+                                         limit=_integer(query.get("limit", ["50"])[0], 1, 200),
                                          offset=_integer(query.get("offset", ["0"])[0], 0, 100000000),
-                                         sort=query.get("sort", ["asc"])[0])
+                                         sort=query.get("sort", ["asc"])[0],
+                                         sort_by=query.get("sort_by", ["created_at"])[0])
             if path == "/api/folders":
                 return self.service.folders(query.get("path", [None])[0])
             if path == "/api/report":
@@ -432,7 +437,7 @@ class WebApplication:
             self.service.confirm_deletion(_text(data, "token", limit=200),
                 local_confirmation=_text(data, "local_confirmation", limit=100) if "local_confirmation" in data else "",
                 owner=environ.get("mailru.session_owner", ""))
-        elif path in {"/api/tasks/pause", "/api/tasks/resume", "/api/tasks/start", "/api/tasks/remove"}:
+        elif path in {"/api/tasks/pause", "/api/tasks/resume", "/api/tasks/start", "/api/tasks/remove", "/api/tasks/skip", "/api/tasks/return"}:
             self.service.control_task(_integer(data.get("id"), 1, 2**63 - 1), path.rsplit("/", 1)[1])
         elif path == "/api/tasks/clear":
             scope = _text(data, "scope", limit=16)

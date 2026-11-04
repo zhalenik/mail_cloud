@@ -149,7 +149,7 @@ class WebTests(unittest.TestCase):
         self.request('/api/session')
         self.assertEqual(self.request('/api/tasks/pause', method='POST', data={'id': 1})['status'], 401)
         self.authenticate()
-        for action in ('pause', 'resume', 'start', 'remove'):
+        for action in ('pause', 'resume', 'start', 'remove', 'skip', 'return'):
             endpoint = '/api/tasks/' + action
             self.assertEqual(self.request(endpoint, method='POST', data={'id': 1}, csrf='bad')['status'], 403)
             self.assertEqual(self.request(endpoint, method='POST', data={'id': 1})['status'], 200)
@@ -433,10 +433,13 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request("/api/jobs?offset=-1")["status"], 400)
         self.assertEqual(self.request("/api/jobs?status=deleted")["status"], 400)
         self.assertEqual(self.request("/api/jobs?status=failed&offset=50&limit=50")["status"], 200)
-        self.assertEqual(self.service.calls[-1], ("jobs", {"status": "failed", "offset": 50, "limit": 50, "sort": "asc"}))
-        for status in ('uploaded_unlimited', 'uploaded_regular', 'uploaded_unknown'):
+        self.assertEqual(self.service.calls[-1], ("jobs", {"status": "failed", "offset": 50, "limit": 50, "sort": "asc", "sort_by": "created_at"}))
+        for status in ('uploaded_unlimited', 'uploaded_regular', 'uploaded_unknown', 'existing', 'skipped'):
             self.assertEqual(self.request('/api/jobs?status=' + status + '&sort=desc')['status'], 200)
-            self.assertEqual(self.service.calls[-1], ('jobs', {'status': status, 'offset': 0, 'limit': 50, 'sort': 'desc'}))
+            self.assertEqual(self.service.calls[-1], ('jobs', {'status': status, 'offset': 0, 'limit': 50, 'sort': 'desc', 'sort_by': 'created_at'}))
+        for field in ('name', 'progress', 'status', 'size', 'created_at', 'completed_at'):
+            self.assertEqual(self.request('/api/jobs?sort_by=' + field + '&limit=200')['status'], 200)
+            self.assertEqual(self.service.calls[-1][1]['sort_by'], field)
 
     def test_deletion_preview_and_confirmation_require_auth_csrf_and_session_binding(self):
         self.request('/api/session')

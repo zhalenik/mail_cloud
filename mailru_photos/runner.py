@@ -15,7 +15,7 @@ from .api import (PROTOCOL_VERSION, CloudAPI, FileIdentity, FileVerificationErro
                   ProtocolError, RemoteConflict, RemoteError, SourceChanged,
                   UnlimitedNotConfirmed, UnsupportedPhoto, is_auth_failure)
 from .auth import AuthError
-from .queue import FileChangedError, Job, Queue, QueueError
+from .queue import FileChangedError, Job, Queue, QueueError, StaleClaimError
 from .transport import Cancelled, SourceReadError, TaskCancelled, TransportError
 
 
@@ -92,25 +92,48 @@ def _job_scope(queue: Queue, api: CloudAPI, job: Job, task_scope: TaskScope | No
 def process_job(queue: Queue, api: CloudAPI, job: Job, *, emit=None,
                 task_scope: TaskScope | None = None,
                 unexpected_unlimited_action: str = "trash", quota_budget=None) -> dict[str, Any]:
+    previous = max(0, getattr(job, "progress_bytes", 0))
+    transferred = 0
+    saved = previous
+    last_save = time.monotonic()
+
+    def progress(size):
+        nonlocal transferred, saved, last_save
+        transferred += max(0, size)
+        known = min(job.size, max(previous, transferred))
+        now = time.monotonic()
+        if known > saved and now - last_save >= 2:
+            saved = queue.record_progress(job, known)
+            last_save = now
+        if emit is not None:
+            emit("upload_progress", {"job_id": job.id, "bytes": size, "sent": known})
+
     if emit is not None:
         emit("file_started", {"job_id": job.id, "path": job.remote_path,
-                              "size": job.size, "storage_mode": job.planned_mode})
+                              "size": job.size, "storage_mode": job.planned_mode, "sent": previous})
     try:
         with _job_scope(queue, api, job, task_scope):
-            return _process_job(queue, api, job, progress=(lambda size: emit(
-                "upload_progress", {"job_id": job.id, "bytes": size})) if emit is not None else None,
+            return _process_job(queue, api, job, progress=progress,
                 unexpected_unlimited_action=unexpected_unlimited_action, quota_budget=quota_budget)
     finally:
-        if quota_budget is not None and quota_budget.has_reservation(job.claim_token):
-            try:
-                uncertain = bool(queue.get_commit_intent(job))
-            except (QueueError, sqlite3.Error):
-                uncertain = True
-            quota_budget.finish(job.claim_token, uncertain=uncertain)
-        if quota_budget is not None:
-            quota_budget.close_claim(job.claim_token)
-        if emit is not None:
-            emit("file_finished", {"job_id": job.id})
+        try:
+            known = min(job.size, max(previous, transferred))
+            if known > saved:
+                # Success and source replacement already finalized this claim;
+                # a late progress write must never resurrect it.
+                with contextlib.suppress(StaleClaimError):
+                    queue.record_progress(job, known)
+        finally:
+            if quota_budget is not None and quota_budget.has_reservation(job.claim_token):
+                try:
+                    uncertain = bool(queue.get_commit_intent(job))
+                except (QueueError, sqlite3.Error):
+                    uncertain = True
+                quota_budget.finish(job.claim_token, uncertain=uncertain)
+            if quota_budget is not None:
+                quota_budget.close_claim(job.claim_token)
+            if emit is not None:
+                emit("file_finished", {"job_id": job.id})
 
 
 def _process_job(queue: Queue, api: CloudAPI, job: Job, *, progress=None,

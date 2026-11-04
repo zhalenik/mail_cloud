@@ -172,6 +172,130 @@ class ScheduledServiceTests(unittest.TestCase):
         self.assertEqual(self.cloud.upload_calls, [])
         self.assertEqual(self.service.schedules()["schedules"][0]["last_run"]["status"], "error")
 
+    def test_overlapping_alarms_serialize_and_ui_reads_during_cloud_listing(self):
+        self.put(self.first, "первое-расписание.jpg")
+        self.put(self.second, "второе-расписание.jpg")
+        first = self.alarm(["Семья"])
+        second = self.alarm(["Поездки"])
+        self.assertEqual(first["next_run"], second["next_run"])
+        listing_started = threading.Event()
+        release_listing = threading.Event()
+        original_list = self.cloud.list_folder
+        activity = {"active": 0, "maximum": 0}
+
+        def blocked_listing(path="/", **kwargs):
+            activity["active"] += 1
+            activity["maximum"] = max(activity["maximum"], activity["active"])
+            listing_started.set()
+            try:
+                while not release_listing.wait(0.01):
+                    self.cloud._check_stopped()
+                return original_list(path, **kwargs)
+            finally:
+                activity["active"] -= 1
+
+        with patch.object(self.cloud, "list_folder", side_effect=blocked_listing):
+            self.now = first["next_run"]
+            self.assertTrue(self.service.scheduler.tick())
+            try:
+                self.assertTrue(listing_started.wait(2), "The scheduled cloud listing did not start")
+                reads, errors = [], []
+                read_finished = threading.Event()
+
+                def read_panel():
+                    try:
+                        reads.append((self.service.snapshot(), self.service.jobs(sort_by="name", limit=25)))
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        read_finished.set()
+
+                reader = threading.Thread(target=read_panel, daemon=True)
+                reader.start()
+                self.assertTrue(read_finished.wait(2), "An in-flight cloud page blocked the dashboard or queue")
+                reader.join(1)
+                self.assertEqual(errors, [])
+                self.assertEqual(reads[0][0]["activity"]["phase"], "reconciling")
+                self.assertEqual(reads[0][1]["total"], 1)
+                self.assertEqual(self.cloud.upload_calls, [])
+                for _ in range(3):
+                    self.assertFalse(self.service.scheduler.tick())
+                self.assertEqual(self.service.scheduler.summary()["queued"], 1)
+                self.assertEqual(activity["maximum"], 1)
+            finally:
+                release_listing.set()
+            first_done = self.done()
+            self.assertEqual(first_done["stats"]["uploaded"], 1)
+            self.assertFalse(first_done["last_scan"]["warning_allowed"])
+            self.assertTrue(self.service.scheduler.tick())
+            second_done = self.done()
+        self.assertEqual(activity["maximum"], 1)
+        self.assertEqual(second_done["stats"]["uploaded"], 2)
+        self.assertEqual(len(self.cloud.commits), 2)
+        self.assertEqual(len({item["path"] for item in self.cloud.commits}), 2)
+        self.assertTrue(all(item["last_run"]["status"] == "complete" for item in self.service.schedules()["schedules"]))
+
+    def test_next_schedule_rechecks_deleted_cloud_file_and_suppresses_quota_warning(self):
+        self.put(self.first, "вернуть.jpg")
+        self.put(self.first, "уже-в-квоте.m4v")
+        self.service.settings(regular_policy="upload")
+        selected = self.alarm(["Семья"])
+        self.now = selected["next_run"]
+        self.assertTrue(self.service.scheduler.tick())
+        initial = self.done()
+        self.assertEqual(initial["stats"]["uploaded"], 2)
+        old_ids = {row["id"] for row in self.service.jobs()["jobs"]}
+        remote_photo = self.cloud.commits[0]["path"]
+        remote_regular = self.cloud.regular_commits[0]["path"]
+        with self.cloud._fake_lock:
+            del self.cloud.remote[remote_photo]
+            self.cloud.remote[remote_regular]["is_unlim_upload"] = False
+        self.put(self.first, "новый-в-квоте.m4v")
+        self.cloud.started.clear()
+        self.cloud.block = True
+        self.now = self.service.schedules()["schedules"][0]["next_run"]
+        self.assertTrue(self.service.scheduler.tick())
+        try:
+            self.assertTrue(self.cloud.started.wait(2), self.service.snapshot()["activity"])
+            current = self.service.snapshot()
+            self.assertEqual(current["last_scan"]["trigger"], "scheduled")
+            self.assertTrue(current["last_scan"]["complete"])
+            self.assertFalse(current["last_scan"]["warning_allowed"])
+            self.assertEqual(current["storage_plan"]["regular"]["count"], 1)
+            self.assertEqual(current["stats"]["existing_regular_count"], 1)
+            rows = self.service.jobs()["jobs"]
+            self.assertFalse(old_ids.intersection(row["id"] for row in rows))
+            photo = next(row for row in rows if row["relative_path"] == "вернуть.jpg")
+            self.assertFalse(photo["cloud_present"], "Old upload history cannot prove the deleted object still exists")
+            self.assertIn(photo["status"], {"pending", "running"})
+        finally:
+            self.cloud.block = False
+        completed = self.done()
+        self.assertEqual(completed["stats"]["uploaded"], 2)
+        self.assertEqual(completed["stats"]["existing"], 1)
+        self.assertEqual([item["path"] for item in self.cloud.commits], [remote_photo, remote_photo])
+        self.assertEqual(len(self.cloud.regular_commits), 2, "An existing quota file must not be uploaded again")
+        self.assertFalse(completed["last_scan"]["warning_allowed"])
+
+    def test_manual_scan_after_paused_schedule_keeps_manual_quota_warning(self):
+        self.put(self.first, "пауза.jpg")
+        self.put(self.first, "обычная-квота.m4v")
+        selected = self.alarm(["Семья"])
+        self.cloud.block = True
+        self.now = selected["next_run"]
+        self.assertTrue(self.service.scheduler.tick())
+        self.assertTrue(self.cloud.started.wait(2))
+        self.service.pause()
+        self.done()
+        self.cloud.block = False
+        self.service.scan()
+        manual = self.done()
+        self.assertTrue(manual["last_scan"]["complete"])
+        self.assertEqual(manual["last_scan"]["trigger"], "manual")
+        self.assertTrue(manual["last_scan"]["warning_allowed"])
+        self.assertEqual(manual["storage_plan"]["regular"]["count"], 1)
+        self.assertEqual(self.cloud.commits, [])
+
     def test_close_at_completed_schedule_boundary_never_resumes_unselected_sources(self):
         self.put(self.first, "выбранный.jpg")
         self.put(self.second, "чужой.jpg")

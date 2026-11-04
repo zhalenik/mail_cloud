@@ -78,6 +78,7 @@ class WebService:
         self._auto_deletion = False
         self._thread: threading.Thread | None = None
         self._operation: str | None = None
+        self._launch_origin = "manual"
         self._stop = event_factory()
         self._pause_requested = False
         self._shutting_down = False
@@ -87,7 +88,7 @@ class WebService:
         self._quota_cache: dict | None = None
         self._quota_error: str | None = None
         self._uploaded_in_run = 0
-        self._settings = {"workers": 2, "auto_resume": True, "remote_reconcile": False,
+        self._settings = {"workers": 2, "auto_resume": True, "remote_reconcile": True,
                           "regular_policy": "skip", "unexpected_unlimited_action": "trash",
                           "timezone": checked_timezone(os.environ.get("MAILRU_TIMEZONE", "Europe/Moscow"))}
         stored = self._read_json("web_settings.json", {})
@@ -111,6 +112,12 @@ class WebService:
                                and not self._logout_requested and not self._auth_required)
         selected = previous.get("job_id") if isinstance(previous, dict) else None
         self._resume_job_id = selected if type(selected) is int and selected > 0 else None
+        selection = previous.get("selection") if isinstance(previous, dict) else None
+        self._resume_selection = selection if (isinstance(selection, dict)
+            and type(selection.get("root_id")) is int and selection["root_id"] > 0
+            and isinstance(selection.get("local_path"), str)
+            and all(type(selection.get(key)) is int for key in ("size", "mtime_ns", "device"))
+            and isinstance(selection.get("inode"), (str, int))) else None
         scope = previous.get("root_ids") if isinstance(previous, dict) else None
         self._resume_root_ids = sorted(set(scope)) if isinstance(scope, list) and scope and all(type(i) is int and i > 0 for i in scope) else None
         occurrence = previous.get("occurrence_id") if isinstance(previous, dict) else None
@@ -264,6 +271,7 @@ class WebService:
     def _persist_activity(self) -> None:
         write_json(self.state_dir / "web_activity.json", {
             "version": 1, "resume_upload": self._resume_upload, "job_id": self._resume_job_id,
+            "selection": self._resume_selection,
             "root_ids": self._resume_root_ids, "occurrence_id": self._resume_occurrence_id,
             "logout_requested": self._logout_requested,
             "auth_required": self._auth_required,
@@ -537,7 +545,7 @@ class WebService:
 
     def control_task(self, task_id: int, action: str) -> dict:
         task_id = self._source_id(task_id)
-        if action not in {"pause", "start", "resume", "remove"}:
+        if action not in {"pause", "start", "resume", "remove", "skip", "return"}:
             raise ValueError("Неизвестное действие с задачей.")
         if action == "resume":
             action = "start"
@@ -560,7 +568,7 @@ class WebService:
                         raise QueueBusyError("Завершите текущий выборочный запуск перед запуском задачи из другого источника.")
                     if action == "pause" and row["status"] != "running":
                         raise ValueError("Остановить можно только выполняющуюся задачу.")
-                    if action == "start" and row.get("planned_mode") == "regular" and self._settings["regular_policy"] == "skip":
+                    if action in {"start", "return"} and row.get("planned_mode") == "regular" and self._settings["regular_policy"] == "skip":
                         raise ValueError("Для этой задачи требуется квота. Сначала разрешите обычную загрузку в настройках.")
                     queue.request_control(task_id, action)
                 current = self._task_signals.get(task_id)
@@ -570,13 +578,15 @@ class WebService:
             if action == "start":
                 if self._operation is None:
                     self._resume_job_id = task_id
+                    self._resume_selection = {key: row[key] for key in ("root_id", "local_path", "size", "mtime_ns", "device", "inode")}
                     self._resume_root_ids = None
                     self._resume_occurrence_id = None
                     return self._launch("upload", lambda: self._pipeline(job_id=task_id), upload_intent=True)
                 if task_id not in self._priority_jobs:
                     self._priority_jobs.append(task_id)
             messages = {"pause": "Запрошена остановка задачи", "start": "Запрошен запуск задачи",
-                        "remove": "Задача убрана из очереди; исходный файл сохранён"}
+                        "remove": "Задача убрана из очереди; исходный файл сохранён",
+                        "skip": "Задача пропущена", "return": "Задача возвращена в очередь"}
             self._event(f"{messages[action]}: {task_id}.")
         return {"ok": True, "task_id": task_id, "action": action}
 
@@ -604,7 +614,7 @@ class WebService:
             raise ValueError("Неизвестный набор задач для удаления.")
         if status in ("", "all"):
             status = None
-        if status is not None and status not in (*STATES, "paused", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
+        if status is not None and status not in (*STATES, "paused", "existing", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
             raise ValueError("Неизвестный фильтр задач.")
         return {"scope": scope, "status": status if scope == "filter" else None}
 
@@ -793,21 +803,23 @@ class WebService:
                     api.close_thread()
                 self._invalidate_stats()
 
-    def jobs(self, status: str | None = None, limit: int = 50, offset: int = 0, sort: str = "asc") -> dict:
+    def jobs(self, status: str | None = None, limit: int = 50, offset: int = 0, sort: str = "asc",
+             sort_by: str = "created_at") -> dict:
         if status in ("", "all"):
             status = None
-        if status is not None and status not in (*STATES, "paused", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
+        if status is not None and status not in (*STATES, "paused", "existing", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
             raise ValueError("Неизвестный фильтр задач.")
-        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0 or sort not in {"asc", "desc"}:
+        if (type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0
+                or sort not in {"asc", "desc"} or sort_by not in {"name", "progress", "status", "size", "created_at", "completed_at"}):
             raise ValueError("Некорректная страница списка задач.")
         if self._configuration is None:
-            return {"jobs": [], "total": 0, "total_bytes": 0, "offset": offset, "limit": limit, "sort": sort}
-        key = (status, limit, offset, sort)
+            return {"jobs": [], "total": 0, "total_bytes": 0, "offset": offset, "limit": limit, "sort": sort, "sort_by": sort_by}
+        key = (status, limit, offset, sort, sort_by)
         with self._stats_lock:
             cached = self._jobs_cache.get(key)
             if cached is None or (self._operation is not None and time.monotonic() - cached[0] >= 5):
                 with self._queue() as queue:
-                    rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True, sort=sort)
+                    rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True, sort=sort, sort_by=sort_by)
                     totals = queue.jobs_summary(status)
                 self._jobs_cache[key] = (time.monotonic(), rows, totals)
                 self._jobs_cache.move_to_end(key)
@@ -819,7 +831,8 @@ class WebService:
         fields = {"id", "root_id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
                   "last_error", "skip_reason", "next_attempt", "uploaded_at", "storage_mode", "created_at",
                   "paused", "remove_requested", "planned_mode", "planned_reason", "observed_mode",
-                  "cloud_present", "cloud_verified", "cloud_path", "cloud_size", "cloud_observed_at", "cloud_deleted_at"}
+                  "cloud_present", "cloud_verified", "cloud_path", "cloud_size", "cloud_observed_at", "cloud_deleted_at",
+                  "completed_at", "progress_bytes", "progress_percent", "cloud_path_matches", "status_label"}
         items = []
         for row in rows:
             item = {k: v for k, v in row.items() if k in fields}
@@ -832,6 +845,11 @@ class WebService:
                                  if row.get("cloud_present") and row.get("cloud_path") else None)
             item["progress"] = None
             current = active.get(row["id"])
+            if row.get("progress_bytes", 0) and row["status"] != "uploaded":
+                total = max(0, row["size"])
+                sent = min(total, max(0, row["progress_bytes"]))
+                item["progress"] = {"sent": sent, "total": total, "percent": sent / total * 100 if total else 0,
+                                    "stage": "paused" if row.get("paused") else "saved"}
             if row["status"] == "running" and current:
                 total = max(0, row["size"])
                 sent = min(total, max(0, current.get("sent", 0)))
@@ -840,7 +858,11 @@ class WebService:
                                     "stage": current.get("stage", "preparing")}
             items.append(item)
         return {"jobs": items, "total": totals["total"], "total_bytes": totals["total_bytes"],
-                "offset": offset, "limit": limit, "sort": sort}
+                "offset": offset, "limit": limit, "sort": sort, "sort_by": sort_by}
+
+    def export_jobs(self, options, *, head=False):
+        from .export import QueueExportResponse
+        return QueueExportResponse(self._queue(), options, head=head)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -872,11 +894,14 @@ class WebService:
         stats = result["stats"]
         result["storage_plan"] = {key: {"count": stats.get(prefix + "_count", 0), "bytes": stats.get(prefix + "_bytes", 0)}
             for key, prefix in (("unlimited", "planned_unlimited"), ("regular", "planned_regular"),
-                                ("uploaded", "uploaded_total"), ("uploaded_unlimited", "uploaded_unlimited"),
-                                ("uploaded_regular", "uploaded_regular"), ("uploaded_unknown", "uploaded_unknown"))}
+                                ("uploaded", "transferred_total"), ("uploaded_unlimited", "transferred_unlimited"),
+                                ("uploaded_regular", "transferred_regular"), ("uploaded_unknown", "transferred_unknown"),
+                                ("existing", "existing_total"), ("existing_unlimited", "existing_unlimited"),
+                                ("existing_regular", "existing_regular"), ("existing_unknown", "existing_unknown"))}
         return result
 
-    def _launch(self, name: str, function: Callable[[], tuple[str, str]], *, upload_intent: bool = False) -> dict:
+    def _launch(self, name: str, function: Callable[[], tuple[str, str]], *, upload_intent: bool = False,
+                origin: str = "manual") -> dict:
         with self._lock:
             self._ensure_idle()
             if name in {"upload", "scanning"}:
@@ -885,6 +910,7 @@ class WebService:
             self._pause_requested = False
             self._shutting_down = False
             self._operation = name
+            self._launch_origin = origin
             self._files.clear()
             self._task_signals.clear()
             self._priority_jobs.clear()
@@ -932,6 +958,7 @@ class WebService:
                         raise Cancelled("Остановка процесса; сохранено намерение продолжить очередь.")
                 self._resume_upload = False
                 self._resume_job_id = None
+                self._resume_selection = None
             self._phase(phase, message)
         except Cancelled:
             with self._lock:
@@ -1081,8 +1108,9 @@ class WebService:
             self._ensure_configuration()
             return self._launch("login", perform)
 
-    def _scan_queue(self, queue: Queue, root_ids=None) -> None:
-        self._phase("scanning", "Сканируем папки с фото и видео…")
+    def _scan_queue(self, queue: Queue, root_ids=None, *, trigger=None) -> None:
+        trigger = trigger or ("scheduled" if self._resume_occurrence_id else self._launch_origin)
+        self._phase("scanning", "Заново сканируем выбранные папки…")
         def on_progress(result):
             with self._lock:
                 self._activity["scan"] = dataclasses.asdict(result)
@@ -1093,18 +1121,34 @@ class WebService:
                 if root_ids is None or source.id in root_ids:
                     self._allowed_path(source.path)
             extensions = queue.discovery_extensions()
-            queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started", "root_ids": root_ids})
+            queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started", "root_ids": root_ids,
+                                              "trigger": trigger, "warning_allowed": False})
+            queue.reset_for_scan(root_ids=root_ids)
             result = queue.scan(extensions, stop=self._stop, progress=on_progress, root_ids=root_ids)
-            queue.set_metadata("last_scan", {**dataclasses.asdict(result), "root_ids": root_ids,
-                                             "occurrence_id": self._resume_occurrence_id})
+            saved = {**dataclasses.asdict(result), "root_ids": root_ids, "local_complete": result.complete,
+                     "complete": False, "occurrence_id": self._resume_occurrence_id if trigger == "scheduled" else None,
+                     "trigger": trigger, "warning_allowed": False, "cloud_checked": False}
+            queue.set_metadata("last_scan", saved)
             queue.set_metadata("extensions", sorted(extensions))
-            queue.apply_regular_policy(upload=self._settings["regular_policy"] == "upload", root_ids=root_ids)
         self._check_stop()
         if not result.complete:
             raise QueueError(f"Сканирование завершилось с ошибками: {result.error_count}. Проверьте доступ к папкам.")
-        LOGGER.info("scan_complete seen=%d added=%d changed=%d",
-                    result.seen, result.added, result.changed)
-        self._reconcile_queue(queue, root_ids=root_ids)
+        LOGGER.info("scan_complete seen=%d added=%d changed=%d", result.seen, result.added, result.changed)
+        report = self._reconcile_queue(queue, root_ids=root_ids)
+        self._check_stop()
+        cloud_checked = report.get("complete") is True
+        unavailable = report.get("disabled") or report.get("login_required")
+        saved.update(complete=bool(cloud_checked or unavailable), cloud_checked=cloud_checked,
+                     cloud_pending=bool(report.get("login_required")),
+                     warning_allowed=trigger == "manual" and cloud_checked)
+        queue.set_metadata("last_scan", saved)
+        # Existing quota files must be recognized before the policy skips new
+        # ordinary uploads; otherwise they would be hidden from reconciliation.
+        queue.apply_regular_policy(upload=self._settings["regular_policy"] == "upload", root_ids=root_ids)
+        self._invalidate_stats()
+        if not saved["complete"]:
+            reason = (report.get("error_samples") or [{}])[0].get("message")
+            raise QueueError("Не удалось полностью проверить содержимое Облака. Новая очередь сохранена; повторите сканирование. " + (reason or ""))
         if self._authenticated:
             api = None
             try:
@@ -1118,60 +1162,65 @@ class WebService:
             finally:
                 if api is not None:
                     api.close_thread()
-        self._invalidate_stats()
 
-    def _reconcile_queue(self, queue: Queue, root_ids=None) -> None:
+    def _reconcile_queue(self, queue: Queue, root_ids=None) -> dict:
         if not self._settings["remote_reconcile"]:
-            return
+            return {"complete": False, "disabled": True}
         if not self._authenticated:
-            self._event("Локальное сканирование завершено. Для сверки с Облаком войдите в Mail и пересканируйте папки.", "warning")
-            return
-        self._phase("reconciling", "Сверяем найденные задачи с файлами в Облаке…")
+            self._event("Локальный список обновлён. Для проверки наличия файлов в Облаке войдите в Mail и пересканируйте папки.", "warning")
+            return {"complete": False, "login_required": True}
+        self._phase("reconciling", "Читаем текущий список файлов Облака…")
         api = None
         def progress(report):
             with self._lock:
                 self._activity["reconcile"] = {key: report.get(key) for key in
-                    ("checked", "matched", "errors", "cancelled", "auth_required")}
-                self._activity["message"] = (f"Проверено задач: {report.get('checked', 0):,}. "
-                                              f"Уже в Облаке: {report.get('matched', 0):,}.")
+                    ("checked", "matched", "matched_elsewhere", "errors", "cancelled", "auth_required",
+                     "stage", "cloud_files", "cloud_folders", "cloud_pages")}
+                if report.get("stage") == "listing":
+                    self._activity["message"] = f"Получено файлов Облака: {report.get('cloud_files', 0):,}."
+                else:
+                    self._activity["message"] = (f"Проверено задач: {report.get('checked', 0):,}. "
+                                                  f"Уже в Облаке: {report.get('matched', 0):,}.")
         try:
             with queue.exclusive_run():
                 api = self._new_api()
                 account = api.require_account(queue.account_id)
                 queue.bind_account(account.email)
-                # Optional by construction: disabled installations do not even
-                # import the reconciliation implementation.
                 from .reconcile import reconcile
                 report = reconcile(queue, api, stop=self._stop, progress=progress, root_ids=root_ids)
                 queue.set_metadata("last_reconcile", {"at": time.time(), **report})
                 progress(report)
                 if report.get("auth_required"):
                     self._invalidate_auth()
-                if report.get("errors"):
-                    self._event("Сверка с Облаком завершена с замечаниями. Локальная очередь сохранена.", "warning")
+                if report.get("cancelled"):
+                    raise Cancelled("Сверка приостановлена.")
+                if report.get("complete"):
+                    self._event(f"Сверка завершена. Уже в Облаке: {report.get('matched', 0):,}; "
+                                f"по другому пути: {report.get('matched_elsewhere', 0):,}.")
                 else:
-                    self._event(f"Сверка завершена. Уже в Облаке: {report.get('matched', 0):,}.")
-        except Cancelled:
-            raise
-        except (QueueError, sqlite3.Error):
+                    self._event("Полная сверка с Облаком не завершена. Старые результаты не используются.", "warning")
+                return report
+        except (Cancelled, QueueError, sqlite3.Error):
             raise
         except Exception as error:
             if is_auth_failure(error):
                 self._invalidate_auth()
-            self._event(f"Дополнительная сверка не завершена ({type(error).__name__}). Локальное сканирование сохранено.", "warning")
-            queue.set_metadata("last_reconcile", {"at": time.time(), "errors": 1, "aborted": type(error).__name__})
+            safe = str(error) if isinstance(error, (AuthError, ProtocolError, TransportError)) else type(error).__name__
+            report = {"complete": False, "errors": 1, "aborted": type(error).__name__,
+                      "error_samples": [{"message": safe}]}
+            queue.set_metadata("last_reconcile", {"at": time.time(), **report})
+            return report
         finally:
             if api is not None:
                 api.close_thread()
             self._invalidate_stats()
-        self._check_stop()
 
     def scan(self) -> dict:
         if self._configuration is None:
             raise ValueError("Добавьте хотя бы одну исходную папку с фото и видео.")
         def perform():
             with self._queue() as queue:
-                self._scan_queue(queue)
+                self._scan_queue(queue, trigger="manual")
                 total = queue.stats()["total"]
             return "idle", f"Сканирование завершено. Задач в очереди: {total:,}."
         return self._launch("scanning", perform)
@@ -1184,13 +1233,13 @@ class WebService:
                     self._stats_cache = (time.monotonic(), copy.deepcopy(data))
             elif event == "file_started":
                 self._files[data["job_id"]] = {"id": data["job_id"], "path": data["path"], "size": data["size"],
-                                               "sent": 0, "stage": "preparing", "storage_mode": data.get("storage_mode")}
+                                               "sent": data.get("sent", 0), "stage": "preparing", "storage_mode": data.get("storage_mode")}
             elif event == "regular_files_skipped":
                 self._event(f"Пропущено задач, требующих квоты: {data['count']:,}. Изменить правило можно в настройках.")
             elif event == "upload_progress":
                 item = self._files.get(data["job_id"])
                 if item:
-                    item["sent"] = min(item["size"], item["sent"] + max(0, data["bytes"]))
+                    item["sent"] = min(item["size"], max(item["sent"], data.get("sent", item["sent"] + max(0, data.get("bytes", 0)))))
                     item["stage"] = "uploading"
             elif event == "file_finished":
                 self._files.pop(data["job_id"], None)
@@ -1226,13 +1275,35 @@ class WebService:
             queue.recover_running()
             if not queue.roots():
                 raise ValueError("Добавьте хотя бы одну папку с фото и видео.")
+            selection = None
+            if job_id is not None:
+                row = queue.get_job(job_id, include_missing=True)
+                selection = self._resume_selection or ({key: row[key] for key in
+                    ("root_id", "local_path", "size", "mtime_ns", "device", "inode")} if row else None)
+                if selection is None:
+                    raise ValueError("Выбранная задача больше не существует. Обновите список.")
+                if root_ids is None:
+                    root_ids = [selection["root_id"]]
+                with self._lock:
+                    self._resume_selection = selection
+                    self._resume_root_ids = root_ids
+                    self._persist_activity()
             last_scan = queue.get_metadata("last_scan", {})
             scan_scope = last_scan.get("root_ids") if isinstance(last_scan, dict) else None
             scope_covered = scan_scope is None or (root_ids is not None and set(root_ids).issubset(set(scan_scope)))
             scheduled_scan_missing = (self._resume_occurrence_id is not None and
                                       (not isinstance(last_scan, dict) or last_scan.get("occurrence_id") != self._resume_occurrence_id))
-            if scan_first or scheduled_scan_missing or not isinstance(last_scan, dict) or last_scan.get("complete") is not True or not scope_covered:
+            if (scan_first or scheduled_scan_missing or not isinstance(last_scan, dict) or last_scan.get("complete") is not True
+                    or not scope_covered or (self._settings["remote_reconcile"] and last_scan.get("cloud_pending"))):
                 self._scan_queue(queue, root_ids=root_ids)
+            if selection is not None:
+                current = queue.find_current_job(selection["root_id"], selection["local_path"])
+                if current is None or any(str(current[key]) != str(selection[key]) for key in ("size", "mtime_ns", "device", "inode")):
+                    raise ValueError("Выбранный исходник исчез или изменился. Выберите актуальную задачу после сканирования.")
+                job_id = current["id"]
+                with self._lock:
+                    self._resume_job_id = job_id
+                    self._persist_activity()
             self._check_stop()
             if not self._authenticated:
                 raise AuthError("Для продолжения требуется вход в Mail.ru.", code="auth_rejected")
@@ -1278,7 +1349,7 @@ class WebService:
                     self._task_starts_closed = True
                 api.close_thread()
 
-    def start(self, *, job_id: int | None = None, root_ids=None, occurrence_id=None) -> dict:
+    def start(self, *, job_id: int | None = None, root_ids=None, occurrence_id=None, origin="manual") -> dict:
         if self._deletion_pending:
             with DeletionJournal(self.state_dir / "deletions.sqlite3") as journal:
                 operation = journal.operation()
@@ -1311,10 +1382,12 @@ class WebService:
             raise ValueError("Сначала войдите в аккаунт Mail.")
         with self._lock:
             self._ensure_idle()
+            if job_id is None or job_id != self._resume_job_id:
+                self._resume_selection = None
             self._resume_job_id = job_id
             self._resume_root_ids = root_ids
             self._resume_occurrence_id = None
-            return self._launch("upload", lambda: self._pipeline(job_id=job_id, root_ids=root_ids), upload_intent=True)
+            return self._launch("upload", lambda: self._pipeline(job_id=job_id, root_ids=root_ids), upload_intent=True, origin=origin)
 
     def pause(self) -> dict:
         with self._lock:
@@ -1363,7 +1436,8 @@ class WebService:
             return True
         if requested:
             try:
-                self.start(job_id=self._resume_job_id, root_ids=self._resume_root_ids, occurrence_id=self._resume_occurrence_id)
+                self.start(job_id=self._resume_job_id, root_ids=self._resume_root_ids,
+                           occurrence_id=self._resume_occurrence_id, origin="automatic")
             except (ValueError, QueueError) as error:
                 with self._lock:
                     self._resume_upload = False
@@ -1405,11 +1479,12 @@ class WebService:
                 return False
             item = self.scheduler.begin(occurrence["id"])
             self._resume_job_id = None
+            self._resume_selection = None
             self._resume_root_ids = list(item["source_ids"])
             self._resume_occurrence_id = item["id"]
             try:
                 self._event("Запущен планировщик: " + item["name"] + ".")
-                self._launch("upload", lambda: self._scheduled_pipeline(item, scan_first=scan_first), upload_intent=True)
+                self._launch("upload", lambda: self._scheduled_pipeline(item, scan_first=scan_first), upload_intent=True, origin="scheduled")
             except Exception:
                 # begin() is durable before any work. A launch failure must be
                 # resumable now, without needing a process restart to recover it.

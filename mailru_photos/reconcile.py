@@ -1,80 +1,55 @@
-"""Optional exact-path cloud comparison, without uploads or deletions.
+"""Fresh cloud-tree reconciliation by content, independent of destination path.
 
-The controller calls this only after a complete scan and after authenticating
-and binding the same account used by ``api``. It is disabled unless explicitly
-requested in settings. A matching hash is an observation of existing content;
-it is never evidence that this client uploaded it or that storage is unlimited.
+A scan-local SQLite inventory avoids one network request per source. It is not
+an atomic server snapshot: another client can change a file after it was listed.
+No previous inventory or upload history is accepted as proof of current presence.
 """
-
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-import re
+from collections.abc import Callable
+import json
+from pathlib import Path
 import threading
 import time
 from typing import Any
 
-from .api import FileIdentity, ProtocolError, RemoteError, SourceChanged, cloud_hash, is_auth_failure
+from .api import ProtocolError, RemoteError, SourceChanged, is_auth_failure
 from .auth import AuthError
+from .inventory import CloudInventory
 from .queue import Queue, QueueConfigurationError
 from .transport import Cancelled, SourceReadError, TransportError
 
 
-_BATCH_SIZE = 500
-_MAX_ERROR_SAMPLES = 100
-_MAX_CONSECUTIVE_INVALID_RESPONSES = 3
-
-
-class _InvalidObservation(ValueError):
-    """One returned object cannot establish an exact-path content match."""
-
-
-def _observation(value: Mapping[str, Any], path: str) -> tuple[int, str]:
-    if not isinstance(value, Mapping):
-        raise _InvalidObservation("Сервер вернул некорректные сведения о файле.")
-    size = value.get("size")
-    digest = value.get("hash")
-    if type(size) is not int or size <= 0:
-        raise _InvalidObservation("Сервер не вернул положительный размер файла.")
-    if not isinstance(digest, str) or not re.fullmatch(r"[0-9A-Fa-f]{40}", digest):
-        raise _InvalidObservation("Сервер не вернул корректный хеш файла.")
-    if "path" in value and value["path"] != path:
-        raise _InvalidObservation("Ответ сервера относится к другому облачному пути.")
-    return size, digest.upper()
-
-
 def reconcile(queue: Queue, api: Any, *, stop: threading.Event,
-              progress: Callable[[dict[str, Any]], None] | None = None, root_ids=None) -> dict[str, Any]:
-    """Compare eligible tasks in bounded pages and mark exact existing matches.
-
-    Only ``api.stat(path)`` performs network operations. File reads are streamed
-    by the existing Mail Cloud hash implementation. Each candidate and final
-    state transition rechecks eligibility so a concurrent pause/remove wins.
-    Global network/protocol/auth failures end this optional pass early; local
-    file problems are reported individually. Queue/database failures propagate.
-    """
-    summary: dict[str, Any] = {
-        "checked": 0, "matched": 0, "errors": 0, "error_samples": [],
-        "cancelled": False, "auth_required": False, "aborted": None,
-    }
+              progress: Callable[[dict[str, Any]], None] | None = None, root_ids=None,
+              inventory_path=None) -> dict[str, Any]:
+    summary = {"checked": 0, "matched": 0, "matched_elsewhere": 0, "errors": 0,
+               "error_samples": [], "cancelled": False, "auth_required": False,
+               "aborted": None, "complete": False, "inventory_complete": False,
+               "cloud_files": 0, "cloud_folders": 0, "cloud_pages": 0,
+               "stage": "listing"}
     last_progress = 0.0
 
-    def snapshot() -> dict[str, Any]:
-        return {**summary, "error_samples": [dict(item) for item in summary["error_samples"]]}
+    def snapshot():
+        return {**summary, "error_samples": [dict(value) for value in summary["error_samples"]]}
 
-    def report(*, force: bool = False) -> None:
+    def report(*, force=False):
         nonlocal last_progress
         if progress is not None and (force or time.monotonic() - last_progress >= 0.25):
             last_progress = time.monotonic()
             progress(snapshot())
 
-    def failed(candidate: Mapping[str, Any], error: Exception, message: str | None = None) -> None:
+    def listing_progress(data):
+        summary.update(data)
+        report()
+
+    def failed(error, candidate=None, message=None):
         summary["errors"] += 1
-        if len(summary["error_samples"]) < _MAX_ERROR_SAMPLES:
+        if len(summary["error_samples"]) < 100:
             summary["error_samples"].append({
-                "job_id": candidate["id"], "path": candidate["remote_path"],
-                "kind": type(error).__name__, "message": (message or str(error))[:500],
-            })
+                "job_id": candidate["id"] if candidate else None,
+                "path": candidate["remote_path"] if candidate else None,
+                "kind": type(error).__name__, "message": (message or str(error))[:500]})
 
     if stop.is_set():
         summary["cancelled"] = True
@@ -83,92 +58,69 @@ def reconcile(queue: Queue, api: Any, *, stop: threading.Event,
     with queue.exclusive_run():
         if not queue.account_id:
             raise QueueConfigurationError("Bind the authenticated account before comparing cloud files.")
+        # Reject a conflicting live upload before making a potentially long
+        # remote traversal. Matching still reads fresh keyset pages afterwards.
+        queue.reconcile_candidates(after_id=0, limit=1, root_ids=root_ids)
         report(force=True)
-        after_id = 0
-        invalid_responses = 0
-        finish = False
-        while not finish:
+        try:
+            with CloudInventory(inventory_path or Path(queue.path).with_name("cloud-index.sqlite3")) as inventory:
+                summary.update(inventory.refresh(api, stop=stop, progress=listing_progress))
+                summary.update(inventory_complete=True, stage="matching")
+                report(force=True)
+                after_id = 0
+                while True:
+                    if stop.is_set():
+                        raise Cancelled("Сверка остановлена.")
+                    candidates = queue.reconcile_candidates(after_id=after_id, limit=500, root_ids=root_ids)
+                    if not candidates:
+                        break
+                    for candidate in candidates:
+                        after_id = candidate["id"]
+                        if stop.is_set():
+                            raise Cancelled("Сверка остановлена.")
+                        summary["checked"] += 1
+                        try:
+                            # A size absent from this complete inventory cannot
+                            # have a matching hash; avoid reading its local bytes.
+                            if not inventory.has_size(candidate["size"]):
+                                continue
+                            digest, ctime_ns = inventory.local_hash(candidate, stop=stop)
+                            found = inventory.find(digest, candidate["size"], candidate["remote_path"])
+                            if found is None:
+                                continue
+                            if stop.is_set():
+                                raise Cancelled("Сверка остановлена.")
+                            adopted = queue.mark_remote_existing(
+                                {**candidate, "ctime_ns": ctime_ns}, remote_hash=digest,
+                                remote_path=found["path"], storage_mode=found["storage_mode"],
+                                remote_id=found["nodeid"], evidence=json.loads(found["evidence"]))
+                            if adopted:
+                                summary["matched"] += 1
+                                summary["matched_elsewhere"] += int(
+                                    found["path"].casefold() != candidate["remote_path"].casefold())
+                        except (SourceChanged, SourceReadError, OSError) as error:
+                            message = "Исходный файл изменился или недоступен для чтения. Пересканируйте папку после устранения причины."
+                            failed(error, candidate, message)
+                            queue.record_task_error(candidate["id"], message)
+                        finally:
+                            report()
+                summary.update(complete=True, stage="complete")
+        except Cancelled:
+            summary["cancelled"] = True
+        except AuthError as error:
+            failed(error, message="Для сверки требуется повторный вход в Mail.ru.")
+            summary.update(auth_required=is_auth_failure(error), aborted="auth")
+        except RemoteError as error:
+            failed(error)
+            summary.update(auth_required=is_auth_failure(error), aborted="auth" if is_auth_failure(error) else "remote")
+        except TransportError as error:
             if stop.is_set():
                 summary["cancelled"] = True
-                break
-            candidates = queue.reconcile_candidates(after_id=after_id, limit=_BATCH_SIZE, root_ids=root_ids)
-            if not candidates:
-                break
-            for candidate in candidates:
-                after_id = candidate["id"]
-                if stop.is_set():
-                    summary["cancelled"] = True
-                    finish = True
-                    break
-                summary["checked"] += 1
-                try:
-                    remote = api.stat(candidate["remote_path"])
-                    if stop.is_set():
-                        raise Cancelled("Сверка остановлена.")
-                    if remote is None:
-                        invalid_responses = 0
-                        continue
-                    size, digest = _observation(remote, candidate["remote_path"])
-                    if size != candidate["size"]:
-                        invalid_responses = 0
-                        continue
-                    expected = FileIdentity(candidate["size"], candidate["mtime_ns"], candidate["device"],
-                                            int(candidate["inode"]))
-                    local_hash, identity = cloud_hash(candidate["local_path"], expected=expected, stop=stop)
-                    if stop.is_set():
-                        raise Cancelled("Сверка остановлена.")
-                    if identity != expected:
-                        raise SourceChanged("Исходный файл изменился во время сверки.")
-                    if local_hash.upper() != digest:
-                        invalid_responses = 0
-                        continue
-                    # Hashing a large source can take time. Recheck the exact
-                    # remote object before persisting a terminal observation.
-                    remote = api.stat(candidate["remote_path"])
-                    if stop.is_set():
-                        raise Cancelled("Сверка остановлена.")
-                    if remote is None or _observation(remote, candidate["remote_path"]) != (size, digest):
-                        invalid_responses = 0
-                        continue
-                    if queue.mark_remote_existing(candidate, remote_hash=digest):
-                        summary["matched"] += 1
-                    invalid_responses = 0
-                except Cancelled:
-                    summary["cancelled"] = True
-                    finish = True
-                except (SourceChanged, SourceReadError, OSError) as error:
-                    failed(candidate, error, "Исходный файл изменился или недоступен для чтения.")
-                    invalid_responses = 0
-                except _InvalidObservation as error:
-                    failed(candidate, error)
-                    invalid_responses += 1
-                    if invalid_responses >= _MAX_CONSECUTIVE_INVALID_RESPONSES:
-                        summary["aborted"] = "invalid_responses"
-                        finish = True
-                except AuthError as error:
-                    failed(candidate, error, "Для сверки требуется повторная авторизация Mail.ru.")
-                    summary["auth_required"] = is_auth_failure(error)
-                    summary["aborted"] = "auth"
-                    finish = True
-                except RemoteError as error:
-                    failed(candidate, error)
-                    summary["auth_required"] = is_auth_failure(error)
-                    summary["aborted"] = "auth" if summary["auth_required"] else "remote"
-                    finish = True
-                except TransportError as error:
-                    if stop.is_set():
-                        summary["cancelled"] = True
-                    else:
-                        failed(candidate, error, "Сетевое соединение прервано; сверка завершена досрочно.")
-                        summary["aborted"] = "network"
-                    finish = True
-                except ProtocolError as error:
-                    failed(candidate, error)
-                    summary["aborted"] = "protocol"
-                    finish = True
-                finally:
-                    report()
-                if finish:
-                    break
+            else:
+                failed(error, message="Сеть недоступна; полный список Облака не получен.")
+                summary["aborted"] = "network"
+        except ProtocolError as error:
+            failed(error)
+            summary["aborted"] = "protocol"
         report(force=True)
-    return snapshot()
+        return snapshot()
