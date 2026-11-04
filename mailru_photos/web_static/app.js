@@ -3,13 +3,14 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const numberFormat = new Intl.NumberFormat("ru-RU");
-  const pageNames = { overview: "Обзор", queue: "Очередь задач", sources: "Исходные папки", schedules: "Планировщик", settings: "Настройки" };
-  const busyPhases = new Set(["login", "logout", "scanning", "checking", "uploading", "pausing", "reconciling", "quota", "deleting"]);
+  const pageNames = { overview: "Обзор", queue: "Очередь задач", sources: "Исходные папки", plans: "План загрузки", schedules: "Планировщик", settings: "Настройки" };
+  const busyPhases = new Set(["login", "logout", "scanning", "checking", "uploading", "pausing", "reconciling", "quota", "deleting", "planning"]);
   const phaseInfo = {
     idle: ["Готов к работе", "Ожидание", "neutral", "cloud"],
     login: ["Подключаем аккаунт", "Подключение", "blue", "lock"],
     logout: ["Выходим из Mail.ru", "Выход", "orange", "logout"],
     scanning: ["Ищем фото и видео", "Сканирование", "blue", "scan"],
+    planning: ["Подготовка плана загрузки", "Подготовка", "blue", "scan"],
     checking: ["Проверяем доступ к Облаку", "Проверка", "blue", "lock"],
     reconciling: ["Проверяем файлы в Облаке", "Проверка", "blue", "scan"],
     deleting: ["Удаляем выбранные задачи", "Удаление", "orange", "remove"],
@@ -77,9 +78,12 @@
   let removingScheduleId = null;
   let folderState = { path: null, parent: null };
   let folderRequest = 0;
+  let folderSelection = null;
+  let currentViewSourceId = null;
   let editingSourceId = null;
   let removingSourceId = null;
   let sourcesSignature = null;
+  let sourcesOffset = 0;
   let settingsDirty = false;
   let connected = true;
   let accessBusy = false;
@@ -157,6 +161,7 @@
   function closeDialogs() {
     document.querySelectorAll("dialog[open]").forEach((dialog) => dialog.close());
     $("mail-password").value = "";
+    $("smtp-password").value = "";
     clearPanelPasswords();
   }
 
@@ -270,9 +275,18 @@
 
   async function refreshState() {
     if (!session.authenticated) return;
-    const generation = sessionGeneration;
-    const value = await api("/api/state");
-    if (generation !== sessionGeneration) return;
+    const generation = sessionGeneration, sourceId = currentViewSourceId;
+    let value, resolvedSourceId = sourceId;
+    try { value = await api("/api/state" + (sourceId !== null ? "?source_id=" + encodeURIComponent(sourceId) : "")); }
+    catch (error) {
+      if (sourceId === null || ![400, 404].includes(error.status) || generation !== sessionGeneration || sourceId !== currentViewSourceId) throw error;
+      const all = await api("/api/state");
+      if (Array.isArray(all.sources) && all.sources.some((source) => source.id === sourceId)) throw error;
+      if (generation !== sessionGeneration || sourceId !== currentViewSourceId) return;
+      currentViewSourceId = null; resolvedSourceId = null; jobsOffset = 0; value = all;
+      toast("Источник больше не существует. Показаны все источники.");
+    }
+    if (generation !== sessionGeneration || resolvedSourceId !== currentViewSourceId) return;
     const previouslyAuthenticated = snapshot && snapshot.authenticated;
     snapshot = value;
     setConnectivity(true);
@@ -292,6 +306,10 @@
       if (pendingActions.has("password")) return;
       if (activePage === "queue") await loadJobs(false);
       if (activePage === "schedules") await loadSchedules(false);
+      if (activePage === "plans") await loadPlans(false);
+      if (planWizard.inventory && $("plan-wizard").open) await refreshInventory();
+      if (planWizard.building && $("plan-wizard").open) await refreshWizardPlan();
+      if (activePage === "settings" && notificationsPending) await loadNotifications();
     } catch (error) {
       if (session.authenticated && !error.staleSession) setConnectivity(false, error.message + " Данные на экране могут быть устаревшими.");
     } finally {
@@ -304,7 +322,7 @@
   function schedulePoll(soon = false) {
     clearTimeout(pollTimer);
     if (document.hidden || !session.authenticated || pendingActions.has("password")) return;
-    pollTimer = setTimeout(poll, soon || isBusy() || anyAction() ? 2000 : 30000);
+    pollTimer = setTimeout(poll, soon || isBusy() || anyAction() || planWizard.building && $("plan-wizard").open ? 2000 : 30000);
   }
 
   function phase() { return plain(snapshot && snapshot.activity && snapshot.activity.phase, "idle"); }
@@ -327,7 +345,7 @@
     ["start-upload", "queue-start-upload"].forEach((id) => {
       $(id).disabled = busy || transient || !connected || !resumeDeletion && (!snapshot.authenticated || !hasSources);
     });
-    ["scan-folders", "queue-scan-folders"].forEach((id) => { $(id).disabled = busy || transient || !hasSources || !connected; });
+    ["scan-folders", "queue-scan-folders", "sources-scan-all"].forEach((id) => { $(id).disabled = busy || transient || !hasSources || !connected; });
     const pausable = ["scanning", "checking", "uploading", "pausing", "reconciling", "deleting"].includes(current);
     ["pause-upload", "queue-pause-upload"].forEach((id) => {
       setHidden(id, !pausable);
@@ -335,16 +353,18 @@
       $(id).querySelector("span").textContent = current === "scanning" ? "Остановить сканирование" : current === "pausing" ? "Сохраняем прогресс…" : current === "deleting" ? "Приостановить удаление" : "Приостановить";
     });
     const resumed = ["paused", "error"].includes(current) || finite(snapshot.stats && snapshot.stats.uploaded) > 0;
+    const planScope = scopeUsesPlan();
     ["start-upload", "queue-start-upload"].forEach((id) => {
       setHidden(id, pausable);
-      $(id).querySelector("span").textContent = resumeDeletion ? "Продолжить удаление" : resumed ? "Продолжить загрузку" : "Начать загрузку";
+      $(id).querySelector("span").textContent = resumeDeletion ? "Продолжить удаление" : planScope ? "Открыть план загрузки" : resumed ? "Продолжить загрузку" : "Начать загрузку";
     });
     $("export-queue").disabled = !canExportQueue();
     $("export-queue").title = ["scanning", "reconciling"].includes(current) ? "Дождитесь завершения сканирования" : "Скачать задачи выбранного фильтра";
     $("export-submit").disabled = !canExportQueue();
     const sourcesDisabled = busy || transient || resumeDeletion || !connected;
-    ["add-source", "empty-add-source", "onboarding-source", "source-submit", "source-remove-submit", "browse-folders", "source-path", "source-alias", "source-remote-prefix"].forEach((id) => { $(id).disabled = sourcesDisabled; });
-    document.querySelectorAll("[data-source-action]").forEach((button) => { button.disabled = sourcesDisabled; });
+    ["add-source", "empty-add-source", "onboarding-source", "source-submit", "source-remove-submit", "source-add-path", "browse-folders", "source-path", "source-alias", "source-remote-prefix"].forEach((id) => { $(id).disabled = sourcesDisabled; });
+    document.querySelectorAll("[data-source-action]").forEach((button) => { button.disabled = button.dataset.sourceAction === "queue" ? !connected : sourcesDisabled; });
+    $("source-paths").querySelectorAll("input, button").forEach((input) => { input.disabled = sourcesDisabled; });
     setHidden("sources-busy-note", !busy && !resumeDeletion);
     setText("sources-busy-note", resumeDeletion ? "Завершите удаление, прежде чем изменять исходные папки." : "Чтобы изменить источники, приостановите текущую работу и дождитесь сохранения прогресса.");
     setHidden("source-form-busy", !busy);
@@ -376,15 +396,19 @@
     jobViews.forEach(updateJobControls);
     updateTaskMenu();
     updateScheduleControls();
+    updatePlanControls();
+    updateNotificationControls();
   }
 
   function renderApplicationStatus(state) {
-    const stats = state.stats || {}, activity = state.activity || {}, scheduler = state.scheduler || {};
+    const stats = state.stats || {}, activity = state.activity || {}, scheduler = state.scheduler || {}, planned = state.plans || {};
     const current = plain(activity.phase, "idle");
     const errors = finite(stats.failed), enabled = finite(scheduler.enabled);
     let title = "Готов к работе", description = "Все задачи обработаны. Можно запустить новое сканирование.", tone = "neutral", badge = "Ожидание", symbol = "cloud";
     if (!connected) {
       title = "Нет связи с сервером"; description = "На экране последние полученные данные. Проверяем подключение."; tone = "orange"; badge = "Нет связи"; symbol = "alert";
+    } else if (current === "planning") {
+      title = "Подготовка плана загрузки"; description = plain(activity.message, "Считаем файлы и объём каталогов без хеширования."); tone = "blue"; badge = "Подготовка"; symbol = "scan";
     } else if (["scanning", "reconciling"].includes(current)) {
       title = "Выполняется сканирование";
       description = plain(activity.message) || (current === "reconciling" ? "Сравниваем найденные файлы с актуальным содержимым Облака." : "Создаём новый список задач из выбранных исходных папок.");
@@ -398,9 +422,9 @@
     } else if (["login", "logout", "checking", "quota"].includes(current)) {
       const info = phaseInfo[current] || phaseInfo.idle;
       title = info[0]; description = plain(activity.message) || "Дожидаемся ответа Облака."; tone = info[2]; badge = info[1]; symbol = info[3];
-    } else if (state.auth_required === true || errors > 0 || plain(activity.last_error) || plain(scheduler.error)) {
+    } else if (state.auth_required === true || errors > 0 || plain(activity.last_error) || plain(scheduler.error) || plain(planned.error) || finite(planned.paused) > 0) {
       title = "Требуются действия";
-      description = state.auth_required === true ? "Войдите в Mail.ru, чтобы продолжить работу." : errors > 0 ? "С ошибкой: " + taskCount(errors) + ". Подробности и повтор доступны в очереди." : plain(activity.last_error, plain(scheduler.error));
+      description = state.auth_required === true ? "Войдите в Mail.ru, чтобы продолжить работу." : finite(planned.paused) > 0 ? "Партия приостановлена. Откройте план загрузки, чтобы возобновить её или изменить план." : errors > 0 ? "С ошибкой: " + taskCount(errors) + ". Подробности и повтор доступны в очереди." : plain(activity.last_error, plain(planned.error, plain(scheduler.error)));
       tone = "orange"; badge = "Внимание"; symbol = "alert";
     } else if (state.deletion && state.deletion.resume_available === true) {
       title = "Требуются действия"; description = "Подтверждённое удаление приостановлено. Его можно продолжить."; tone = "orange"; badge = "На паузе"; symbol = "pause";
@@ -408,10 +432,11 @@
       title = "Требуются действия";
       description = !state.authenticated ? "Подключите аккаунт Mail.ru для работы с Облаком." : "Добавьте исходные папки с фото и видео.";
       tone = "orange"; badge = "Настройка"; symbol = "alert";
-    } else if (enabled > 0) {
+    } else if (enabled > 0 || finite(planned.active) > 0) {
       title = "Работа по расписанию";
-      const next = scheduleDateTime(scheduler.next_run, plain(state.settings && state.settings.timezone, plain(scheduler.timezone, schedulesTimezone)));
-      description = finite(scheduler.queued) > 0 ? "Сработавшее расписание ожидает запуска." : next ? "Следующий запуск: " + next + "." : "Включено расписаний: " + count(enabled) + ".";
+      const dates = [scheduler.next_run, planned.next_run].filter((value) => typeof value === "number" && value > 0);
+      const next = dates.length ? scheduleDateTime(Math.min(...dates), plain(state.settings && state.settings.timezone, plain(scheduler.timezone, schedulesTimezone))) : "";
+      description = finite(scheduler.queued) > 0 ? "Сработавшее расписание ожидает запуска." : next ? "Следующий запуск: " + next + "." : "Включено расписаний: " + count(enabled) + " · Планов загрузки: " + count(planned.active) + ".";
       if (current === "paused") description = "Текущая работа на паузе. " + description;
       tone = "green"; badge = "Расписание"; symbol = "clock";
     } else if (current === "paused") {
@@ -433,6 +458,7 @@
     const total = plan[kind];
     setText("stat-" + kind, total ? count(total.count) : "—");
     setText("stat-" + kind + "-bytes", total ? bytes(total.bytes) : "Объём неизвестен");
+    if (kind === "existing") return;
     ["unlimited", "regular", "unknown"].forEach((mode) => {
       const value = plan[kind + "_" + mode];
       setText("stat-" + kind + "-" + mode, value ? fileCount(value.count) + " · " + bytes(value.bytes) : "—");
@@ -443,6 +469,7 @@
   function renderState() {
     const state = snapshot || {};
     renderConnectivity();
+    renderSourceScope();
     const stats = state.stats || {};
     const sources = Array.isArray(state.sources) ? state.sources : [];
     const activity = state.activity || {};
@@ -696,37 +723,89 @@
     });
   }
 
+  function sourceMembers(source) {
+    if (Array.isArray(source && source.members_preview) && source.members_preview.length) return source.members_preview;
+    return source && source.path ? [{ path: source.path, recursive: true }] : [];
+  }
+  function sourceScopeBody() { return currentViewSourceId === null ? {} : { source_id: currentViewSourceId }; }
+  function scopeUsesPlan() {
+    const sources = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources : [];
+    if (currentViewSourceId !== null) return Boolean(sourceById(currentViewSourceId) && sourceById(currentViewSourceId).owner_key);
+    return sources.length > 0 && sources.every((source) => source.owner_key);
+  }
+  function startCurrentScope() {
+    if (scopeUsesPlan() && !(snapshot && snapshot.deletion && snapshot.deletion.resume_available)) { location.hash = "plans"; return; }
+    return perform("start", "/api/start", sourceScopeBody());
+  }
+  function renderSourceScope() {
+    const source = currentViewSourceId === null ? null : sourceById(currentViewSourceId);
+    ["overview", "queue"].forEach((page) => {
+      setHidden(page + "-source-scope", currentViewSourceId === null);
+      setText(page + "-scope-name", source ? plain(source.alias, "Источник") : "Источник № " + currentViewSourceId);
+    });
+  }
+  async function selectSourceScope(id, page = activePage) {
+    currentViewSourceId = id === null ? null : Number(id);
+    jobsOffset = 0; jobsRequest += 1; closeTaskMenu(); renderSourceScope();
+    if (page !== activePage) { location.hash = page; navigate(page); }
+    try { await refreshState(); if (activePage === "queue") await loadJobs(); }
+    catch (error) { toast(error.message, true); }
+  }
+  async function scanSource(id) {
+    await selectSourceScope(id, "overview");
+    await perform("scan", "/api/scan", sourceScopeBody());
+  }
+  async function startSource(id) {
+    await selectSourceScope(id, "overview");
+    await perform("start", "/api/start", sourceScopeBody());
+  }
   function renderSources(sources) {
     setHidden("sources-empty", sources.length > 0);
-    const signature = JSON.stringify(sources.map((source) => [source.id, source.path, source.alias, source.remote_prefix]));
+    if (sourcesOffset >= sources.length && sourcesOffset > 0) sourcesOffset = Math.max(0, Math.floor((sources.length - 1) / 50) * 50);
+    const page = sources.slice(sourcesOffset, sourcesOffset + 50);
+    setText("sources-page-label", sources.length ? "Источники " + count(sourcesOffset + 1) + "–" + count(sourcesOffset + page.length) + " из " + count(sources.length) : "");
+    $("sources-prev").disabled = sourcesOffset === 0; $("sources-next").disabled = sourcesOffset + 50 >= sources.length;
+    setHidden("sources-pagination", sources.length <= 50);
+    const signature = JSON.stringify([sourcesOffset, page]);
     if (signature === sourcesSignature) return;
     sourcesSignature = signature;
     const list = $("sources-list"); list.replaceChildren();
-    sources.forEach((source) => {
+    page.forEach((source) => {
       const card = element("article", "card source-card");
       const symbol = element("span", "stat-icon blue"); symbol.appendChild(icon("folder"));
-      const info = element("div", "source-info");
-      const heading = element("div", "source-title-line");
-      heading.append(element("h2", "", plain(source.alias, "Папка")), element("span", "badge neutral", "Все подпапки"));
+      const info = element("div", "source-info"), heading = element("div", "source-title-line");
+      const managed = Boolean(source.owner_key), memberCount = finite(source.member_count, sourceMembers(source).length);
+      heading.append(element("h2", "", plain(source.alias, "Источник")), element("span", "badge neutral", managed ? "Партия плана" : memberCount > 1 ? count(memberCount) + " папок" : "Все подпапки"));
       info.appendChild(heading);
-      const local = element("div", "source-path-line"), remote = element("div", "source-path-line");
-      local.append(element("span", "", "На сервере"), element("span", "", plain(source.path)));
-      remote.append(element("span", "", "В Облаке"), element("span", "", plain(source.remote_prefix)));
-      info.append(local, remote);
+      sourceMembers(source).slice(0, 3).forEach((member) => {
+        const local = element("div", "source-path-line");
+        local.append(element("span", "", "На сервере"), element("span", "path-text", plain(member.path)));
+        info.appendChild(local);
+      });
+      if (memberCount > 3) info.appendChild(element("p", "field-hint", "Ещё папок: " + count(memberCount - 3)));
+      const remote = element("div", "source-path-line");
+      remote.append(element("span", "", "В Облаке"), element("span", "path-text", plain(source.remote_prefix)));
+      info.appendChild(remote);
+      const stats = source.stats || {}, totals = element("div", "source-totals");
+      totals.append(element("span", "", "После сканирования: " + fileCount(stats.total_count) + " · " + bytes(stats.total_bytes)), element("span", "", "В том числе в Облаке: " + fileCount(stats.cloud_count) + " · " + bytes(stats.cloud_bytes)));
+      info.appendChild(totals);
       const actions = element("div", "source-actions");
-      const edit = element("button", "button compact"); edit.type = "button";
-      edit.dataset.sourceAction = "edit"; edit.dataset.sourceId = String(source.id);
-      edit.setAttribute("aria-label", "Изменить источник «" + plain(source.alias, "Папка") + "»");
-      edit.append(icon("edit", "small"), document.createTextNode("Изменить"));
-      edit.addEventListener("click", () => openSource(source.id));
-      const remove = element("button", "button compact danger subtle"); remove.type = "button";
-      remove.dataset.sourceAction = "remove"; remove.dataset.sourceId = String(source.id);
-      remove.setAttribute("aria-label", "Убрать источник «" + plain(source.alias, "Папка") + "»");
-      remove.append(icon("remove", "small"), document.createTextNode("Убрать"));
-      remove.addEventListener("click", () => openSourceRemoval(source.id));
-      actions.append(edit, remove);
-      card.append(symbol, info, actions);
-      list.appendChild(card);
+      const addAction = (action, label, symbolName, callback, className = "button compact") => {
+        const button = element("button", className); button.type = "button";
+        button.dataset.sourceAction = action; button.dataset.sourceId = String(source.id);
+        button.setAttribute("aria-label", label + ": " + plain(source.alias, "Источник"));
+        button.append(icon(symbolName), document.createTextNode(label)); button.addEventListener("click", callback); actions.appendChild(button);
+      };
+      addAction("scan", "Сканировать", "scan", () => scanSource(source.id));
+      addAction("queue", "Задачи", "list", () => { setFilter("all"); selectSourceScope(source.id, "queue"); });
+      if (!managed) addAction("start", "Загрузить", "play", () => startSource(source.id));
+      if (managed) {
+        const link = element("a", "text-button", "Открыть план загрузки"); link.href = "#plans"; actions.appendChild(link);
+      } else {
+        addAction("edit", "Изменить", "edit", () => openSource(source.id));
+        addAction("remove", "Убрать", "remove", () => openSourceRemoval(source.id), "button compact danger subtle");
+      }
+      card.append(symbol, info, actions); list.appendChild(card);
     });
   }
 
@@ -754,6 +833,8 @@
     document.title = pageNames[activePage] + " · Фотоархив";
     if (activePage === "queue" && session.authenticated) loadJobs();
     if (activePage === "schedules" && session.authenticated) loadSchedules();
+    if (activePage === "plans" && session.authenticated) loadPlans();
+    if (activePage === "settings" && session.authenticated) loadNotifications();
   }
 
   function renderJobsSort() {
@@ -776,14 +857,15 @@
   async function loadJobs(showLoading = true) {
     if (!session.authenticated || pendingActions.has("password")) return;
     const request = ++jobsRequest, generation = sessionGeneration;
-    const offset = jobsOffset, filter = jobsFilter, sort = jobsSort, sortBy = jobsSortBy, limit = jobsLimit;
+    const offset = jobsOffset, filter = jobsFilter, sort = jobsSort, sortBy = jobsSortBy, limit = jobsLimit, sourceId = currentViewSourceId;
     renderJobsSort();
     if (showLoading) setText("jobs-loading", "Обновляем…");
     try {
       const query = new URLSearchParams({ status: filter, offset: String(offset), limit: String(limit), sort, sort_by: sortBy });
+      if (sourceId !== null) query.set("source_id", String(sourceId));
       const result = await api("/api/jobs?" + query.toString());
       if (request !== jobsRequest || generation !== sessionGeneration || offset !== jobsOffset || filter !== jobsFilter
-          || sort !== jobsSort || sortBy !== jobsSortBy || limit !== jobsLimit) return;
+          || sort !== jobsSort || sortBy !== jobsSortBy || limit !== jobsLimit || sourceId !== currentViewSourceId) return;
       jobsTotal = Math.max(0, finite(result.total));
       jobsTotalBytes = typeof result.total_bytes === "number" && Number.isFinite(result.total_bytes) ? Math.max(0, result.total_bytes) : null;
       if (jobsOffset >= jobsTotal && jobsOffset > 0) {
@@ -813,7 +895,7 @@
     const available = canManageSchedules(), saving = pendingActions.has("schedule");
     ["add-schedule", "empty-add-schedule"].forEach((id) => { $(id).disabled = !available; });
     document.querySelectorAll("[data-schedule-action]").forEach((button) => { button.disabled = !available; });
-    $("schedule-submit").disabled = !available || !snapshot || !Array.isArray(snapshot.sources) || snapshot.sources.length === 0;
+    $("schedule-submit").disabled = !available || !snapshot || !Array.isArray(snapshot.sources) || !snapshot.sources.some((source) => !source.owner_key);
     $("schedule-remove-submit").disabled = !available;
     setText("schedule-submit", saving ? "Сохраняем…" : "Сохранить расписание");
     setText("schedule-remove-submit", saving ? "Удаляем…" : "Удалить расписание");
@@ -930,11 +1012,11 @@
     setText("schedule-timezone-hint", "Часовой пояс: " + schedulesTimezone);
     const selected = value && Array.isArray(value.source_ids) ? value.source_ids : [];
     const sourceList = $("schedule-source-list"); sourceList.replaceChildren();
-    const sources = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources : [];
+    const sources = snapshot && Array.isArray(snapshot.sources) ? snapshot.sources.filter((source) => !source.owner_key) : [];
     sources.forEach((source) => {
       const label = element("label", "checkbox-row schedule-source-choice"), checkbox = element("input"), body = element("span");
       checkbox.type = "checkbox"; checkbox.name = "schedule-source"; checkbox.value = String(source.id); checkbox.checked = selected.includes(source.id);
-      body.append(element("strong", "", plain(source.alias, "Источник")), element("small", "", plain(source.path)));
+      body.append(element("strong", "", plain(source.alias, "Источник")), element("small", "", sourceMembers(source).map((member) => plain(member.path)).join(" · ")));
       label.append(checkbox, body); sourceList.appendChild(label);
     });
     setHidden("schedule-no-sources", sources.length > 0);
@@ -1109,8 +1191,9 @@
     view.name.setAttribute("aria-label", "Открыть файл: " + fullName);
     view.fileIcon.firstElementChild.setAttribute("href", "#i-" + mediaIcon(fullName));
     const reason = planReasons[plain(job.planned_reason)] || plain(job.planned_reason);
-    const storageHint = job.planned_mode === "regular" ? "Ожидается загрузка в квоту" : job.planned_mode === "unlimited" ? "Кандидат в безлимит" : "";
-    view.name.title = [plain(job.local_path, fullName), plain(job.cloud_path, plain(job.remote_path)), storageHint, reason].filter(Boolean).join("\n");
+    const isExisting = job.status === "skipped" && job.skip_reason === "remote_exists";
+    const storageHint = isExisting ? "" : job.planned_mode === "regular" ? "Ожидается загрузка в квоту" : job.planned_mode === "unlimited" ? "Кандидат в безлимит" : "";
+    view.name.title = [plain(job.local_path, fullName), plain(job.cloud_path, plain(job.remote_path)), storageHint, isExisting ? "" : reason].filter(Boolean).join("\n");
     const state = taskState(job);
     view.cloudLink.textContent = state[0]; view.cloudLink.className = "badge " + state[1] + " task-status-link";
     view.statusLabel.textContent = state[0]; view.menu.className = "badge " + state[1] + " task-status-button";
@@ -1119,7 +1202,7 @@
       detail = taskPathMatches(job) ? "Файл найден по назначенному пути. Повторная передача не требуется." : "Файл найден в другой папке Облака. Повторная передача не требуется.";
     } else if (job.status === "skipped" && job.skip_reason === "manual_skipped") detail = "Задача пропущена вручную. Её можно вернуть в очередь.";
     if (job.cloud_present === true || taskIsCloudStatus(job)) {
-      detail += (detail ? "\n" : "") + storageDescription(job.observed_mode);
+      if (!isExisting) detail += (detail ? "\n" : "") + storageDescription(job.observed_mode);
       if (job.cloud_path) detail += "\nПуть в Облаке: " + job.cloud_path;
       if (job.status === "skipped" && job.skip_reason === "remote_exists" && !taskPathMatches(job) && job.remote_path) detail += "\nНазначение источника: " + job.remote_path;
     }
@@ -1300,6 +1383,7 @@
     const params = new URLSearchParams({ status: $("export-filter").value, fields: fields.join(","),
       format: $("export-format").value, delimiter: $("export-delimiter").value,
       header: $("export-header").checked ? "1" : "0", sort_by: jobsSortBy, sort: jobsSort });
+    if (currentViewSourceId !== null) params.set("source_id", String(currentViewSourceId));
     // Let the browser stream a large export to disk instead of materializing
     // hundreds of thousands of rows in this tab's JavaScript memory.
     const download = document.createElement("a");
@@ -1315,6 +1399,7 @@
     if (deleteContext.id !== null) body.id = deleteContext.id;
     else {
       body.scope = $("queue-clear-scope").value;
+      if (deleteContext.sourceId !== null) body.source_id = deleteContext.sourceId;
       if (body.scope === "filter") body.status = deleteContext.filter;
     }
     return body;
@@ -1342,12 +1427,12 @@
   function openDeletion(job = null) {
     if (job ? !canControlTasks() : !canClearQueue()) return;
     closeTaskMenu();
-    deleteContext = { id: job ? job.id : null, filter: jobsFilter };
+    deleteContext = { id: job ? job.id : null, filter: jobsFilter, sourceId: currentViewSourceId };
     deletePreview = null; deletePreviewRequest += 1;
     $("queue-clear-form").reset();
     setHidden("queue-clear-options", Boolean(job));
     setText("queue-clear-title", job ? "Удалить задачу?" : "Удалить задачи?");
-    setText("queue-clear-description", job ? plain(job.relative_path, plain(job.local_path, "Выбранная задача")) : "Выберите задачи и укажите, что удалить вместе с ними. Исходные папки останутся подключёнными.");
+    setText("queue-clear-description", job ? plain(job.relative_path, plain(job.local_path, "Выбранная задача")) : "Выберите задачи и укажите, что удалить вместе с ними. Область: " + (currentViewSourceId === null ? "все источники" : plain(sourceById(currentViewSourceId) && sourceById(currentViewSourceId).alias, "выбранный источник")) + ". Исходные папки останутся подключёнными.");
     const tab = [...document.querySelectorAll(".filter-tab")].find((node) => node.dataset.filter === jobsFilter);
     $("queue-clear-scope").querySelector('option[value="filter"]').textContent = "Текущий фильтр: " + (tab ? tab.textContent : "Все");
     setError("queue-clear-error");
@@ -1427,6 +1512,7 @@
     try {
       await api(path, { method: "POST", body });
       if (options.resetJobs) jobsOffset = 0;
+      if (options.clearSourceScope) { currentViewSourceId = null; jobsOffset = 0; }
       if (options.close) $(options.close).close();
       await refreshState();
       if (activePage === "queue") await loadJobs(false);
@@ -1449,29 +1535,64 @@
   function sourceById(id) {
     return snapshot && Array.isArray(snapshot.sources) ? snapshot.sources.find((source) => source.id === id) : null;
   }
-  function openSource(id = null) {
+  let sourceMembershipEditable = true;
+  function addSourcePathRow(path = "", removable = true) {
+    const container = $("source-paths"), row = element("div", "source-member-row");
+    const input = element("input", "source-member-path"); input.type = "text"; input.required = true; input.maxLength = 4096; input.value = path;
+    input.placeholder = "/photos/Family"; input.setAttribute("aria-label", "Папка на сервере " + (container.childElementCount + 1));
+    input.addEventListener("input", updateSourcePreview);
+    const browse = element("button", "button compact", "Выбрать…"); browse.type = "button";
+    browse.addEventListener("click", () => openFolderPicker((selected) => { input.value = selected; updateSourcePreview(); input.focus(); }));
+    row.append(input, browse);
+    if (removable) {
+      const remove = element("button", "icon-button danger"); remove.type = "button"; remove.setAttribute("aria-label", "Убрать путь из источника"); remove.title = "Убрать путь"; remove.appendChild(icon("remove"));
+      remove.addEventListener("click", () => { row.remove(); updateSourcePreview(); $("source-add-path").focus(); }); row.appendChild(remove);
+    }
+    container.appendChild(row); return input;
+  }
+  async function openSource(id = null) {
     if (!snapshot || isBusy() || anyAction() || !connected) return;
     const source = id === null ? null : sourceById(id);
     if (id !== null && !source) { toast("Источник уже убран. Список папок обновлён."); return; }
-    editingSourceId = source ? source.id : null;
+    if (source && source.owner_key) { location.hash = "plans"; return; }
+    editingSourceId = source ? source.id : null; sourceMembershipEditable = true;
     $("source-form").reset();
-    $("source-path").value = source ? plain(source.path) : "";
-    $("source-path").readOnly = Boolean(source);
+    [...$("source-paths").children].slice(1).forEach((row) => row.remove());
+    $("source-path").value = source ? plain(sourceMembers(source)[0] && sourceMembers(source)[0].path) : "";
+    $("source-path").readOnly = false;
     $("source-alias").value = source ? plain(source.alias) : "";
     $("source-remote-prefix").value = source ? plain(source.remote_prefix) : "";
     setText("source-dialog-label", source ? "НАСТРОЙКИ ИСТОЧНИКА" : "НОВЫЙ ИСТОЧНИК");
-    setText("source-dialog-title", source ? "Изменить источник" : "Добавить папку с фото и видео");
-    setText("source-description", source ? "Измените название источника или назначение загрузки в Облаке." : "Файлы читаются прямо из этой папки. Все вложенные каталоги будут найдены автоматически.");
+    setText("source-dialog-title", source ? "Изменить источник" : "Добавить источник");
+    setText("source-description", "Объедините одну или несколько папок сервера. Вложенные каталоги будут найдены автоматически.");
     setText("source-submit", source ? "Сохранить изменения" : "Добавить источник");
-    setHidden("browse-folders", Boolean(source));
-    setHidden("source-path-hint", !source);
-    setHidden("source-update-note", !source);
+    setHidden("browse-folders", false); setHidden("source-path-hint", false); setHidden("source-add-path", false); setHidden("source-update-note", !source);
+    setText("source-path-hint", "При нескольких папках их имена сохраняются внутри назначения. Вложенные друг в друга пути добавлять не нужно.");
     setError("source-error"); updateSourcePreview(); updateControls(); showDialog("source-dialog");
-    if (source) $("source-alias").focus();
+    if (source) {
+      const generation = sessionGeneration;
+      pendingActions.add("source-members"); updateControls();
+      try {
+        const result = await api("/api/sources/members?id=" + encodeURIComponent(source.id) + "&offset=0&limit=200");
+        if (generation !== sessionGeneration || !$("source-dialog").open || editingSourceId !== source.id) return;
+        const members = Array.isArray(result.members) ? result.members : sourceMembers(source);
+        if (members.length) $("source-path").value = plain(members[0].path);
+        members.slice(1).forEach((member) => addSourcePathRow(plain(member.path)));
+        if (finite(result.total, members.length) > members.length) {
+          sourceMembershipEditable = false;
+          $("source-paths").querySelectorAll("input").forEach((input) => { input.readOnly = true; });
+          $("source-paths").querySelectorAll("button").forEach((button) => { button.hidden = true; });
+          setHidden("source-add-path", true);
+          setText("source-path-hint", "Показаны первые 200 путей. Полный состав большой группы сохранится при изменении названия или назначения.");
+        }
+      } catch (error) { sourceMembershipEditable = false; $("source-paths").querySelectorAll("input").forEach((input) => { input.readOnly = true; }); $("source-paths").querySelectorAll("button").forEach((button) => { button.hidden = true; }); setHidden("source-add-path", true); setError("source-error", error.message + " Состав папок сохранится без изменений."); }
+      finally { pendingActions.delete("source-members"); updateSourcePreview(); updateControls(); }
+    }
   }
   function updateSourcePreview() {
     const remote = $("source-remote-prefix").value.trim();
-    setText("source-remote-hint", remote.startsWith("/") ? "Например, файл 2024/IMG.jpg будет загружен в " + remote.replace(/\/+$/, "") + "/2024/IMG.jpg. Название источника к пути не добавляется." : "Полный путь от корня Облака, начиная с /. Например: /Фото/Семья. Название источника к пути не добавляется.");
+    const multiple = $("source-paths").childElementCount > 1;
+    setText("source-remote-hint", remote.startsWith("/") ? "Например, файл " + (multiple ? "Family/" : "") + "2024/IMG.jpg будет загружен в " + remote.replace(/\/+$/, "") + (multiple ? "/Family" : "") + "/2024/IMG.jpg. Название источника к пути не добавляется." : "Полный путь от корня Облака, начиная с /. Например: /Фото/Семья.");
   }
   function openSourceRemoval(id) {
     if (!snapshot || isBusy() || anyAction() || !connected) return;
@@ -1479,12 +1600,13 @@
     if (!source) { toast("Источник уже убран. Список папок обновлён."); return; }
     removingSourceId = source.id;
     setText("source-remove-name", plain(source.alias, "Папка"));
-    setText("source-remove-path", "На сервере: " + plain(source.path));
+    setText("source-remove-path", "На сервере: " + sourceMembers(source).map((member) => plain(member.path)).join("; ") + (finite(source.member_count) > 3 ? " и другие папки" : ""));
     setText("source-remove-remote", "В Облаке: " + plain(source.remote_prefix));
     setError("source-remove-error"); updateControls(); showDialog("source-remove-dialog");
   }
-  async function openFolderPicker() {
-    if (editingSourceId !== null || isBusy() || anyAction() || !connected) return;
+  async function openFolderPicker(onSelect = null) {
+    if (isBusy() || anyAction() || !connected) return;
+    folderSelection = typeof onSelect === "function" ? onSelect : (selected) => { $("source-path").value = selected; if (!$("source-alias").value.trim()) $("source-alias").value = selected.split(/[\\/]/).filter(Boolean).pop() || "Фото"; updateSourcePreview(); $("source-alias").focus(); };
     setError("folder-error"); showDialog("folder-dialog");
     await browseFolder(null);
   }
@@ -1521,6 +1643,543 @@
       setError("folder-error", error.message);
     }
   }
+
+  // Planning pages only fetch folder and batch pages; file lists stay on the server.
+  const planStepNames = ["root", "folders", "settings", "preview"];
+  const batchStates = { queued: ["В очереди", "neutral"], running: ["Выполняется", "blue"], paused: ["Приостановлена", "orange"], completed: ["Выполнена", "green"], completed_with_errors: ["Завершена с ошибками", "orange"], deleting: ["Очистка Облака", "orange"] };
+  const planStates = { draft: ["Черновик", "neutral"], building: ["Формируется", "blue"], activating: ["Подготовка источников", "blue"], active: ["По расписанию", "blue"], running: ["Выполняется", "blue"], paused: ["Приостановлен", "orange"], completed: ["Выполнен", "green"], completed_with_errors: ["Завершён с ошибками", "orange"], attention: ["Требуется внимание", "orange"] };
+  let plans = [], plansOffset = 0, plansTotal = 0, plansRequest = 0;
+  let selectedPlanId = null, selectedPlan = null, planBatches = [], batchesOffset = 0, batchesTotal = 0;
+  let planDetailRequest = 0, planDraftSignature = "", planListSignature = "", draggedBatchId = null;
+  const batchViews = new Map();
+  const planWizard = { step: "root", inventory: null, plan: null, building: false, request: 0, treeRevision: null, treeEpoch: 0, treeBusy: 0, expanded: new Set(), nodes: new Map() };
+  let editingBatchTimeId = null, batchAction = null, cleanupAfterPause = null;
+  let notificationsDirty = false, notificationsLoaded = false, notificationsPending = false, notificationsRequest = 0;
+  let notificationsConfig = null;
+
+  function queryURL(path, values = {}) {
+    const query = new URLSearchParams();
+    Object.entries(values).forEach(([key, value]) => { if (value !== null && value !== undefined) query.set(key, String(value)); });
+    return path + (query.size ? "?" + query.toString() : "");
+  }
+  function planResult(result) { return result && result.plan && typeof result.plan === "object" ? result.plan : result; }
+  function inventoryResult(result) { return result && result.inventory && typeof result.inventory === "object" ? result.inventory : result; }
+  function warningText(value) { return typeof value === "string" ? value : value && plain(value.message, plain(value.reason, plain(value.code))); }
+  function planZone(plan = selectedPlan) { return plain(plan && plan.settings && plan.settings.timezone, plain(snapshot && snapshot.settings && snapshot.settings.timezone, "Europe/Moscow")); }
+  function localDateTime(value, zone) {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(value * 1000));
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return values.year + "-" + values.month + "-" + values.day + "T" + values.hour + ":" + values.minute;
+  }
+  function fillCalendar(prefix, settings = {}) {
+    const zone = plain(settings.timezone, plain(snapshot && snapshot.settings && snapshot.settings.timezone, "Europe/Moscow"));
+    let today;
+    try { today = localDateTime(Date.now() / 1000, zone).slice(0, 10); } catch { today = new Date().toISOString().slice(0, 10); }
+    $(prefix + "-start-date").value = plain(settings.start_date, today);
+    $(prefix + "-start-time").value = plain(settings.time, "02:00");
+    $(prefix + "-interval-days").value = String(finite(settings.interval_days, 1));
+    $(prefix + "-timezone").value = zone;
+    const weekdays = Array.isArray(settings.weekdays) ? settings.weekdays : [1, 2, 3, 4, 5, 6, 7];
+    document.querySelectorAll('[name="' + prefix + '-weekday"]').forEach((input) => { input.checked = weekdays.includes(Number(input.value)); });
+  }
+  function readCalendar(prefix, base = {}) {
+    const weekdays = [...document.querySelectorAll('[name="' + prefix + '-weekday"]:checked')].map((input) => Number(input.value));
+    const interval = Number($(prefix + "-interval-days").value), date = $(prefix + "-start-date").value, time = $(prefix + "-start-time").value, zone = $(prefix + "-timezone").value.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) throw new Error("Укажите дату и время начала.");
+    if (!Number.isInteger(interval) || interval < 1 || interval > 3660) throw new Error("Интервал должен быть целым числом от 1 до 3660 суток.");
+    if (!weekdays.length) throw new Error("Выберите хотя бы один разрешённый день недели.");
+    try { new Intl.DateTimeFormat("ru", { timeZone: zone }).format(); } catch { throw new Error("Укажите часовой пояс IANA, например Europe/Moscow."); }
+    return { ...base, start_date: date, time, interval_days: interval, timezone: zone, weekdays };
+  }
+  function calendarDescription(settings = {}) {
+    const names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+    const days = Array.isArray(settings.weekdays) ? settings.weekdays.map((day) => names[day - 1]).filter(Boolean).join(", ") : "все дни";
+    return "Не чаще раза в " + count(finite(settings.interval_days, 1)) + " сут. · " + days + " · " + plain(settings.time, "02:00") + " · " + plain(settings.timezone, "Europe/Moscow");
+  }
+  function updatePlanControls() {
+    const available = Boolean(session.authenticated && snapshot && connected && !pendingActions.has("password")), saving = pendingActions.has("plan");
+    ["add-plan", "empty-add-plan"].forEach((id) => { $(id).disabled = !available || saving || isBusy(); });
+    $("plan-select").disabled = !available || saving || !plans.length;
+    $("plans-prev").disabled = !available || saving || plansOffset === 0;
+    $("plans-next").disabled = !available || saving || plansOffset + 50 >= plansTotal;
+    ["plan-configure", "plan-recalculate", "plan-activate"].forEach((id) => { $(id).disabled = !available || saving || !selectedPlan; });
+    $("plan-delete").disabled = !available || saving || isBusy() || !selectedPlan || ["building", "activating"].includes(selectedPlan.status);
+    $("plan-delete-confirm").disabled = !available || saving || isBusy();
+    $("batches-prev").disabled = !available || saving || batchesOffset === 0;
+    $("batches-next").disabled = !available || saving || batchesOffset + 50 >= batchesTotal;
+    $("plan-browse").disabled = !available || saving || isBusy();
+    $("plan-wizard-back").disabled = saving || planWizard.treeBusy > 0 || planWizard.building;
+    const inventory = planWizard.inventory, ready = inventory && ["ready", "incomplete"].includes(inventory.status) && finite(inventory.selected_count) > 0 && finite(inventory.selected_errors) === 0;
+    $("plan-wizard-next").disabled = !available || saving || planWizard.step === "folders" && (!ready || planWizard.treeBusy > 0) || planWizard.step === "preview" && (!planWizard.plan || planWizard.building || planWizard.plan.status !== "draft" || finite(planWizard.plan.batch_count) === 0);
+    ["plan-calendar-save", "batch-time-save", "batch-action-confirm"].forEach((id) => { $(id).disabled = !available || saving; });
+    if (batchAction && batchAction.kind === "cleanup") $("batch-action-confirm").disabled = !available || saving || !batchAction.preview || finite(batchAction.preview.count) === 0;
+    batchViews.forEach((view) => updateBatchControls(view, available && !saving));
+  }
+  async function planMutation(path, body, options = {}) {
+    if (pendingActions.has("plan")) return null;
+    pendingActions.add("plan"); updateControls();
+    if (options.errorId) setError(options.errorId);
+    try {
+      const result = await api(path, { method: "POST", body });
+      if (options.message) toast(options.message);
+      return result;
+    } catch (error) {
+      if (options.errorId) setError(options.errorId, error.message); else toast(error.message, true);
+      return null;
+    } finally { pendingActions.delete("plan"); updateControls(); schedulePoll(true); }
+  }
+  async function loadPlans(showLoading = true) {
+    if (!session.authenticated || pendingActions.has("password")) return;
+    const request = ++plansRequest, generation = sessionGeneration, offset = plansOffset;
+    if (showLoading) setText("plans-loading", "Обновляем…");
+    try {
+      const result = await api(queryURL("/api/plans", { offset, limit: 50 }));
+      if (request !== plansRequest || generation !== sessionGeneration || offset !== plansOffset) return;
+      plans = Array.isArray(result.plans) ? result.plans : [];
+      plansTotal = finite(result.total, plans.length);
+      const signature = JSON.stringify([plans.map((plan) => [plan.id, plan.name, plan.status]), selectedPlanId]);
+      if (signature !== planListSignature) {
+        planListSignature = signature; const select = $("plan-select"); select.replaceChildren();
+        if (!plans.length) { const option = element("option", "", "Планов пока нет"); option.value = ""; select.appendChild(option); }
+        plans.forEach((plan) => { const option = element("option", "", plain(plan.name, "План") + (plan.status === "draft" ? " · черновик" : "")); option.value = String(plan.id); select.appendChild(option); });
+        if (selectedPlanId && selectedPlan && !plans.some((plan) => String(plan.id) === String(selectedPlanId))) { const option = element("option", "", plain(selectedPlan.name, "Выбранный план")); option.value = String(selectedPlanId); select.prepend(option); }
+      }
+      if (!selectedPlanId && plans.length) { selectedPlanId = String(plans[0].id); batchesOffset = 0; }
+      $("plan-select").value = selectedPlanId || "";
+      renderInventoryDrafts(Array.isArray(result.inventories) ? result.inventories : []);
+      setHidden("plans-empty", plansTotal > 0); setHidden("plan-detail", !selectedPlanId);
+      setText("plans-loading", plansTotal > 50 ? "Планы " + count(offset + 1) + "–" + count(offset + plans.length) + " из " + count(plansTotal) : "");
+      setError("plans-error");
+      if (selectedPlanId) await loadPlanDetail(showLoading);
+    } catch (error) { if (request === plansRequest && !error.staleSession) { setText("plans-loading", ""); setError("plans-error", error.message); } }
+    finally { updatePlanControls(); }
+  }
+  function renderInventoryDrafts(inventories) {
+    const signature = JSON.stringify(inventories);
+    if (signature === planDraftSignature) return;
+    planDraftSignature = signature; const container = $("plan-inventory-drafts"); container.replaceChildren();
+    if (!inventories.length) return;
+    const details = element("details", "card inventory-history"), summary = element("summary", "", "Недавние просмотры каталогов · " + count(inventories.length)); details.appendChild(summary);
+    inventories.slice(0, 20).forEach((inventory) => {
+      const row = element("div", "inventory-history-row"), info = element("div");
+      info.append(element("strong", "path-text", plain(inventory.root)), element("span", "field-hint", fileCount(inventory.total_count) + " · " + bytes(inventory.total_bytes) + (inventory.status === "scanning" ? " · идёт подсчёт" : "")));
+      const button = element("button", "button compact", inventory.status === "scanning" ? "Открыть" : "Использовать"); button.type = "button"; button.addEventListener("click", () => openPlanWizard(inventory)); row.append(info, button); details.appendChild(row);
+    }); container.appendChild(details);
+  }
+  async function loadPlanDetail(showLoading = true) {
+    if (!selectedPlanId) return;
+    const request = ++planDetailRequest, id = selectedPlanId, offset = batchesOffset, generation = sessionGeneration;
+    if (showLoading) setText("batches-loading", "Обновляем…");
+    try {
+      const results = await Promise.all([api(queryURL("/api/plans/detail", { id })), api(queryURL("/api/plans/batches", { plan_id: id, offset, limit: 50 }))]);
+      if (request !== planDetailRequest || generation !== sessionGeneration || id !== selectedPlanId || offset !== batchesOffset) return;
+      selectedPlan = planResult(results[0]); const batchResult = results[1];
+      planBatches = Array.isArray(batchResult.batches) ? batchResult.batches : [];
+      batchesTotal = finite(batchResult.total, planBatches.length);
+      if (batchesOffset >= batchesTotal && batchesOffset > 0) { batchesOffset = Math.max(0, Math.floor((batchesTotal - 1) / 50) * 50); return loadPlanDetail(); }
+      renderPlanDetail(); renderBatches(); setText("batches-loading", "");
+      if (cleanupAfterPause) {
+        const batch = planBatches.find((item) => String(item.id) === cleanupAfterPause);
+        if (batch && batch.status === "paused") { cleanupAfterPause = null; await openBatchAction(batch, "cleanup"); }
+      }
+    } catch (error) { if (request === planDetailRequest && !error.staleSession) setText("batches-loading", error.message); }
+    finally { updatePlanControls(); }
+  }
+  function renderPlanDetail() {
+    if (!selectedPlan) return;
+    setHidden("plan-detail", false);
+    const plan = selectedPlan, summary = plan.summary || {}, status = finite(plan.running_count) > 0 ? ["Выполняется", "blue"] : planStates[plain(plan.status)] || [plain(plan.status, "План"), "neutral"];
+    setText("plan-detail-title", plain(plan.name, "План загрузки")); setText("plan-detail-root", plain(plan.root));
+    setText("plan-detail-status", status[0]); $("plan-detail-status").className = "badge " + status[1];
+    setText("plan-calendar-description", calendarDescription(plan.settings));
+    setText("plan-batch-count", count(finite(plan.batch_count, batchesTotal)));
+    setText("plan-files-count", count(finite(plan.file_count, finite(plan.total_count, finite(summary.file_count)))));
+    setText("plan-files-bytes", bytes(finite(plan.total_bytes, finite(summary.total_bytes))));
+    setText("plan-done-count", count(finite(plan.completed_count, finite(summary.completed_count))));
+    setHidden("plan-activate", plan.status !== "draft");
+    const warnings = Array.isArray(plan.warnings) ? plan.warnings.map(warningText).filter(Boolean) : [];
+    if (plain(plan.message)) warnings.push(plan.message);
+    setText("plan-warnings", warnings.slice(0, 20).join(" ")); setHidden("plan-warnings", !warnings.length);
+  }
+  function batchButton(view, action, text, symbol, callback, className = "button compact") {
+    const button = element("button", className); button.type = "button"; button.dataset.batchAction = action; button.dataset.batchId = String(view.batch.id); button.title = text;
+    button.setAttribute("aria-label", text + ": " + plain(view.batch.name, "Партия"));
+    if (symbol) button.appendChild(icon(symbol)); if (text) button.appendChild(document.createTextNode(text));
+    button.addEventListener("click", () => callback(view.batch)); return button;
+  }
+  function createBatchView(batch) {
+    const card = element("article", "card batch-card"); card.setAttribute("role", "listitem"); card.dataset.batchId = String(batch.id);
+    const order = element("div", "batch-order"), number = element("strong"), arrows = element("div", "batch-arrows");
+    const up = element("button", "icon-button", "↑"), down = element("button", "icon-button", "↓"); up.type = down.type = "button";
+    up.dataset.batchAction = "up"; down.dataset.batchAction = "down"; up.dataset.batchId = down.dataset.batchId = String(batch.id);
+    up.setAttribute("aria-label", "Переместить партию выше"); down.setAttribute("aria-label", "Переместить партию ниже");
+    arrows.append(up, down); order.append(number, arrows);
+    const info = element("div", "batch-info"), heading = element("div", "source-title-line"), title = element("h3"), badge = element("span", "badge"), oversized = element("span", "badge orange", "Крупная папка");
+    heading.append(title, badge, oversized); const members = element("p", "field-hint batch-members"), volume = element("p", "batch-volume");
+    const progress = element("div", "progress-track"); progress.setAttribute("role", "progressbar"); progress.setAttribute("aria-valuemin", "0"); progress.setAttribute("aria-valuemax", "100"); const fill = element("div", "progress-fill"); progress.appendChild(fill);
+    const result = element("p", "field-hint batch-result"), message = element("p", "field-hint batch-message"); info.append(heading, members, volume, progress, result, message);
+    const side = element("div", "batch-side"), date = element("button", "batch-date"); date.type = "button"; date.dataset.batchAction = "time"; date.dataset.batchId = String(batch.id); const actions = element("div", "batch-actions"); side.append(date, actions);
+    card.append(order, info, side);
+    const view = { batch, card, number, up, down, title, badge, oversized, members, volume, progress, fill, result, message, date, actions, actionSignature: "" };
+    up.addEventListener("click", () => moveBatch(view.batch, "up")); down.addEventListener("click", () => moveBatch(view.batch, "down")); date.addEventListener("click", () => openBatchTime(view.batch));
+    card.addEventListener("dragstart", (event) => { if (view.batch.status !== "queued" || pendingActions.has("plan")) { event.preventDefault(); return; } draggedBatchId = String(view.batch.id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", draggedBatchId); card.classList.add("dragging"); });
+    card.addEventListener("dragend", () => { draggedBatchId = null; document.querySelectorAll(".batch-card").forEach((item) => item.classList.remove("dragging", "drag-target")); });
+    card.addEventListener("dragover", (event) => { if (draggedBatchId && draggedBatchId !== String(view.batch.id) && view.batch.status === "queued") { event.preventDefault(); event.dataTransfer.dropEffect = "move"; card.classList.add("drag-target"); } });
+    card.addEventListener("dragleave", (event) => { if (!card.contains(event.relatedTarget)) card.classList.remove("drag-target"); });
+    card.addEventListener("drop", async (event) => { event.preventDefault(); const moving = draggedBatchId; draggedBatchId = null; card.classList.remove("drag-target"); if (!moving || moving === String(view.batch.id) || view.batch.status !== "queued") return; if (await planMutation("/api/plans/batch/move", { id: moving, before_id: view.batch.id }, { message: "Порядок партий и даты обновлены." })) await loadPlanDetail(false); });
+    return view;
+  }
+  function updateBatchView(view, batch) {
+    view.batch = batch; const state = batchStates[batch.status] || [plain(batch.status, "Партия"), "neutral"], summary = batch.summary || {};
+    view.number.textContent = String(finite(batch.position, 0) + 1); view.title.textContent = plain(batch.name, "Партия " + view.number.textContent);
+    view.badge.textContent = state[0]; view.badge.className = "badge " + state[1]; view.oversized.hidden = !batch.oversized;
+    const members = Array.isArray(batch.members_preview) ? batch.members_preview : [];
+    view.members.textContent = members.map((member) => typeof member === "string" ? member : plain(member.relative_path, plain(member.path))).filter(Boolean).join(" · ") + (finite(batch.member_count) > members.length ? " · ещё " + count(batch.member_count - members.length) : "");
+    view.members.title = view.members.textContent;
+    const total = finite(summary.total, finite(summary.total_count, finite(batch.file_count)));
+    const done = Math.min(total, finite(summary.uploaded) + finite(summary.skipped) + finite(summary.failed));
+    const terminal = ["completed", "completed_with_errors"].includes(batch.status), percent = terminal ? 100 : total > 0 ? Math.min(100, Math.floor(done / total * 100)) : 0;
+    view.volume.textContent = fileCount(finite(batch.file_count)) + " · " + bytes(batch.total_bytes);
+    view.fill.style.width = percent + "%"; view.progress.setAttribute("aria-valuenow", String(percent)); view.progress.setAttribute("aria-label", "Обработано задач партии " + view.title.textContent); view.progress.setAttribute("aria-valuetext", percent + "% · " + count(done) + " из " + count(total));
+    view.result.textContent = batch.started_at ? "Обработано: " + count(done) + " из " + count(total) + " · Загружено: " + bytes(summary.uploaded_bytes) + (finite(summary.failed) ? " · Ошибок: " + count(summary.failed) : "") : "Сканирование и проверка начнутся по расписанию.";
+    view.message.textContent = plain(batch.message); view.message.hidden = !view.message.textContent;
+    view.date.textContent = (batch.finished_at ? "Завершена " + scheduleDateTime(batch.finished_at, planZone()) : batch.started_at ? "Начата " + scheduleDateTime(batch.started_at, planZone()) : scheduleDateTime(batch.scheduled_for, planZone()) || "Дата ещё не назначена");
+    view.date.title = batch.status === "queued" ? "Изменить дату · " + planZone() : planZone();
+    view.card.draggable = batch.status === "queued"; view.card.classList.toggle("batch-queued", batch.status === "queued");
+    const signature = [batch.status, batch.source_id, selectedPlan && selectedPlan.status].join(":");
+    if (signature !== view.actionSignature) {
+      view.actionSignature = signature; view.actions.replaceChildren();
+      if (batch.status === "queued") view.actions.appendChild(batchButton(view, "start", "Запустить", "play", (item) => runBatch(item, "start"), "button compact primary"));
+      if (batch.status === "running") view.actions.appendChild(batchButton(view, "pause", "Приостановить", "pause", (item) => openBatchAction(item, "pause")));
+      if (batch.status === "paused") {
+        view.actions.appendChild(batchButton(view, "resume", "Возобновить", "play", (item) => runBatch(item, "resume"), "button compact primary"));
+        view.actions.appendChild(batchButton(view, "cleanup", "В корзину Облака…", "remove", (item) => openBatchAction(item, "cleanup"), "button compact danger subtle"));
+      }
+      if (batch.source_id) view.actions.appendChild(batchButton(view, "queue", "Задачи", "list", (item) => { setFilter("all"); selectSourceScope(item.source_id, "queue"); }));
+      if (!["running", "deleting"].includes(batch.status)) view.actions.appendChild(batchButton(view, "delete", "Удалить партию", "remove", (item) => openBatchAction(item, "delete"), "button compact danger subtle"));
+    }
+    updateBatchControls(view, connected && !pendingActions.has("plan"));
+  }
+  function updateBatchControls(view, available) {
+    const batch = view.batch, mutable = available && batch.status === "queued";
+    view.up.disabled = !mutable || finite(batch.position) === 0; view.down.disabled = !mutable || finite(batch.position) >= batchesTotal - 1;
+    view.date.disabled = !mutable; view.date.classList.toggle("editable", mutable);
+    view.actions.querySelectorAll("button").forEach((button) => {
+      const action = button.dataset.batchAction, needsIdle = ["start", "resume", "cleanup", "delete"].includes(action);
+      button.disabled = !available || needsIdle && isBusy() || action === "start" && selectedPlan && selectedPlan.status !== "active";
+    });
+  }
+  function renderBatches() {
+    if (draggedBatchId) return;
+    const container = $("plan-batches"), seen = new Set();
+    container.querySelectorAll(":scope > .empty-state").forEach((node) => node.remove());
+    let cursor = container.firstElementChild;
+    planBatches.forEach((batch) => {
+      const id = String(batch.id); seen.add(id); let view = batchViews.get(id);
+      if (!view) { view = createBatchView(batch); batchViews.set(id, view); }
+      updateBatchView(view, batch);
+      if (view.card !== cursor) container.insertBefore(view.card, cursor); else cursor = cursor.nextElementSibling;
+    });
+    batchViews.forEach((view, id) => { if (!seen.has(id)) { view.card.remove(); batchViews.delete(id); } });
+    if (!planBatches.length) { container.replaceChildren(element("div", "card empty-state", "В этом плане пока нет партий.")); batchViews.clear(); }
+    setText("batches-page-label", batchesTotal ? "Партии " + count(batchesOffset + 1) + "–" + count(batchesOffset + planBatches.length) + " из " + count(batchesTotal) : "");
+  }
+  async function moveBatch(batch, direction) {
+    if (await planMutation("/api/plans/batch/move", { id: batch.id, direction }, { message: "Порядок партий и даты обновлены." })) await loadPlanDetail(false);
+  }
+  async function runBatch(batch, action) {
+    if (await planMutation("/api/plans/batch/" + action, { id: batch.id }, { message: action === "resume" ? "Партия продолжит работу." : "Партия запущена. Даты следующих партий пересчитаны." })) { await refreshState(); await loadPlanDetail(false); }
+  }
+  function showPlanStep(step) {
+    planWizard.step = step; planStepNames.forEach((name) => { setHidden("plan-step-" + name, name !== step); const item = document.querySelector('[data-plan-step="' + name + '"]'); item.classList.toggle("current", name === step); if (name === step) item.setAttribute("aria-current", "step"); else item.removeAttribute("aria-current"); });
+    setText("plan-wizard-title", { root: "Подготовка архива", folders: "Папки для загрузки", settings: "Правила и календарь", preview: "Проверьте план" }[step]);
+    setHidden("plan-wizard-back", step === "root");
+    setText("plan-wizard-next", { root: "Посчитать архив", folders: "Далее: правила", settings: "Сформировать партии", preview: "Принять план" }[step]);
+    setText("plan-wizard-note", step === "folders" ? "Результат просмотра сохранён на сервере." : step === "preview" ? "Можно изменить порядок и даты после принятия." : "");
+    setError("plan-wizard-error"); updatePlanControls();
+  }
+  function openPlanWizard(inventory = null) {
+    if (!session.authenticated || pendingActions.has("plan")) return;
+    $("plan-wizard-form").reset(); planWizard.request += 1; planWizard.inventory = inventory; planWizard.plan = null; planWizard.building = false; planWizard.treeRevision = null; planWizard.treeEpoch += 1; planWizard.expanded.clear(); planWizard.nodes.clear();
+    fillCalendar("plan"); $("plan-name").value = inventory ? plain(inventory.root).split(/[\\/]/).filter(Boolean).pop() || "Архив" : "";
+    $("plan-root").value = inventory ? plain(inventory.root) : ""; $("plan-destination").value = "/Фото";
+    showPlanStep(inventory ? "folders" : "root"); showDialog("plan-wizard");
+    if (inventory) refreshInventory(); else $("plan-name").focus();
+  }
+  async function refreshInventory() {
+    const current = planWizard.inventory;
+    if (!current || !$("plan-wizard").open) return;
+    const request = planWizard.request, generation = sessionGeneration;
+    try {
+      const inventory = inventoryResult(await api(queryURL("/api/plans/inventory", { id: current.id })));
+      if (request !== planWizard.request || generation !== sessionGeneration || !planWizard.inventory || inventory.id !== planWizard.inventory.id) return;
+      planWizard.inventory = inventory; renderInventory();
+      if (["ready", "incomplete"].includes(inventory.status) && inventory.revision !== planWizard.treeRevision) await reloadPlanTree();
+    } catch (error) { if (!error.staleSession) setError("plan-wizard-error", error.message); }
+    updatePlanControls();
+  }
+  function renderInventory() {
+    const inventory = planWizard.inventory; if (!inventory) return;
+    const state = { new: "Подготовка", scanning: "Подсчёт", ready: "Готово", incomplete: "Есть недоступные папки", cancelled: "Остановлено" }[inventory.status] || "Просмотр";
+    setText("plan-inventory-status", state); $("plan-inventory-status").className = "badge " + (inventory.status === "ready" ? "green" : inventory.status === "scanning" ? "blue" : "orange");
+    setText("plan-inventory-progress", ["new", "scanning"].includes(inventory.status) ? "Просмотрено: " + fileCount(inventory.total_count) + " · " + bytes(inventory.total_bytes) + " · Каталогов: " + count(inventory.directory_count) : "Всего в каталоге: " + fileCount(inventory.total_count) + " · " + bytes(inventory.total_bytes) + (finite(inventory.error_count) ? ". Недоступных элементов: " + count(inventory.error_count) + ". Исключите проблемные папки или исправьте доступ и повторите просмотр." : ""));
+    setText("plan-tree-summary", "В план включено: " + fileCount(inventory.selected_count) + " · " + bytes(inventory.selected_bytes));
+    if (!["ready", "incomplete"].includes(inventory.status)) $("plan-tree").replaceChildren(element("p", "field-hint", inventory.status === "cancelled" ? "Просмотр остановлен. Вернитесь к выбору каталога, чтобы повторить." : "Дерево появится после завершения подсчёта. Окно можно закрыть и вернуться через «Недавние просмотры»."));
+  }
+  async function reloadPlanTree() {
+    if (!planWizard.inventory) return;
+    const epoch = ++planWizard.treeEpoch; planWizard.nodes.clear(); planWizard.treeRevision = planWizard.inventory.revision;
+    const container = $("plan-tree"), scroll = container.scrollTop; container.replaceChildren();
+    await loadTreePage(container, null, 0, epoch, true); container.scrollTop = scroll;
+  }
+  function forgetTreeChildren(container) {
+    container.querySelectorAll("[data-folder-id]").forEach((node) => planWizard.nodes.delete(String(node.dataset.folderId))); container.replaceChildren();
+  }
+  async function loadTreePage(container, parentId, offset, epoch = planWizard.treeEpoch, root = false) {
+    if (!planWizard.inventory || epoch !== planWizard.treeEpoch) return;
+    if (planWizard.nodes.size >= 1000) { container.appendChild(element("p", "field-hint", "Сверните несколько веток, чтобы открыть другие. Одновременно показано не более 1000 папок.")); return; }
+    const loading = element("p", "field-hint", "Читаем папки…"); container.appendChild(loading); planWizard.treeBusy += 1; updatePlanControls();
+    try {
+      const result = await api(queryURL("/api/plans/tree", { inventory_id: planWizard.inventory.id, parent_id: parentId, offset, limit: Math.min(100, 1000 - planWizard.nodes.size) }));
+      if (epoch !== planWizard.treeEpoch || !container.isConnected) return;
+      loading.remove(); const folders = Array.isArray(result.folders) ? result.folders : [];
+      for (const folder of folders) {
+        const id = String(folder.id); if (planWizard.nodes.size >= 1000) break;
+        const node = element("div", "plan-tree-node"); node.dataset.folderId = id;
+        const row = element("div", "plan-tree-row"), expand = element("button", "tree-expand"), toggle = element("button", "tree-toggle"), info = element("span", "tree-folder-info"), name = element("strong", "tree-name", plain(folder.name, plain(folder.path))), size = element("span", "tree-counts");
+        expand.type = toggle.type = "button"; const hasChildren = finite(folder.child_count) > 0;
+        expand.appendChild(icon("chevron")); expand.disabled = !hasChildren; expand.classList.toggle("leaf", !hasChildren); expand.setAttribute("aria-label", "Раскрыть " + plain(folder.name, "каталог")); expand.setAttribute("aria-expanded", "false");
+        const excluded = folder.excluded === true || folder.inherited_excluded === true, partial = !excluded && finite(folder.selected_count) < finite(folder.total_count);
+        toggle.classList.toggle("excluded", excluded); toggle.classList.toggle("partial", partial); toggle.disabled = folder.inherited_excluded === true;
+        toggle.setAttribute("aria-pressed", partial ? "mixed" : String(!excluded)); toggle.setAttribute("aria-label", (excluded ? "Включить папку " : "Исключить папку ") + plain(folder.path));
+        toggle.title = folder.inherited_excluded ? "Исключена вместе с родительской папкой" : partial ? "Часть вложенных папок исключена. Нажмите, чтобы исключить всю ветку." : excluded ? "Вернуть в план" : "Исключить из плана"; toggle.appendChild(icon(excluded ? "close" : "check"));
+        name.title = plain(folder.path); size.textContent = fileCount(folder.total_count) + " · " + bytes(folder.total_bytes) + (partial ? " · включено " + fileCount(folder.selected_count) : "") + (finite(folder.error_count) ? " · ошибки: " + count(folder.error_count) : "");
+        info.append(name, size); row.append(expand, toggle, icon("folder"), info); node.appendChild(row);
+        const children = element("div", "plan-tree-children"); children.hidden = true; node.appendChild(children); container.appendChild(node); planWizard.nodes.set(id, node);
+        const open = async () => {
+          children.hidden = false; expand.setAttribute("aria-expanded", "true"); expand.setAttribute("aria-label", "Свернуть " + plain(folder.name)); planWizard.expanded.add(id);
+          if (!children.childElementCount) await loadTreePage(children, folder.id, 0, epoch);
+        };
+        expand.addEventListener("click", async () => { if (children.hidden) await open(); else { children.hidden = true; expand.setAttribute("aria-expanded", "false"); expand.setAttribute("aria-label", "Раскрыть " + plain(folder.name)); planWizard.expanded.delete(id); forgetTreeChildren(children); } });
+        toggle.addEventListener("click", async () => {
+          if (pendingActions.has("plan")) return;
+          const result = await planMutation("/api/plans/exclude", { inventory_id: planWizard.inventory.id, folder_id: folder.id, excluded: !excluded }, { errorId: "plan-wizard-error" });
+          if (result) { planWizard.treeRevision = null; await refreshInventory(); }
+        });
+        if (hasChildren && (planWizard.expanded.has(id) || root)) await open();
+      }
+      const next = offset + folders.length;
+      if (next < finite(result.total) && folders.length) {
+        const more = element("button", "text-button tree-more", "Следующие папки · осталось " + count(result.total - next)); more.type = "button";
+        more.addEventListener("click", () => { more.remove(); loadTreePage(container, parentId, next, epoch); }); container.appendChild(more);
+      }
+    } catch (error) { if (epoch === planWizard.treeEpoch) { loading.remove(); const retry = element("button", "text-button", "Повторить чтение папок"); retry.type = "button"; retry.addEventListener("click", () => { retry.remove(); loadTreePage(container, parentId, offset, epoch, root); }); container.append(element("p", "form-error", error.message), retry); } }
+    finally { planWizard.treeBusy = Math.max(0, planWizard.treeBusy - 1); updatePlanControls(); }
+  }
+  async function submitPlanWizard(event) {
+    event.preventDefault(); setError("plan-wizard-error");
+    if (pendingActions.has("plan")) return;
+    try {
+      if (planWizard.step === "root") {
+        const root = $("plan-root").value.trim(), name = $("plan-name").value.trim(), remote = $("plan-destination").value.trim();
+        if (!name || !root || !remote.startsWith("/")) throw new Error("Укажите название, каталог сервера и путь в Облаке, начиная с /.");
+        if (planWizard.inventory && root === planWizard.inventory.root && ["ready", "incomplete", "scanning"].includes(planWizard.inventory.status)) { showPlanStep("folders"); await refreshInventory(); return; }
+        const result = await planMutation("/api/plans/inspect", { root }, { errorId: "plan-wizard-error" });
+        if (result) { planWizard.inventory = inventoryResult(result); planWizard.plan = null; planWizard.building = false; planWizard.treeRevision = null; planWizard.expanded.clear(); showPlanStep("folders"); renderInventory(); await refreshState(); await refreshInventory(); }
+      } else if (planWizard.step === "folders") { showPlanStep("settings"); $("plan-target-count").focus(); }
+      else if (planWizard.step === "settings") {
+        const targetCount = Number($("plan-target-count").value), gib = Number($("plan-target-gib").value), tolerance = Number($("plan-tolerance").value);
+        if (!Number.isInteger(targetCount) || targetCount < 1 || !Number.isFinite(gib) || gib <= 0 || !Number.isInteger(tolerance) || tolerance < 0 || tolerance > 100) throw new Error("Укажите положительные размер и число файлов, а допуск — целым процентом от 0 до 100.");
+        const settings = readCalendar("plan", { target_count: targetCount, target_bytes: Math.round(gib * 1024 ** 3), tolerance_percent: tolerance });
+        const body = { inventory_id: planWizard.inventory.id, name: $("plan-name").value.trim(), settings, remote_prefix: $("plan-destination").value.trim() };
+        if (planWizard.plan) body.replace_draft_id = planWizard.plan.id;
+        const result = await planMutation("/api/plans/build", body, { errorId: "plan-wizard-error" });
+        if (result) { planWizard.plan = planResult(result); planWizard.building = planWizard.plan.status === "building" || finite(planWizard.plan.batch_count) === 0; showPlanStep("preview"); await renderPlanPreview(); schedulePoll(true); }
+      } else if (planWizard.step === "preview") {
+        if (await planMutation("/api/plans/activate", { id: planWizard.plan.id }, { errorId: "plan-wizard-error", message: "План принят. Партии начнутся по назначенным датам." })) {
+          selectedPlanId = String(planWizard.plan.id); batchesOffset = 0; $("plan-wizard").close(); location.hash = "plans"; await loadPlans(); await refreshState();
+        }
+      }
+    } catch (error) { setError("plan-wizard-error", error.message); }
+  }
+  async function refreshWizardPlan() {
+    if (!planWizard.plan || !$("plan-wizard").open) return;
+    const request = planWizard.request, id = planWizard.plan.id, generation = sessionGeneration;
+    try {
+      const plan = planResult(await api(queryURL("/api/plans/detail", { id })));
+      if (request !== planWizard.request || generation !== sessionGeneration || !planWizard.plan || planWizard.plan.id !== id) return;
+      planWizard.plan = plan;
+      if (plan.status === "draft" && finite(plan.batch_count) > 0) { planWizard.building = false; await renderPlanPreview(); }
+      else if (plan.status === "draft" && plain(plan.message)) { planWizard.building = false; setError("plan-wizard-error", plan.message + " Вернитесь к правилам, чтобы повторить подготовку."); }
+      else { planWizard.building = true; setText("plan-preview-summary", "Формируем партии… " + plain(plan.message, "Результат сохраняется на сервере.")); }
+    } catch (error) { if (!error.staleSession) setError("plan-wizard-error", error.message); }
+    updatePlanControls();
+  }
+  async function renderPlanPreview() {
+    const plan = planWizard.plan;
+    if (planWizard.building) { setText("plan-preview-summary", "Формируем партии и рассчитываем календарь…"); $("plan-preview-batches").replaceChildren(); setHidden("plan-preview-warnings", true); setText("plan-preview-more", "Окно можно закрыть: черновик останется в списке планов."); updatePlanControls(); return; }
+    const result = await api(queryURL("/api/plans/batches", { plan_id: plan.id, offset: 0, limit: 100 }));
+    const batches = Array.isArray(result.batches) ? result.batches : [], inventory = planWizard.inventory;
+    setText("plan-preview-summary", "Партий: " + count(finite(result.total, batches.length)) + " · " + fileCount(inventory.selected_count) + " · " + bytes(inventory.selected_bytes));
+    const warnings = Array.isArray(plan.warnings) ? plan.warnings.map(warningText).filter(Boolean) : [];
+    const oversized = batches.filter((batch) => batch.oversized).length;
+    if (oversized && !warnings.length) warnings.push("Есть папки больше допустимого размера партии. Они включены целиком и отмечены отдельно.");
+    setText("plan-preview-warnings", warnings.slice(0, 20).join(" ")); setHidden("plan-preview-warnings", !warnings.length);
+    const container = $("plan-preview-batches"); container.replaceChildren();
+    batches.forEach((batch, index) => {
+      const row = element("div", "plan-preview-row"), title = element("div");
+      title.append(element("strong", "", plain(batch.name, "Партия " + (index + 1)))); if (batch.oversized) title.appendChild(element("span", "badge orange", "Крупная папка"));
+      row.append(title, element("span", "", fileCount(batch.file_count) + " · " + bytes(batch.total_bytes)), element("span", "small-muted", scheduleDateTime(batch.scheduled_for, planZone(plan)))); container.appendChild(row);
+    });
+    setText("plan-preview-more", finite(result.total) > batches.length ? "Показаны первые 100 партий. Весь план будет доступен постранично после принятия." : "Даты рассчитаны в часовом поясе " + planZone(plan) + ".");
+  }
+  function openBatchTime(batch) {
+    if (batch.status !== "queued") return;
+    editingBatchTimeId = batch.id; setText("batch-time-title", plain(batch.name, "Время партии"));
+    $("batch-time-local").value = localDateTime(finite(batch.scheduled_for, Date.now() / 1000), planZone());
+    setText("batch-time-zone", "Часовой пояс: " + planZone()); setError("batch-time-error"); showDialog("batch-time-dialog");
+  }
+  async function openBatchAction(batch, kind) {
+    batchAction = { batch, kind, preview: null }; $("batch-action-form").reset(); setError("batch-action-error");
+    setText("batch-action-name", plain(batch.name, "Партия"));
+    setText("batch-action-title", kind === "pause" ? "Приостановить партию?" : kind === "delete" ? "Удалить партию из плана?" : "Убрать загруженные файлы в корзину?");
+    setText("batch-action-description", kind === "pause" ? "Работа остановится с сохранением прогресса. Следующие партии будут ждать возобновления этой партии." : kind === "delete" ? "Будут удалены партия, её источник и задачи. Загруженные файлы останутся в Облаке. Даты оставшихся партий пересчитаются." : "В корзину попадут только файлы, которые создала эта партия. Найденные до загрузки файлы и исходники на сервере сохранятся.");
+    setHidden("batch-action-trash-row", kind !== "pause"); setHidden("batch-action-preview", true);
+    setText("batch-action-confirm", kind === "pause" ? "Приостановить" : kind === "delete" ? "Удалить партию" : "Переместить в корзину");
+    $("batch-action-confirm").className = "button " + (kind === "pause" ? "primary" : "danger"); showDialog("batch-action-dialog"); updatePlanControls();
+    if (kind === "cleanup") {
+      const context = batchAction;
+      const result = await planMutation("/api/plans/batch/cleanup-preview", { id: batch.id }, { errorId: "batch-action-error" });
+      if (context !== batchAction || !$("batch-action-dialog").open) return;
+      if (result) { batchAction.preview = result; setText("batch-action-preview", "В корзину Облака: " + fileCount(result.count) + " · " + bytes(result.total_bytes) + ". Корзина также занимает место в квоте."); setHidden("batch-action-preview", false); }
+      updatePlanControls();
+    }
+  }
+  async function submitBatchAction(event) {
+    event.preventDefault(); if (!batchAction || pendingActions.has("plan")) return;
+    const context = batchAction, batch = context.batch;
+    const body = context.kind === "pause" ? { id: batch.id, cloud_action: "keep" } : context.kind === "cleanup" ? { id: batch.id, token: context.preview && context.preview.token } : { id: batch.id };
+    const wantsCleanup = context.kind === "pause" && $("batch-action-trash").checked;
+    const result = await planMutation("/api/plans/batch/" + context.kind, body, { errorId: "batch-action-error" });
+    if (result) {
+      $("batch-action-dialog").close(); batchAction = null;
+      if (context.kind === "delete" && currentViewSourceId === batch.source_id) currentViewSourceId = null;
+      if (wantsCleanup) { cleanupAfterPause = String(batch.id); toast("Останавливаем партию. После остановки покажем подтверждение очистки Облака."); }
+      else toast(context.kind === "delete" ? "Партия удалена. Файлы сохранены." : context.kind === "cleanup" ? "Подтверждённые файлы перемещаются в корзину Облака." : "Партия приостанавливается. Прогресс сохраняется.");
+      await refreshState(); await loadPlanDetail(false);
+    }
+  }
+
+  function notificationSettings(result) { return result && result.settings && typeof result.settings === "object" ? result.settings : result && result.config && typeof result.config === "object" ? result.config : result; }
+  function fillNotifications(settings) {
+    $("notifications-enabled").checked = settings.enabled === true;
+    $("smtp-host").value = plain(settings.host, "smtp.mail.ru"); $("smtp-port").value = String(finite(settings.port, 465));
+    $("smtp-security").value = ["ssl", "starttls", "plain"].includes(settings.security) ? settings.security : "ssl";
+    $("smtp-username").value = plain(settings.username); $("smtp-sender-name").value = plain(settings.sender_name, "Фотоархив"); $("smtp-from").value = plain(settings.from_email);
+    $("smtp-recipients").value = Array.isArray(settings.recipients) ? settings.recipients.filter((value) => typeof value === "string").join("\n") : "";
+    document.querySelectorAll('[name="notification-event"]').forEach((input) => { input.checked = !Array.isArray(settings.events) || settings.events.includes(input.value); });
+    $("smtp-password").placeholder = settings.password_stored || settings.has_password ? "Сохранён на сервере — оставьте пустым" : "Пароль приложения для SMTP";
+    setText("smtp-password-hint", settings.password_stored || settings.has_password ? "Пароль уже сохранён. Пустое поле оставит его без изменений." : "Пароль хранится только на сервере. Для Mail может потребоваться пароль приложения с доступом к почте.");
+  }
+  async function loadNotifications() {
+    if (!session.authenticated) return;
+    const request = ++notificationsRequest, generation = sessionGeneration;
+    try {
+      const result = await api("/api/notifications");
+      if (request !== notificationsRequest || generation !== sessionGeneration) return;
+      notificationsConfig = notificationSettings(result); notificationsLoaded = true;
+      if (!notificationsDirty && !pendingActions.has("notifications")) fillNotifications(notificationsConfig || {});
+      const status = result.status && typeof result.status === "object" ? result.status : {};
+      notificationsPending = Boolean(status.pending || status.sending || result.pending);
+      const error = plain(status.last_error, plain(result.last_error));
+      setText("smtp-status", error ? "Последняя попытка: " + error : notificationsPending ? "Письмо ожидает отправки…" : (status.last_sent_at || status.last_sent) ? "Последнее письмо отправлено: " + dateTime(status.last_sent_at || status.last_sent) : notificationsConfig.enabled ? "Оповещения включены. Письма отправляются после выбранных событий." : "Оповещения выключены. Настройки можно сохранить заранее.");
+    } catch (error) { if (!error.staleSession) setError("smtp-error", error.message); }
+    updateNotificationControls();
+  }
+  function updateNotificationControls() {
+    const available = Boolean(session.authenticated && connected && !pendingActions.has("password")), saving = pendingActions.has("notifications");
+    $("notifications-fields").disabled = !available || saving; $("notifications-enabled").disabled = !available || saving;
+    $("smtp-save").disabled = !available || saving; $("smtp-test").disabled = !available || saving || !notificationsLoaded || notificationsDirty || notificationsPending;
+    $("smtp-test").title = notificationsDirty ? "Сначала сохраните изменённые настройки" : "Отправить тестовое письмо сохранённым получателям";
+    $("smtp-import").disabled = !available || saving;
+  }
+  function readNotifications() {
+    const recipients = $("smtp-recipients").value.split(/[,;\n]+/).map((value) => value.trim()).filter(Boolean), port = Number($("smtp-port").value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Порт SMTP должен быть от 1 до 65535.");
+    if (recipients.some((value) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))) throw new Error("Проверьте адреса получателей.");
+    const result = { enabled: $("notifications-enabled").checked, host: $("smtp-host").value.trim(), port, security: $("smtp-security").value, username: $("smtp-username").value.trim(), sender_name: $("smtp-sender-name").value.trim(), from_email: $("smtp-from").value.trim(), recipients, events: [...document.querySelectorAll('[name="notification-event"]:checked')].map((input) => input.value) };
+    if (result.enabled && (!result.host || !result.from_email || !recipients.length)) throw new Error("Для включения уведомлений укажите SMTP-сервер, адрес отправителя и получателя.");
+    if ($("smtp-password").value) result.password = $("smtp-password").value;
+    if ($("smtp-clear-password").checked) result.clear_password = true;
+    return result;
+  }
+  async function saveNotifications(event) {
+    event.preventDefault(); if (pendingActions.has("notifications")) return; setError("smtp-error");
+    let body; try { body = readNotifications(); } catch (error) { setError("smtp-error", error.message); return; }
+    pendingActions.add("notifications"); updateControls();
+    try {
+      const request = api("/api/notifications/settings", { method: "POST", body }); $("smtp-password").value = "";
+      await request; notificationsDirty = false; $("smtp-clear-password").checked = false; await loadNotifications(); toast("Настройки уведомлений сохранены.");
+    } catch (error) { setError("smtp-error", error.message); }
+    finally { pendingActions.delete("notifications"); updateControls(); }
+  }
+  async function sendTestNotification() {
+    if (notificationsDirty || pendingActions.has("notifications")) return;
+    pendingActions.add("notifications"); updateControls(); setError("smtp-error");
+    try { await api("/api/notifications/test", { method: "POST", body: {} }); notificationsPending = true; setText("smtp-status", "Тестовое письмо поставлено на отправку сохранённым получателям."); toast("Тестовое письмо поставлено в очередь."); schedulePoll(true); }
+    catch (error) { setError("smtp-error", error.message); }
+    finally { pendingActions.delete("notifications"); updateControls(); }
+  }
+  async function importNotificationSettings(event) {
+    const file = event.target.files && event.target.files[0]; event.target.value = ""; if (!file) return;
+    setError("smtp-error");
+    try {
+      if (file.size > 65536) throw new Error("Файл настроек слишком большой: допустимо до 64 КиБ.");
+      const parsed = JSON.parse(await file.text()), settings = parsed.notifications && typeof parsed.notifications === "object" ? parsed.notifications : parsed;
+      if (!settings || typeof settings !== "object" || Array.isArray(settings) || typeof settings.host !== "string") throw new Error("В JSON не найдены настройки SMTP.");
+      fillNotifications(settings); $("smtp-password").value = plain(settings.password); $("smtp-clear-password").checked = false; notificationsDirty = true; updateNotificationControls();
+      setText("smtp-status", "Настройки прочитаны из файла. Проверьте поля и нажмите «Сохранить уведомления».");
+    } catch (error) { setError("smtp-error", error instanceof SyntaxError ? "Файл должен содержать корректный JSON." : error.message); }
+  }
+
+  ["add-plan", "empty-add-plan"].forEach((id) => $(id).addEventListener("click", () => openPlanWizard()));
+  $("plan-select").addEventListener("change", () => { selectedPlanId = $("plan-select").value || null; selectedPlan = null; batchesOffset = 0; loadPlanDetail(); });
+  $("plans-prev").addEventListener("click", () => { plansOffset = Math.max(0, plansOffset - 50); selectedPlanId = null; selectedPlan = null; loadPlans(); });
+  $("plans-next").addEventListener("click", () => { if (plansOffset + 50 < plansTotal) { plansOffset += 50; selectedPlanId = null; selectedPlan = null; loadPlans(); } });
+  $("batches-prev").addEventListener("click", () => { batchesOffset = Math.max(0, batchesOffset - 50); loadPlanDetail(); });
+  $("batches-next").addEventListener("click", () => { if (batchesOffset + 50 < batchesTotal) { batchesOffset += 50; loadPlanDetail(); } });
+  $("plan-browse").addEventListener("click", () => openFolderPicker((path) => { $("plan-root").value = path; if (!$("plan-name").value.trim()) $("plan-name").value = path.split(/[\\/]/).filter(Boolean).pop() || "Архив"; $("plan-name").focus(); }));
+  $("plan-wizard-form").addEventListener("submit", submitPlanWizard);
+  $("plan-wizard-back").addEventListener("click", () => { const index = planStepNames.indexOf(planWizard.step); if (index > 0) showPlanStep(planStepNames[index - 1]); });
+  $("plan-wizard").addEventListener("close", () => { planWizard.request += 1; if (session.authenticated && activePage === "plans") loadPlans(false); });
+  $("plan-activate").addEventListener("click", async () => { if (selectedPlan && await planMutation("/api/plans/activate", { id: selectedPlan.id }, { message: "План принят. Партии запустятся по расписанию." })) { await loadPlans(false); await refreshState(); } });
+  $("plan-delete").addEventListener("click", () => {
+    if (!selectedPlan) return;
+    setText("plan-delete-name", plain(selectedPlan.name, "План") + " · партий: " + count(selectedPlan.batch_count));
+    setError("plan-delete-error"); showDialog("plan-delete-dialog");
+  });
+  $("plan-delete-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); if (!selectedPlan) return;
+    if (await planMutation("/api/plans/delete", { id: selectedPlan.id }, { errorId: "plan-delete-error", message: "План и его задачи удалены. Файлы сохранены." })) {
+      $("plan-delete-dialog").close(); currentViewSourceId = null; selectedPlanId = null; selectedPlan = null; batchesOffset = 0; plansOffset = 0; await loadPlans(false); await refreshState();
+    }
+  });
+  $("plan-recalculate").addEventListener("click", async () => { if (selectedPlan && await planMutation("/api/plans/recalculate", { id: selectedPlan.id }, { message: "Даты ожидающих партий пересчитаны." })) await loadPlanDetail(false); });
+  $("plan-configure").addEventListener("click", () => { if (!selectedPlan) return; fillCalendar("calendar", selectedPlan.settings || {}); setError("plan-calendar-error"); showDialog("plan-calendar-dialog"); });
+  $("plan-calendar-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); if (!selectedPlan) return;
+    try { const settings = readCalendar("calendar", selectedPlan.settings || {}); if (await planMutation("/api/plans/schedule", { id: selectedPlan.id, settings }, { errorId: "plan-calendar-error", message: "Правила сохранены, ожидающие партии перенесены." })) { $("plan-calendar-dialog").close(); await loadPlanDetail(false); } }
+    catch (error) { setError("plan-calendar-error", error.message); }
+  });
+  $("batch-time-form").addEventListener("submit", async (event) => { event.preventDefault(); if (editingBatchTimeId && await planMutation("/api/plans/batch-time", { id: editingBatchTimeId, scheduled_local: $("batch-time-local").value }, { errorId: "batch-time-error", message: "Дата партии и последующих загрузок обновлена." })) { $("batch-time-dialog").close(); await loadPlanDetail(false); } });
+  $("batch-action-form").addEventListener("submit", submitBatchAction);
+  $("notifications-form").addEventListener("input", () => { notificationsDirty = true; updateNotificationControls(); });
+  $("notifications-form").addEventListener("submit", saveNotifications);
+  $("smtp-test").addEventListener("click", sendTestNotification);
+  $("smtp-import").addEventListener("click", () => $("smtp-import-file").click());
+  $("smtp-import-file").addEventListener("change", importNotificationSettings);
+  $("smtp-security").addEventListener("change", () => { if ($("smtp-security").value === "ssl" && $("smtp-port").value === "587") $("smtp-port").value = "465"; if ($("smtp-security").value === "starttls" && $("smtp-port").value === "465") $("smtp-port").value = "587"; });
+  $("smtp-clear-password").addEventListener("change", () => { if ($("smtp-clear-password").checked) $("smtp-password").value = ""; });
 
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
   document.querySelectorAll("dialog").forEach((dialog) => dialog.addEventListener("close", () => setTimeout(maybeShowScanWarning, 0)));
@@ -1574,7 +2233,7 @@
     if (pendingActions.has("password")) return;
     try {
       await api("/api/session/logout", { method: "POST" });
-      session.authenticated = false; snapshot = null;
+      session.authenticated = false; snapshot = null; $("smtp-password").value = ""; notificationsDirty = false; notificationsLoaded = false;
       await refreshSession(); setError("access-error");
     } catch (error) { toast(error.message, true); }
   }
@@ -1631,9 +2290,14 @@
   $("account-menu-logout").addEventListener("click", logoutMail);
   ["logout-panel", "logout-panel-settings"].forEach((id) => $(id).addEventListener("click", logoutPanel));
   $("refresh-connection").addEventListener("click", () => { clearTimeout(pollTimer); poll(); });
-  ["start-upload", "queue-start-upload"].forEach((id) => $(id).addEventListener("click", () => perform("start", "/api/start")));
+  ["start-upload", "queue-start-upload"].forEach((id) => $(id).addEventListener("click", startCurrentScope));
   ["pause-upload", "queue-pause-upload"].forEach((id) => $(id).addEventListener("click", () => perform("pause", "/api/pause", {}, { message: "Останавливаем текущую работу и сохраняем прогресс…" })));
-  ["scan-folders", "queue-scan-folders"].forEach((id) => $(id).addEventListener("click", () => perform("scan", "/api/scan")));
+  ["scan-folders", "queue-scan-folders"].forEach((id) => $(id).addEventListener("click", () => perform("scan", "/api/scan", sourceScopeBody())));
+  $("sources-prev").addEventListener("click", () => { sourcesOffset = Math.max(0, sourcesOffset - 50); if (snapshot) { renderSources(snapshot.sources || []); updateControls(); } });
+  $("sources-next").addEventListener("click", () => { if (snapshot && sourcesOffset + 50 < snapshot.sources.length) { sourcesOffset += 50; renderSources(snapshot.sources); updateControls(); } });
+  $("sources-scan-all").addEventListener("click", () => scanSource(null));
+  $("source-add-path").addEventListener("click", () => { addSourcePathRow().focus(); updateSourcePreview(); });
+  document.querySelectorAll("[data-clear-source-scope]").forEach((button) => button.addEventListener("click", () => selectSourceScope(null)));
   $("view-errors").addEventListener("click", () => { setFilter("failed"); location.hash = "queue"; if (activePage === "queue") loadJobs(); });
   $("view-existing").addEventListener("click", () => { setFilter("existing"); location.hash = "queue"; if (activePage === "queue") loadJobs(); });
   ["onboarding-login"].forEach((id) => $(id).addEventListener("click", openMail));
@@ -1653,9 +2317,8 @@
   $("folder-up").addEventListener("click", () => { if (folderState.parent) browseFolder(folderState.parent); });
   $("folder-select").addEventListener("click", () => {
     if (!folderState.path) return;
-    $("source-path").value = folderState.path;
-    if (!$("source-alias").value.trim()) $("source-alias").value = folderState.path.split(/[\\/]/).filter(Boolean).pop() || "Photos";
-    updateSourcePreview(); $("folder-dialog").close(); $("source-alias").focus();
+    const selected = folderState.path, callback = folderSelection;
+    $("folder-dialog").close(); if (callback) callback(selected);
   });
   $("source-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1664,7 +2327,10 @@
     if (!alias) { setError("source-error", "Укажите название источника."); $("source-alias").focus(); return; }
     if (!remote_prefix.startsWith("/")) { setError("source-error", "Укажите полный путь в Облаке, начиная с /. Например: /Фото/Семья."); $("source-remote-prefix").focus(); return; }
     const editing = editingSourceId !== null;
-    const body = editing ? { id: editingSourceId, remote_prefix, alias } : { path: $("source-path").value.trim(), alias, remote_prefix };
+    const paths = [...$("source-paths").querySelectorAll(".source-member-path")].map((input) => input.value.trim());
+    if (sourceMembershipEditable && (paths.some((path) => !path) || new Set(paths).size !== paths.length)) { setError("source-error", "Укажите разные непустые пути к папкам."); return; }
+    const body = editing ? { id: editingSourceId, remote_prefix, alias } : { alias, remote_prefix };
+    if (sourceMembershipEditable) body.paths = paths;
     if (await perform("source", editing ? "/api/sources/update" : "/api/sources/add", body, { errorId: "source-error", close: "source-dialog", message: editing ? "Настройки источника сохранены. Уже загруженные файлы остаются на прежних местах." : "Папка добавлена. Нажмите «Начать загрузку» или запустите сканирование." })) {
       $("add-source").focus();
     }
@@ -1672,7 +2338,7 @@
   $("source-remove-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (removingSourceId === null || isBusy() || anyAction() || !connected) return;
-    if (await perform("source-remove", "/api/sources/remove", { id: removingSourceId }, { errorId: "source-remove-error", close: "source-remove-dialog", message: "Источник и его задачи убраны. Файлы на сервере и в Облаке сохранены." })) {
+    if (await perform("source-remove", "/api/sources/remove", { id: removingSourceId }, { errorId: "source-remove-error", close: "source-remove-dialog", clearSourceScope: currentViewSourceId === removingSourceId, message: "Источник и его задачи убраны. Файлы на сервере и в Облаке сохранены." })) {
       removingSourceId = null;
       $("add-source").focus();
     }
@@ -1701,7 +2367,7 @@
   $("retry-errors").addEventListener("click", () => { $("retry-permanent").checked = false; setError("retry-error"); showDialog("retry-dialog"); });
   $("retry-form").addEventListener("submit", async (event) => {
     event.preventDefault(); $("retry-submit").disabled = true;
-    try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задачи возвращены в очередь." }); }
+    try { await perform("retry", "/api/retry", { include_permanent: $("retry-permanent").checked, ...sourceScopeBody() }, { errorId: "retry-error", close: "retry-dialog", message: "Подходящие задачи возвращены в очередь." }); }
     finally { $("retry-submit").disabled = false; }
   });
   $("clear-queue").addEventListener("click", () => openDeletion());

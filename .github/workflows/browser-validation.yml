@@ -1,0 +1,46 @@
+name: Browser UI validation
+
+on:
+  push:
+    branches: [main, 'release/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned browser test runtime
+        run: |
+          npm install --prefix "$RUNNER_TEMP/browser-tools" --no-audit --no-fund playwright@1.62.1
+          "$RUNNER_TEMP/browser-tools/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Exercise the browser interface with offline API fixtures
+        env:
+          NODE_PATH: ${{ runner.temp }}/browser-tools/node_modules
+          UI_ARTIFACT_DIR: ${{ runner.temp }}/browser-results
+        run: node tests/browser_plans_v090.cjs
+      - name: Keep screenshots and the exact assertion report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: browser-results
+          path: ${{ runner.temp }}/browser-results
+          retention-days: 7
+      - name: Prepare browser runtime for local release validation
+        if: github.ref == 'refs/heads/release/v0.9.0'
+        run: tar -C "$HOME/.cache" -czf "$RUNNER_TEMP/playwright-browser.tar.gz" ms-playwright
+      - name: Keep temporary validation runtime
+        if: github.ref == 'refs/heads/release/v0.9.0'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-runtime
+          path: ${{ runner.temp }}/playwright-browser.tar.gz
+          retention-days: 1
