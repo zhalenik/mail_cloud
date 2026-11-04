@@ -45,8 +45,19 @@ def write_json(path: Path, value) -> None:
             os.unlink(temporary)
 
 
+def _display_data(value):
+    """Keep internal observation evidence out of user-facing storage totals."""
+    if isinstance(value, dict):
+        return {key: _display_data(item) for key, item in value.items()
+                if not isinstance(key, str)
+                or not key.startswith(("existing_unlimited", "existing_regular", "existing_unknown"))}
+    if isinstance(value, (list, tuple)):
+        return [_display_data(item) for item in value]
+    return value
+
+
 def pretty(value) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2))
+    print(json.dumps(_display_data(value), ensure_ascii=False, indent=2))
 
 
 class Reporter:
@@ -305,7 +316,7 @@ def dispatch(args) -> int:
                     "last_run": queue.get_metadata("last_run"),
                     "last_auth": queue.get_metadata("last_auth"),
                     "errors": queue.list_jobs("failed", limit=100)}
-            write_json(args.output.expanduser().resolve(), data)
+            write_json(args.output.expanduser().resolve(), _display_data(data))
             print(f"Отчёт записан: {args.output}")
             return 0
         if args.command == "login":

@@ -1,6 +1,6 @@
 {
   "release": "0.9.0",
-  "checked_at_utc": "2026-11-04T22:08:27.441706+00:00",
+  "checked_at_utc": "2026-11-04T22:21:08.657621+00:00",
   "scope": "Installed wheel and offline local gates; the real container is separately gated in GitHub Actions before publication",
   "status": "passed",
   "environment": {
@@ -11,7 +11,7 @@
   },
   "application_tests": {
     "count": 757,
-    "seconds": 139.816,
+    "seconds": 150.023,
     "installed_isolated_import": true
   },
   "release_safeguard_tests": 19,
@@ -22,7 +22,7 @@
     "timezone_fallback_checked": true,
     "cli_entry_points_checked": true,
     "frozen_sources_match_installed_wheel": true,
-    "wheel_sha256": "4cb9745a8f54e5345a6705df5e3dd67caff5253662e2e239b440f7848c540091"
+    "wheel_sha256": "a6fba98596ce040102d91bb09b87fd362513cd84bc5ceaf928b3cc50f887b4c4"
   },
   "historical_upgrade_cases": 8,
   "browser_fixture_checks": 24,
@@ -55,7 +55,7 @@
     },
     {
       "path": "mailru_photos/cli.py",
-      "sha256": "1534718af600cbacf712a0ebfe1674ea7155fad665974511285b5db1590b4605"
+      "sha256": "59a3c1ef3ccb5e3abf6f8603ced74427ddf24270ffc4d957aa7d7c4b24b575d9"
     },
     {
       "path": "mailru_photos/content.py",

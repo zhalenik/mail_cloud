@@ -334,6 +334,10 @@ class CLITests(unittest.TestCase):
             self.assertFalse(status["last_scan"]["warning_allowed"])
             self.assertEqual(status["stats"]["pending"], 2)
             self.assertEqual(status["stats"]["total_bytes"], sum(map(len, before.values())))
+            self.assertIn("existing_total_count", status["stats"])
+            self.assertIn("transferred_unlimited_count", status["stats"])
+            self.assertFalse(any(key.startswith(("existing_unlimited", "existing_regular", "existing_unknown"))
+                                 for key in status["stats"]))
             self.assertIsNone(status["account"])
             with Queue(self.db, destination="/Archive") as queue:
                 self.assertEqual({row["remote_path"] for row in queue.list_jobs()}, {
@@ -341,6 +345,7 @@ class CLITests(unittest.TestCase):
                 })
                 job = queue.claim()
                 self.assertIsNotNone(job)
+                queue.set_metadata("last_run", {"stats": {"existing_regular_count": 1, "existing_total_count": 1}})
             self.assertEqual(json.loads(self.success("recover")), {"recovered": 1})
             recovered = json.loads(self.success("status"))
             self.assertEqual(recovered["stats"]["pending"], 2)
@@ -356,6 +361,9 @@ class CLITests(unittest.TestCase):
             self.assertEqual(report["destination"], "/Archive")
             self.assertEqual(report["stats"]["total"], 2)
             self.assertTrue(report["last_scan"]["complete"])
+            self.assertEqual(report["last_run"]["stats"], {"existing_total_count": 1})
+            self.assertFalse(any(key.startswith(("existing_unlimited", "existing_regular", "existing_unknown"))
+                                 for key in report["stats"]))
             self.assertNotIn(secret, report_text)
             self.assertNotIn("auth.dat", report_text)
         self.assertEqual({path: path.read_bytes() for path in before}, before)

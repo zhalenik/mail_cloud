@@ -1,12 +1,13 @@
 {
   "version": "0.9.0",
-  "checked_at": "2026-11-04T22:10:43.128876+00:00",
+  "checked_at": "2026-11-04T22:17:48.373896+00:00",
   "result": "passed",
   "scope": {
     "release_files_before_report": 105,
     "git_history": "all local refs",
     "binary_artifacts": "built wheel; Docker build context allowlist",
-    "personal_values_checked_in_current_tree": true
+    "personal_values_checked_in_current_tree": true,
+    "release_files_at_final_delta_check": 106
   },
   "gitleaks": {
     "version": "8.30.1",
@@ -67,7 +68,7 @@
   },
   "wheel": {
     "filename": "mailru_photo_client-0.9.0-py3-none-any.whl",
-    "sha256": "4cb9745a8f54e5345a6705df5e3dd67caff5253662e2e239b440f7848c540091",
+    "sha256": "a6fba98596ce040102d91bb09b87fd362513cd84bc5ceaf928b3cc50f887b4c4",
     "members": 31,
     "package_files_identical_to_source": 26,
     "runtime_secret_entries": [],
@@ -86,5 +87,13 @@
     "Container image layers were not inspected in this local gate. The repository build context is deny-by-default; the built wheel was inspected directly.",
     "Synthetic fixture values and generic private-network examples remain in tests and installation documentation; no personal values matched in the current release. Older Git history contains a formerly documented personal LAN address."
   ],
-  "runtime_state": "Private SMTP settings were not read, copied into the repository, or included in this report."
+  "runtime_state": "Private SMTP settings were not read, copied into the repository, or included in this report.",
+  "final_delta_review": {
+    "files": [
+      "mailru_photos/cli.py",
+      "tests/test_cli.py"
+    ],
+    "result": "passed",
+    "summary": "Display-only recursive removal of unsupported existing-file storage counters; totals and verified transfer counters are preserved."
+  }
 }
