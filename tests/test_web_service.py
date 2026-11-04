@@ -330,6 +330,9 @@ class WebServiceTests(unittest.TestCase):
 
     def test_failed_run_rejection_updates_auth_indicator_and_stales_quota(self):
         self.photos_count(2)
+        # The exact pending count assumes no second in-flight request when the
+        # first rejects authentication; parallel cancellation is tested separately.
+        self.service.settings(workers=1)
         self.service.scan(); self.done()
         first = self.service.jobs()['jobs'][0]
         self.cloud.failures[Path(first['local_path']).name] = [RemoteError(403)]

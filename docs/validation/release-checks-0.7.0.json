@@ -1,0 +1,51 @@
+{
+  "version": "0.7.0",
+  "checked_at": "2026-11-04T01:15:20.657609+00:00",
+  "installed_package_tests": {
+    "count": 543,
+    "result": "passed",
+    "seconds": 41.957
+  },
+  "publication_guard_tests": {
+    "count": 19,
+    "result": "passed"
+  },
+  "wheel_metadata_static_assets_and_entry_points": "passed",
+  "timezone_fallback_without_system_TZPATH": "passed",
+  "historical_upgrade_versions": [
+    "0.4.3",
+    "0.4.4",
+    "0.5.0",
+    "0.5.1",
+    "0.5.2",
+    "0.6.0"
+  ],
+  "target_schema": 4,
+  "chromium_mock_scenarios": 19,
+  "chromium_real_backend_scenarios": 12,
+  "chromium_real_backend_http_requests": 37,
+  "real_container_smoke": "required in GitHub CI before publication",
+  "live_mail_account_tested": false,
+  "user_truenas_instance_tested": false,
+  "source_sha256": {
+    "mailru_photos/__init__.py": "02cb54131f5387d419de26f89b3794bc3f754b0c908b159c5e4280acc83eae94",
+    "mailru_photos/__main__.py": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d",
+    "mailru_photos/api.py": "18e9fd4072d4e2d59cbf552f216c8d36fe9780f35c6b537895f00be87eaf1e2c",
+    "mailru_photos/auth.py": "5724d875199a2e5950370f9a220ba2470761b248c743ebcfa3a3c922b08c4127",
+    "mailru_photos/cli.py": "a56c180b400f1a19d7759e7583862406c8e86e9e3bf93ab20910feaabfaae1eb",
+    "mailru_photos/content.py": "169a51b7f0504fb2222b7db3787a6790869ace54d12fb6f46a373d406d661158",
+    "mailru_photos/deletion.py": "88ed9199ce290ec2b72e531475121b8660a27a0cf8b028d28395719962156e2e",
+    "mailru_photos/media.py": "25b4550ae8e4d391386e42fba1068f5c8291fdf2bdebc89f3f2ef6b834bcd00b",
+    "mailru_photos/metadata.py": "dea176d70324f82b6d10825ebc2e11f983a6c3f823cb690aacd60873d8c829ee",
+    "mailru_photos/queue.py": "2c8631aa5a797623ba832dfcc49b4d09fc0bf733880c1132b5527de034b5ef4e",
+    "mailru_photos/reconcile.py": "2b369c054bd9cd75c1fdebdd8954067c674aed101c0ef0c79ee31fd6fd722f3f",
+    "mailru_photos/runner.py": "74e77d29c8d22e71c9f60f7e49027eb0680bac2b9397874b46a3e813571825a4",
+    "mailru_photos/scheduler.py": "a0c7b654c300e4164c03e87987901b687f0319d03c7bc9b7d2f90fb1dc4d81b0",
+    "mailru_photos/transport.py": "758ec704f2990917326be0e4f8bad0a5476c95d2ff8e1351f331e57fa8716561",
+    "mailru_photos/web.py": "980d276eabc91da4985c3d4eafcadb22571294f52ed4abb6525a918125ed46d2",
+    "mailru_photos/web_service.py": "816fab3b044b082741cf7fab0a79ea57bcb6e2888b60aeb61591e7365973b8d7",
+    "mailru_photos/web_static/app.js": "efda9e61812cc3307c964126552ecf28828c8ac312c94ef101582f074346c028",
+    "mailru_photos/web_static/index.html": "bf43fb430a429a37ec819e4c20dad7b43c2b9160757c7a1ddb8765c7c1d374c2",
+    "mailru_photos/web_static/style.css": "90084457827712844417703340db5d8a55ec18e8e47902f23c0b42f3c845d4a8"
+  }
+}
