@@ -44,7 +44,7 @@ def _observation(value: Mapping[str, Any], path: str) -> tuple[int, str]:
 
 
 def reconcile(queue: Queue, api: Any, *, stop: threading.Event,
-              progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+              progress: Callable[[dict[str, Any]], None] | None = None, root_ids=None) -> dict[str, Any]:
     """Compare eligible tasks in bounded pages and mark exact existing matches.
 
     Only ``api.stat(path)`` performs network operations. File reads are streamed
@@ -91,7 +91,7 @@ def reconcile(queue: Queue, api: Any, *, stop: threading.Event,
             if stop.is_set():
                 summary["cancelled"] = True
                 break
-            candidates = queue.reconcile_candidates(after_id=after_id, limit=_BATCH_SIZE)
+            candidates = queue.reconcile_candidates(after_id=after_id, limit=_BATCH_SIZE, root_ids=root_ids)
             if not candidates:
                 break
             for candidate in candidates:

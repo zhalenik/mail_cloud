@@ -15,6 +15,7 @@ import contextlib
 import dataclasses
 import errno
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import sqlite3
 import stat
 import threading
 import time
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import unicodedata
 import uuid
 
@@ -54,6 +55,7 @@ _SCHEMA_OBJECTS = frozenset({
     ("index", "jobs_current_created"), ("index", "jobs_current_status_created"),
     ("index", "jobs_paused_created"), ("index", "jobs_observed_created"),
     ("index", "cloud_observations_job"), ("index", "cloud_observations_origin"),
+    ("index", "jobs_pending_root"), ("index", "jobs_retry_root"), ("index", "jobs_reconcile_root"),
 })
 _JOB_SUMMARY_COLUMNS = (
     "id,root_id,relative_path,local_path,remote_path,status,size,attempts,present,"
@@ -186,6 +188,7 @@ class ScanResult:
     seconds: float = 0.0
     complete: bool = False
     cancelled: bool = False
+    root_ids: list[int] | None = None
 
     def error(self, message: str) -> None:
         self.error_count += 1
@@ -319,7 +322,7 @@ class Queue:
             if (has_schema and schema_version == SCHEMA_VERSION and existing is not None and not needs_account
                     and self._get_meta("_media_policy_version") == MEDIA_POLICY_VERSION):
                 return
-        with self._transaction():
+        with self._schema_upgrade_backup(schema_version, has_jobs=("table", "jobs") in objects), self._transaction():
             # A second first-opener may have migrated while this one waited.
             schema_version = self._db.execute("PRAGMA user_version").fetchone()[0]
             if schema_version not in (0, 1, 2, 3, SCHEMA_VERSION):
@@ -370,6 +373,59 @@ class Queue:
             self._create_queue_indexes()
             if schema_version != SCHEMA_VERSION:
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    @contextlib.contextmanager
+    def _schema_upgrade_backup(self, version: int, *, has_jobs: bool) -> Iterator[None]:
+        """Keep a consistent old-schema queue before the first upgrade write.
+
+        SQLite backup includes committed WAL pages and produces a standalone
+        rollback file. It cannot run from inside our own write transaction.
+        The advisory lock serializes upgrade openers and is released on death.
+        Initialized current-schema read connections never enter this path.
+        """
+        if version >= SCHEMA_VERSION or not has_jobs:
+            yield
+            return
+        with _file_lock(self.path + ".schema-upgrade.lock"):
+            current = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if current < SCHEMA_VERSION:
+                self._save_schema_backup(current)
+            yield
+
+    def _save_schema_backup(self, version: int) -> Path:
+        folder = Path(self.path).parent / "backups"
+        destination = folder / (f"{Path(self.path).stem}-schema{version}-before{SCHEMA_VERSION}-"
+                                f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}.sqlite3")
+        created = False
+        try:
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            created = True
+            os.close(descriptor)
+            with contextlib.closing(sqlite3.connect(str(destination), timeout=30, isolation_level=None)) as backup:
+                self._db.backup(backup, pages=1024)
+                # A WAL-mode source must still yield one restorable file.
+                backup.execute("PRAGMA journal_mode=DELETE")
+                if backup.execute("PRAGMA user_version").fetchone()[0] != version:
+                    raise sqlite3.DatabaseError("Source schema changed while its backup was being created")
+            with destination.open("rb") as saved:
+                os.fsync(saved.fileno())
+            if os.name == "posix":
+                directory = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            return destination
+        except (OSError, sqlite3.Error) as error:
+            if created:
+                # Only this newly reserved, incomplete copy may be removed.
+                with contextlib.suppress(OSError):
+                    destination.unlink()
+            raise QueueConfigurationError(
+                "Не удалось сохранить резервную копию очереди перед обновлением схемы. "
+                "Обновление отменено; проверьте свободное место и права на каталог состояния."
+            ) from error
 
     def _create_core_schema(self) -> None:
         # execute(), not executescript(): Python's executescript implicitly
@@ -573,6 +629,10 @@ class Queue:
             "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND planned_mode='unlimited'",
             "CREATE INDEX IF NOT EXISTS jobs_retry_regular ON jobs(next_attempt,id) "
             "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL AND planned_mode='regular'",
+            "CREATE INDEX IF NOT EXISTS jobs_pending_root ON jobs(root_id,planned_mode,id) "
+            "WHERE status='pending' AND present=1 AND paused=0 AND remove_requested=0",
+            "CREATE INDEX IF NOT EXISTS jobs_retry_root ON jobs(root_id,planned_mode,next_attempt,id) "
+            "WHERE status='failed' AND present=1 AND paused=0 AND remove_requested=0 AND next_attempt IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS jobs_root_scan ON jobs(root_id,seen_scan)",
             "CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,id)",
             "CREATE INDEX IF NOT EXISTS jobs_current ON jobs(id) WHERE present=1",
@@ -590,6 +650,8 @@ class Queue:
             "CREATE INDEX IF NOT EXISTS cloud_observations_job ON cloud_observations(job_id)",
             "CREATE INDEX IF NOT EXISTS cloud_observations_origin ON cloud_observations(origin_job_id)",
             "CREATE INDEX IF NOT EXISTS jobs_reconcile ON jobs(id) WHERE present=1 AND paused=0 AND remove_requested=0 "
+            "AND status IN ('pending','failed') AND cloud_present=0 AND size>0",
+            "CREATE INDEX IF NOT EXISTS jobs_reconcile_root ON jobs(root_id,id) WHERE present=1 AND paused=0 AND remove_requested=0 "
             "AND status IN ('pending','failed') AND cloud_present=0 AND size>0",
         )
         for statement in statements:
@@ -1060,6 +1122,29 @@ class Queue:
             return [Root(r["id"], r["path"], r["alias"], r["remote_prefix"])
                     for r in self._db.execute("SELECT * FROM roots ORDER BY id")]
 
+    def _selected_root_ids(self, root_ids: Sequence[int] | None) -> tuple[int, ...] | None:
+        """Validate a bounded explicit scope; None keeps the global operation."""
+        if root_ids is None:
+            return None
+        if (not isinstance(root_ids, Sequence) or isinstance(root_ids, (str, bytes))
+                or not 1 <= len(root_ids) <= 500
+                or any(type(value) is not int or not 0 < value < 2**63 for value in root_ids)):
+            raise ValueError("root_ids must be a nonempty sequence of at most 500 positive source IDs")
+        selected = tuple(sorted(set(root_ids)))
+        with self._mutex:
+            found = {row[0] for row in self._db.execute(
+                "SELECT id FROM roots WHERE id IN (" + ",".join("?" for _ in selected) + ")", selected,
+            )}
+        if found != set(selected):
+            raise QueueConfigurationError("Unknown source roots: " + ", ".join(str(value) for value in selected if value not in found))
+        return selected
+
+    @staticmethod
+    def _root_filter(root_ids: tuple[int, ...] | None) -> tuple[str, tuple[int, ...]]:
+        if root_ids is None:
+            return "1", ()
+        return "root_id IN (" + ",".join("?" for _ in root_ids) + ")", root_ids
+
     def _walk_files(self, root: Root, extensions: frozenset[str], result: ScanResult,
                     stop: threading.Event | None = None) -> Iterator[tuple]:
         directories = [root.path]
@@ -1097,8 +1182,9 @@ class Queue:
 
     def scan(self, extensions: Iterable[str] | None = None, *, batch_size: int = 500,
              stop: threading.Event | None = None,
-             progress: Callable[[ScanResult], None] | None = None) -> ScanResult:
-        """Stream all registered roots; never hold the complete file list in RAM.
+             progress: Callable[[ScanResult], None] | None = None,
+             root_ids: Sequence[int] | None = None) -> ScanResult:
+        """Stream selected roots; never hold the complete file list in RAM.
 
         A successful root scan prunes disappeared/excluded pending work.  A
         partial or interrupted scan never prunes unseen rows.  No claims can be
@@ -1107,7 +1193,8 @@ class Queue:
         if batch_size < 1 or batch_size > 10000:
             raise ValueError("batch_size must be in 1..10000")
         selected = MEDIA_EXTENSIONS if extensions is None else _normalize_extensions(extensions)
-        result = ScanResult()
+        selected_roots = self._selected_root_ids(root_ids)
+        result = ScanResult(root_ids=list(selected_roots) if selected_roots is not None else None)
         started = time.monotonic()
         last_progress = started
         token = uuid.uuid4().hex
@@ -1115,7 +1202,9 @@ class Queue:
             with self._transaction():
                 if self._db.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone():
                     raise QueueBusyError("Pause/finish uploads or recover interrupted claims before scanning.")
-                sources = self.roots()
+                # Recheck under the writer lock before beginning this scope.
+                selected_roots = self._selected_root_ids(selected_roots)
+                sources = [root for root in self.roots() if selected_roots is None or root.id in selected_roots]
                 if not sources:
                     raise QueueConfigurationError("Register at least one source root before scanning.")
                 # We own the OS lock, so an old token left by a killed scanner
@@ -1297,9 +1386,42 @@ class Queue:
             row["storage_mode"], row["planned_mode"], row["planned_reason"],
         )
 
+    def _scoped_ready(self, root_ids: tuple[int, ...], *, storage_mode: str | None,
+                      now: float, max_attempts: int | None, stop: threading.Event | None) -> sqlite3.Row | None:
+        """Merge at most two indexed candidates per selected source.
+
+        Ordering an IN(root_ids) result by id would sort every eligible row
+        on each claim. Separate equality seeks keep this independent of the
+        number of tasks in both selected and unrelated source directories.
+        """
+        modes = _STORAGE_MODES if storage_mode is None else (storage_mode,)
+        for state in ("failed", "pending"):
+            retry = state == "failed"
+            index = "jobs_retry_root" if retry else "jobs_pending_root"
+            retry_clause = " AND next_attempt IS NOT NULL AND next_attempt<=?" if retry else ""
+            order = "next_attempt,id" if retry else "id"
+            best = best_key = None
+            for root_id in root_ids:
+                for mode in modes:
+                    if stop is not None and stop.is_set():
+                        return None
+                    parameters = (root_id, mode) + ((now,) if retry else ()) + (max_attempts, max_attempts)
+                    row = self._db.execute(
+                        f"SELECT * FROM jobs INDEXED BY {index} WHERE status='{state}' AND present=1 "
+                        "AND paused=0 AND remove_requested=0 AND root_id=? AND planned_mode=?"
+                        f"{retry_clause} AND (? IS NULL OR attempts<?) ORDER BY {order} LIMIT 1", parameters,
+                    ).fetchone()
+                    if row is not None:
+                        key = (row["next_attempt"], row["id"]) if retry else (row["id"],)
+                        if best is None or key < best_key:
+                            best, best_key = row, key
+            if best is not None:
+                return best
+        return None
+
     def claim(self, *, now: float | None = None, max_attempts: int | None = None,
               storage_mode: str | None = None, stop: threading.Event | None = None,
-              job_id: int | None = None) -> Job | None:
+              job_id: int | None = None, root_ids: Sequence[int] | None = None) -> Job | None:
         """Claim one ready file and validate the local snapshot before returning.
 
         None means no work is *currently* ready or the supplied stop is set,
@@ -1310,6 +1432,8 @@ class Queue:
             raise ValueError("max_attempts must be positive")
         if job_id is not None and (type(job_id) is not int or job_id < 1):
             raise ValueError("job_id must be a positive integer or None")
+        selected_roots = self._selected_root_ids(root_ids)
+        root_filter, root_parameters = self._root_filter(selected_roots)
         partition = _size_partition(storage_mode)
         pending_index = "jobs_pending" if storage_mode is None else f"jobs_pending_{storage_mode}"
         retry_index = " INDEXED BY jobs_retry" if storage_mode is None else f" INDEXED BY jobs_retry_{storage_mode}"
@@ -1332,9 +1456,12 @@ class Queue:
                     row = self._db.execute(
                         "SELECT * FROM jobs WHERE id=? AND present=1 AND paused=0 AND remove_requested=0 "
                         "AND (status='pending' OR (status='failed' AND next_attempt IS NOT NULL AND next_attempt<=?)) "
-                        f"AND {partition} AND (? IS NULL OR attempts<?)",
-                        (job_id, current, max_attempts, max_attempts),
+                        f"AND {partition} AND {root_filter} AND (? IS NULL OR attempts<?)",
+                        (job_id, current, *root_parameters, max_attempts, max_attempts),
                     ).fetchone()
+                elif selected_roots is not None:
+                    row = self._scoped_ready(selected_roots, storage_mode=storage_mode, now=current,
+                                             max_attempts=max_attempts, stop=stop)
                 else:
                     row = self._db.execute(
                         f"SELECT * FROM jobs{retry_index} WHERE status='failed' AND present=1 "
@@ -1790,7 +1917,7 @@ class Queue:
             )
             self._finalize_control(job.id)
 
-    def apply_regular_policy(self, upload: bool) -> dict[str, int]:
+    def apply_regular_policy(self, upload: bool, *, root_ids: Sequence[int] | None = None) -> dict[str, int]:
         """Reversibly park files planned for quota storage when it is disabled.
 
         Completed work, live workers, permanent errors, existing cloud
@@ -1799,6 +1926,8 @@ class Queue:
         """
         if type(upload) is not bool:
             raise ValueError("upload must be a boolean")
+        selected_roots = self._selected_root_ids(root_ids)
+        root_filter, root_parameters = self._root_filter(selected_roots)
         codes = "('regular_size_disabled','regular_format_disabled','large_files_disabled')"
         now = time.time()
         with self._transaction():
@@ -1807,8 +1936,8 @@ class Queue:
                 "last_error=NULL,skip_reason=NULL,updated_at=? WHERE present=1 AND remove_requested=0 "
                 "AND cloud_present=0 AND status='skipped' "
                 f"AND (skip_reason IN {codes} OR (skip_reason='manual' AND last_error=?)) "
-                "AND (? OR planned_mode='unlimited')",
-                (now, _LEGACY_LARGE_FILE_ERROR, int(upload)),
+                f"AND (? OR planned_mode='unlimited') AND {root_filter}",
+                (now, _LEGACY_LARGE_FILE_ERROR, int(upload), *root_parameters),
             ).rowcount
             skipped = 0
             if not upload:
@@ -1818,9 +1947,10 @@ class Queue:
                     "ELSE 'regular_format_disabled' END,"
                     "last_error=CASE WHEN planned_reason='size_limit' THEN ? ELSE ? END "
                     "WHERE present=1 AND remove_requested=0 AND cloud_present=0 AND planned_mode='regular' "
-                    "AND (status='pending' OR (status='failed' AND next_attempt IS NOT NULL))",
+                    f"AND (status='pending' OR (status='failed' AND next_attempt IS NOT NULL)) AND {root_filter}",
                     (now, "Файл больше 2 ГБ; загрузка в хранилище с квотой отключена.",
-                     "Формат не входит в подтверждённый клиентом список; загрузка в хранилище с квотой отключена."),
+                     "Формат не входит в подтверждённый клиентом список; загрузка в хранилище с квотой отключена.",
+                     *root_parameters),
                 ).rowcount
             return {"skipped": skipped, "resumed": resumed}
 
@@ -1896,7 +2026,8 @@ class Queue:
                 (time.time(), int(include_permanent)),
             ).rowcount
 
-    def reconcile_candidates(self, *, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+    def reconcile_candidates(self, *, after_id: int = 0, limit: int = 500,
+                             root_ids: Sequence[int] | None = None) -> list[dict[str, Any]]:
         """One bounded keyset page for an optional, read-only cloud comparison.
 
         No upload claims are created. The reconciliation pass owns the run
@@ -1904,8 +2035,38 @@ class Queue:
         """
         if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("after_id must be nonnegative and limit must be in 1..500")
+        selected_roots = self._selected_root_ids(root_ids)
         with self._mutex:
             self._require_idle_sources()
+            if selected_roots is not None:
+                # Merge streaming root cursors rather than fetching a full
+                # page from every source. Memory is bounded by root count
+                # plus the requested page, and unrelated rows are never read.
+                cursors, heads, result = [], [], []
+                try:
+                    for root_id in selected_roots:
+                        cursor = self._db.execute(
+                            "SELECT id,root_id,relative_path,local_path,remote_path,size,mtime_ns,device,inode "
+                            "FROM jobs INDEXED BY jobs_reconcile_root WHERE root_id=? AND id>? "
+                            "AND present=1 AND paused=0 AND remove_requested=0 AND status IN ('pending','failed') "
+                            "AND cloud_present=0 AND size>0 "
+                            "AND NOT EXISTS (SELECT 1 FROM commit_intents WHERE job_id=jobs.id) ORDER BY id LIMIT ?",
+                            (root_id, after_id, limit),
+                        )
+                        cursors.append(cursor)
+                        row = cursor.fetchone()
+                        if row is not None:
+                            heapq.heappush(heads, (row["id"], len(cursors) - 1, row))
+                    while heads and len(result) < limit:
+                        _, index, row = heapq.heappop(heads)
+                        result.append(dict(row))
+                        row = cursors[index].fetchone()
+                        if row is not None:
+                            heapq.heappush(heads, (row["id"], index, row))
+                    return result
+                finally:
+                    for cursor in cursors:
+                        cursor.close()
             return [dict(row) for row in self._db.execute(
                 "SELECT id,root_id,relative_path,local_path,remote_path,size,mtime_ns,device,inode "
                 "FROM jobs INDEXED BY jobs_reconcile WHERE id>? AND present=1 AND paused=0 AND remove_requested=0 "
@@ -1964,32 +2125,40 @@ class Queue:
             return True
 
     def stats(self, *, now: float | None = None, storage_mode: str | None = None,
-              include_missing: bool = False) -> dict[str, Any]:
+              include_missing: bool = False, root_ids: Sequence[int] | None = None) -> dict[str, Any]:
         current = time.time() if now is None else now
-        partition = _size_partition(storage_mode)
+        selected_roots = self._selected_root_ids(root_ids)
+        root_filter, root_parameters = self._root_filter(selected_roots)
+        partition = _size_partition(storage_mode) + " AND " + root_filter
         selected = partition if include_missing else partition + " AND present=1"
+        # The generic status/retry index can look cheaper to SQLite even
+        # when virtually every matching status belongs to another source.
+        # A scheduled source summary must visit only its selected roots,
+        # including permanent errors, future retries and adopted files.
+        source = "jobs INDEXED BY jobs_root_scan" if selected_roots is not None else "jobs"
         with self._mutex:
             counts = {state: 0 for state in STATES}
             sizes = {state: 0 for state in STATES}
             for row in self._db.execute(
-                f"SELECT status,COUNT(*) AS n,COALESCE(SUM(size),0) AS bytes FROM jobs WHERE {selected} GROUP BY status"
+                f"SELECT status,COUNT(*) AS n,COALESCE(SUM(size),0) AS bytes FROM {source} WHERE {selected} GROUP BY status",
+                root_parameters,
             ):
                 counts[row["status"]] = row["n"]
                 sizes[row["status"]] = row["bytes"]
             ready = self._db.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE {partition} AND present=1 AND paused=0 AND remove_requested=0 AND (status='pending' OR "
-                "(status='failed' AND next_attempt IS NOT NULL AND next_attempt<=?))", (current,),
+                f"SELECT COUNT(*) FROM {source} WHERE {partition} AND present=1 AND paused=0 AND remove_requested=0 AND (status='pending' OR "
+                "(status='failed' AND next_attempt IS NOT NULL AND next_attempt<=?))", (*root_parameters, current),
             ).fetchone()[0]
             next_retry = self._db.execute(
-                f"SELECT MIN(next_attempt) FROM jobs WHERE {partition} AND status='failed' AND present=1 "
+                f"SELECT MIN(next_attempt) FROM {source} WHERE {partition} AND status='failed' AND present=1 "
                 "AND paused=0 AND remove_requested=0 AND next_attempt>?",
-                (current,),
+                (*root_parameters, current),
             ).fetchone()[0]
             permanent = self._db.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE {selected} AND status='failed' AND next_attempt IS NULL"
+                f"SELECT COUNT(*) FROM {source} WHERE {selected} AND status='failed' AND next_attempt IS NULL", root_parameters,
             ).fetchone()[0]
             existing = self._db.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE {selected} AND status='skipped' AND skip_reason='remote_exists'"
+                f"SELECT COUNT(*) FROM {source} WHERE {selected} AND status='skipped' AND skip_reason='remote_exists'", root_parameters,
             ).fetchone()[0]
             controls = self._db.execute(
                 f"SELECT COALESCE(SUM(paused),0) AS paused,COALESCE(SUM(remove_requested),0) AS removing,"
@@ -1998,7 +2167,8 @@ class Queue:
                 "COALESCE(SUM(CASE WHEN status IN ('uploaded','skipped') OR "
                 "(status='failed' AND next_attempt IS NULL) THEN 1 ELSE 0 END),0) AS processed,"
                 "COALESCE(SUM(CASE WHEN status IN ('uploaded','skipped') OR "
-                f"(status='failed' AND next_attempt IS NULL) THEN size ELSE 0 END),0) AS processed_bytes FROM jobs WHERE {selected}"
+                f"(status='failed' AND next_attempt IS NULL) THEN size ELSE 0 END),0) AS processed_bytes FROM {source} WHERE {selected}",
+                root_parameters,
             ).fetchone()
             # Planned bytes represent transfers still to do. A failed task
             # with an accepted cloud object belongs only to observed totals,
@@ -2020,7 +2190,7 @@ class Queue:
                         f"THEN {amount} ELSE 0 END),0) AS uploaded_{mode}_{suffix}"
                     )
             storage = dict(self._db.execute(
-                "SELECT " + ",".join(expressions) + f" FROM jobs WHERE {selected}",
+                "SELECT " + ",".join(expressions) + f" FROM {source} WHERE {selected}", root_parameters,
             ).fetchone())
             for suffix in ("count", "bytes"):
                 storage[f"uploaded_total_{suffix}"] = sum(storage[f"uploaded_{mode}_{suffix}"] for mode in _OBSERVED_MODES)
@@ -2030,7 +2200,8 @@ class Queue:
                 "ready": ready, "permanent_failures": permanent, "next_retry_at": next_retry,
                 "existing": existing,
                 "scan_active": bool(self._get_meta("_scan_token")),
-                "roots": self._db.execute("SELECT COUNT(*) FROM roots").fetchone()[0],
+                "roots": (len(selected_roots) if selected_roots is not None
+                          else self._db.execute("SELECT COUNT(*) FROM roots").fetchone()[0]),
                 **dict(controls), **storage,
             }
 

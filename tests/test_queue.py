@@ -7,6 +7,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -991,7 +992,8 @@ class QueueTests(unittest.TestCase):
     def schema_two_controls_fixture(self):
         self.queue._db.execute("DROP TABLE commit_evidence")
         for name in ("jobs_pending", "jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry",
-                     "jobs_retry_unlimited", "jobs_retry_regular", "jobs_paused", "jobs_paused_created", "jobs_reconcile"):
+                     "jobs_retry_unlimited", "jobs_retry_regular", "jobs_paused", "jobs_paused_created", "jobs_reconcile",
+                     "jobs_pending_root", "jobs_retry_root", "jobs_reconcile_root"):
             self.queue._db.execute(f"DROP INDEX {name}")
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN paused")
         self.queue._db.execute("ALTER TABLE jobs DROP COLUMN remove_requested")
@@ -2354,7 +2356,7 @@ class QueueTests(unittest.TestCase):
         self.queue._db.execute("DROP TABLE cloud_observations")
         for name in ("jobs_pending_unlimited", "jobs_pending_regular", "jobs_retry_unlimited", "jobs_retry_regular",
                      "jobs_reconcile", "jobs_current_created", "jobs_current_status_created", "jobs_paused_created",
-                     "jobs_observed_created"):
+                     "jobs_observed_created", "jobs_pending_root", "jobs_retry_root", "jobs_reconcile_root"):
             self.queue._db.execute(f"DROP INDEX {name}")
         for column in ("planned_mode", "planned_reason", "observed_mode", "cloud_present", "cloud_path", "cloud_hash",
                        "cloud_size", "cloud_verified", "cloud_observed_at", "cloud_deleted_at"):
@@ -2414,6 +2416,233 @@ class QueueTests(unittest.TestCase):
         with Queue(self.db, destination="/Archive") as upgraded:
             self.assertEqual(upgraded.stats()["uploaded_unlimited_count"], 1)
             self.assertEqual(len(upgraded.cloud_history(job.id)), 1)
+
+    def test_schema_upgrade_keeps_standalone_old_queue_backup_with_committed_wal_receipts(self):
+        self.photo("completed.jpg")
+        self.photo("pending.jpg")
+        self.queue.scan()
+        job = self.queue.claim()
+        self.queue.mark_uploaded(job, remote_hash="A" * 40, verified_metadata={"is_unlim_upload": True})
+        pending = self.queue.claim()
+        self.queue.save_commit_intent(pending, "B" * 40)
+        self.queue.release(pending)
+        self.schema_three_policy_fixture()
+        with Queue(self.db, destination="/Archive") as upgraded:
+            copies = list((self.base / "backups").glob("queue-schema3-before4-*.sqlite3"))
+            self.assertEqual(len(copies), 1)
+            with sqlite3.connect(copies[0]) as backup:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(backup.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+                self.assertEqual(backup.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
+                self.assertEqual(backup.execute("SELECT remote_hash FROM upload_results").fetchone()[0], "A" * 40)
+                self.assertEqual(backup.execute("SELECT cloud_hash FROM commit_intents").fetchone()[0], "B" * 40)
+                self.assertNotIn("planned_mode", {row[1] for row in backup.execute("PRAGMA table_info(jobs)")})
+                self.assertEqual(backup.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+            self.assertFalse(Path(str(copies[0]) + "-wal").exists())
+            if os.name == "posix":
+                self.assertEqual(copies[0].stat().st_mode & 0o777, 0o600)
+            data_version = upgraded._db.execute("PRAGMA data_version").fetchone()[0]
+            with Queue(self.db, destination="/Archive") as reopened:
+                self.assertEqual(reopened._db.total_changes, 0)
+            self.assertEqual(upgraded._db.execute("PRAGMA data_version").fetchone()[0], data_version)
+            self.assertEqual(list((self.base / "backups").glob("queue-schema3-before4-*.sqlite3")), copies)
+
+    def test_failed_backup_prevents_any_schema_upgrade_and_leaves_no_partial_copy(self):
+        self.photo()
+        self.queue.scan()
+        self.schema_three_policy_fixture()
+        original_connect = sqlite3.connect
+        def no_space(path, *args, **kwargs):
+            if Path(path).parent.name == "backups":
+                raise sqlite3.OperationalError("disk full in offline backup fixture")
+            return original_connect(path, *args, **kwargs)
+        with patch("mailru_photos.queue.sqlite3.connect", side_effect=no_space), self.assertRaises(QueueConfigurationError):
+            Queue(self.db, destination="/Archive")
+        self.assertEqual(self.queue._db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertNotIn("planned_mode", {row["name"] for row in self.queue._db.execute("PRAGMA table_info(jobs)")})
+        self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+        self.assertEqual(list((self.base / "backups").glob("*.sqlite3")), [])
+        with Queue(self.db, destination="/Archive") as upgraded:
+            self.assertEqual(upgraded.stats()["pending"], 1)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 4)
+
+    def test_scoped_scan_never_prunes_or_discovers_unselected_sources(self):
+        second = self.base / "second-source"
+        second.mkdir()
+        root = self.queue.add_root(second, "second")
+        selected_old = self.photo("old.jpg")
+        other_old = self.photo("other-old.jpg", root=second)
+        full = self.queue.scan()
+        self.assertIsNone(asdict(full)["root_ids"])
+        other_id = next(row["id"] for row in self.queue.list_jobs() if row["root_id"] == root.id)
+        before = self.queue.get_job(other_id)
+        selected_old.unlink()
+        other_old.unlink()
+        self.photo("selected-new.jpg")
+        self.photo("unselected-new.jpg", root=second)
+        partial = self.queue.scan(root_ids=[1, 1])
+        self.assertEqual((partial.added, partial.missing, partial.seen), (1, 1, 1))
+        self.assertTrue(partial.complete)
+        self.assertEqual(asdict(partial)["root_ids"], [1])
+        self.assertEqual(self.queue.get_job(other_id), before)
+        self.assertNotIn("unselected-new.jpg", {row["relative_path"] for row in self.queue.list_jobs()})
+        later = self.queue.scan(root_ids=[root.id])
+        self.assertEqual((later.added, later.missing, later.seen), (1, 1, 1))
+        self.assertEqual({row["relative_path"] for row in self.queue.list_jobs()},
+                         {"selected-new.jpg", "unselected-new.jpg"})
+        record = self.queue._db.execute("SELECT result_json FROM scans WHERE id=?", (partial.scan_id,)).fetchone()[0]
+        self.assertEqual(json.loads(record)["root_ids"], [1])
+
+    def test_scoped_claim_and_stats_preserve_other_sources_and_single_task_boundary(self):
+        second = self.base / "second-source"
+        second.mkdir()
+        root = self.queue.add_root(second, "second")
+        self.photo("outside.jpg", b"outside")
+        self.photo("inside.jpg", b"photo", root=second)
+        self.photo("inside.m4v", b"video", root=second)
+        self.queue.scan()
+        rows = {row["relative_path"]: row for row in self.queue.list_jobs()}
+        outside = rows["outside.jpg"]
+        self.assertIsNone(self.queue.claim(job_id=outside["id"], root_ids=[root.id]))
+        job = self.queue.claim(now=100, storage_mode="unlimited", root_ids=[root.id])
+        self.assertEqual(job.id, rows["inside.jpg"]["id"])
+        self.queue.mark_failed(job, "retry later", retry_delay=30, now=100)
+        scoped = self.queue.stats(now=110, root_ids=[root.id])
+        self.assertEqual((scoped["total"], scoped["roots"], scoped["ready"], scoped["next_retry_at"]), (2, 1, 1, 130))
+        next_job = self.queue.claim(now=110, root_ids=[root.id])
+        self.assertEqual(next_job.id, rows["inside.m4v"]["id"])
+        self.queue.mark_uploaded(next_job, remote_hash="B" * 40, verified_metadata={"storage_mode": "regular"})
+        retry = self.queue.claim(now=150, root_ids=[root.id])
+        self.assertEqual(retry.id, job.id)
+        self.queue.mark_uploaded(retry, remote_hash="A" * 40)
+        self.assertEqual(self.queue.get_job(outside["id"]), outside)
+        scoped = self.queue.stats(root_ids=[root.id])
+        self.assertEqual((scoped["total"], scoped["uploaded"], scoped["uploaded_total_bytes"]), (2, 2, 10))
+        self.assertEqual(scoped["planned_unlimited_count"], 0)
+        self.assertEqual(self.queue.stats(root_ids=[1])["pending"], 1)
+        self.assertEqual(self.queue.stats()["total"], 3)
+
+    def test_scoped_regular_policy_and_reconcile_do_not_touch_unselected_tasks(self):
+        second = self.base / "second-source"
+        second.mkdir()
+        root = self.queue.add_root(second, "second")
+        self.photo("outside.m4v")
+        self.photo("inside.m4v", root=second)
+        self.photo("inside.jpg", root=second)
+        self.queue.scan()
+        before = next(row for row in self.queue.list_jobs() if row["root_id"] == 1)
+        self.assertEqual(self.queue.apply_regular_policy(False, root_ids=[root.id]), {"skipped": 1, "resumed": 0})
+        self.assertEqual(self.queue.get_job(before["id"]), before)
+        self.assertEqual(self.queue.stats(root_ids=[root.id])["planned_regular_count"], 1)
+        candidates = self.queue.reconcile_candidates(root_ids=[root.id])
+        self.assertEqual([row["relative_path"] for row in candidates], ["inside.jpg"])
+        self.assertEqual(self.queue.apply_regular_policy(True, root_ids=[root.id]), {"skipped": 0, "resumed": 1})
+        candidates = self.queue.reconcile_candidates(root_ids=[root.id, 1], limit=1)
+        gathered = []
+        while candidates:
+            gathered.extend(candidates)
+            candidates = self.queue.reconcile_candidates(root_ids=[root.id, 1], after_id=candidates[-1]["id"], limit=1)
+        self.assertEqual([row["id"] for row in gathered], sorted(row["id"] for row in self.queue.list_jobs()))
+        self.assertEqual(self.queue.get_job(before["id"]), before)
+
+    def test_scoped_operations_reject_empty_invalid_or_missing_source_ids_without_mutation(self):
+        self.photo()
+        self.queue.scan()
+        before = self.queue.list_jobs()
+        operations = (self.queue.scan, self.queue.claim, self.queue.stats, self.queue.reconcile_candidates,
+                      lambda **kwargs: self.queue.apply_regular_policy(False, **kwargs))
+        for ids in ([], (), [True], ["1"], [0], [-1], [2**63], "1", [1] * 501):
+            for operation in operations:
+                with self.subTest(ids=ids[:3] if isinstance(ids, list) else ids, operation=operation.__name__):
+                    with self.assertRaises(ValueError):
+                        operation(root_ids=ids)
+        for operation in operations:
+            with self.subTest(operation=operation.__name__), self.assertRaises(QueueConfigurationError):
+                operation(root_ids=[1, 999999])
+        self.assertEqual(self.queue.list_jobs(), before)
+        self.assertFalse(self.queue.stats()["scan_active"])
+
+    def test_scoped_claim_seeks_past_large_unrelated_source_and_storage_prefixes(self):
+        second = self.base / "second-source"
+        second.mkdir()
+        root = self.queue.add_root(second, "second")
+        target = self.photo("target.mp4", root=second)
+        self.queue.scan()
+        target_id = 60001
+        self.queue._db.execute("UPDATE jobs SET id=?", (target_id,))
+        with self.queue._transaction():
+            self.queue._db.execute("""
+                WITH RECURSIVE prefix(n) AS (
+                    VALUES(1) UNION ALL SELECT n+1 FROM prefix WHERE n<60000
+                )
+                INSERT INTO jobs(id,root_id,relative_path,local_path,local_key,remote_path,remote_key,
+                                 size,mtime_ns,device,inode,status,next_attempt,created_at,updated_at,planned_mode)
+                SELECT n,CASE WHEN n<=30000 THEN 1 ELSE ? END,'prefix-'||n||'.mp4',
+                       '/fixture/prefix-'||n,'prefix-'||n,'/Archive/prefix-'||n,'/archive/prefix-'||n,
+                       32,0,0,'0','pending',0,0,0,'regular' FROM prefix
+            """, (root.id,))
+        for state in ("pending", "failed"):
+            with self.subTest(state=state):
+                self.queue._db.execute("UPDATE jobs SET status=?,next_attempt=0,claim_token=NULL,attempts=0", (state,))
+                steps = 0
+                def count_steps():
+                    nonlocal steps
+                    steps += 1
+                    return 0
+                self.queue._db.set_progress_handler(count_steps, 1000)
+                try:
+                    job = self.queue.claim(root_ids=[root.id], storage_mode="unlimited", now=100)
+                finally:
+                    self.queue._db.set_progress_handler(None, 0)
+                self.assertEqual(job.id, target_id)
+                self.assertLess(steps, 50, "Scoped claim walked an unrelated prefix")
+                self.queue.release(job)
+        self.queue._db.execute("UPDATE jobs SET root_id=1 WHERE id<?", (target_id,))
+        steps = 0
+        self.queue._db.set_progress_handler(count_steps, 1000)
+        try:
+            page = self.queue.reconcile_candidates(root_ids=[root.id])
+            scoped = self.queue.stats(root_ids=[root.id])
+        finally:
+            self.queue._db.set_progress_handler(None, 0)
+        self.assertEqual([row["id"] for row in page], [target_id])
+        self.assertEqual(scoped["total"], 1)
+        self.assertLess(steps, 50, "Scoped reconciliation or statistics scanned unrelated sources")
+
+    def test_scoped_stats_does_not_scan_foreign_errors_retries_or_adopted_files(self):
+        second = self.base / "selected-source"
+        second.mkdir()
+        root = self.queue.add_root(second, "selected")
+        self.photo("only-selected.mp4", root=second)
+        self.queue.scan()
+        with self.queue._transaction():
+            self.queue._db.execute("""
+                WITH RECURSIVE prefix(n) AS (
+                    VALUES(1) UNION ALL SELECT n+1 FROM prefix WHERE n<60000
+                )
+                INSERT INTO jobs(root_id,relative_path,local_path,local_key,remote_path,remote_key,
+                                 size,mtime_ns,device,inode,status,next_attempt,skip_reason,
+                                 created_at,updated_at)
+                SELECT 1,'foreign-'||n||'.mp4','/fixture/foreign-'||n,'foreign-'||n,
+                       '/Archive/foreign-'||n,'/archive/foreign-'||n,32,0,0,'0',
+                       CASE WHEN n%3=0 THEN 'skipped' ELSE 'failed' END,
+                       CASE WHEN n%3=1 THEN 150 ELSE NULL END,
+                       CASE WHEN n%3=0 THEN 'remote_exists' ELSE NULL END,0,0 FROM prefix
+            """)
+        steps = 0
+        def count_steps():
+            nonlocal steps
+            steps += 1
+            return 0
+        self.queue._db.set_progress_handler(count_steps, 1000)
+        try:
+            scoped = self.queue.stats(root_ids=[root.id], now=100)
+        finally:
+            self.queue._db.set_progress_handler(None, 0)
+        self.assertEqual((scoped["total"], scoped["ready"], scoped["permanent_failures"], scoped["existing"]),
+                         (1, 1, 0, 0))
+        self.assertIsNone(scoped["next_retry_at"])
+        self.assertLess(steps, 10, "Scoped statistics traversed unrelated status/retry indexes")
 
     def test_partitioned_claim_cost_does_not_scan_an_unrelated_30000_job_prefix(self):
         target = self.photo("target.mp4")

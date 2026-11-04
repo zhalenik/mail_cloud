@@ -322,6 +322,7 @@ class WebApplication:
             elif path.startswith("/api/"):
                 if not session or session.get("authenticated") is not True or not self.access.configured:
                     raise WebError(401, "Войдите в панель управления.", "authentication_required")
+                environ["mailru.session_owner"] = session["csrf"]
                 value = self._api(path, method, data, environ)
                 content_type = "application/json"
             else:
@@ -373,15 +374,19 @@ class WebApplication:
             return open_task_content(*source, download=choice[0] == "1", head=method == "HEAD",
                                      range_header=None if environ.get("HTTP_IF_RANGE") else environ.get("HTTP_RANGE"))
         if method == "GET":
+            if path == "/api/schedules":
+                return self.service.schedules()
             if path == "/api/state":
                 return self.service.snapshot()
             if path == "/api/jobs":
                 status = query.get("status", ["all"])[0]
-                if status not in {"all", "pending", "running", "uploaded", "failed", "skipped", "paused"}:
+                if status not in {"all", "pending", "running", "uploaded", "failed", "skipped", "paused",
+                                   "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"}:
                     raise WebError(400, "Неизвестный фильтр очереди.")
                 return self.service.jobs(status=None if status == "all" else status,
                                          limit=_integer(query.get("limit", ["50"])[0], 1, 100),
-                                         offset=_integer(query.get("offset", ["0"])[0], 0, 100000000))
+                                         offset=_integer(query.get("offset", ["0"])[0], 0, 100000000),
+                                         sort=query.get("sort", ["asc"])[0])
             if path == "/api/folders":
                 return self.service.folders(query.get("path", [None])[0])
             if path == "/api/report":
@@ -389,7 +394,13 @@ class WebApplication:
                         "errors": self.service.jobs(status="failed", limit=100, offset=0)}
         if method != "POST":
             raise WebError(404, "Неизвестная команда.")
-        if path == "/api/setup":
+        if path == "/api/schedules/save":
+            return self.service.save_schedule(data)
+        elif path == "/api/schedules/toggle":
+            return self.service.toggle_schedule(_integer(data.get("id"), 1, 2**63 - 1), data.get("enabled"))
+        elif path == "/api/schedules/remove":
+            return self.service.remove_schedule(_integer(data.get("id"), 1, 2**63 - 1))
+        elif path == "/api/setup":
             self.service.setup(_text(data, "destination"))
         elif path == "/api/login":
             self.service.login(_text(data, "email", limit=320), _text(data, "password", limit=1024))
@@ -410,7 +421,18 @@ class WebApplication:
                                        alias=_text(data, "alias", limit=255) if "alias" in data else None)
         elif path == "/api/sources/remove":
             self.service.remove_source(_integer(data.get("id"), 1, 2**63 - 1))
-        elif path in {"/api/tasks/pause", "/api/tasks/resume", "/api/tasks/remove"}:
+        elif path == "/api/tasks/delete/preview":
+            return self.service.preview_deletion(
+                task_id=_integer(data["id"], 1, 2**63 - 1) if "id" in data else None,
+                scope=_text(data, "scope", limit=16) if "scope" in data else "all",
+                status=_text(data, "status", limit=32) if "status" in data else None,
+                delete_cloud=data.get("delete_cloud", False), delete_local=data.get("delete_local", False),
+                owner=environ.get("mailru.session_owner", ""))
+        elif path == "/api/tasks/delete":
+            self.service.confirm_deletion(_text(data, "token", limit=200),
+                local_confirmation=_text(data, "local_confirmation", limit=100) if "local_confirmation" in data else "",
+                owner=environ.get("mailru.session_owner", ""))
+        elif path in {"/api/tasks/pause", "/api/tasks/resume", "/api/tasks/start", "/api/tasks/remove"}:
             self.service.control_task(_integer(data.get("id"), 1, 2**63 - 1), path.rsplit("/", 1)[1])
         elif path == "/api/tasks/clear":
             scope = _text(data, "scope", limit=16)
@@ -434,14 +456,17 @@ class WebApplication:
             workers = _integer(data.get("workers"), 1, 16)
             if type(data.get("auto_resume")) is not bool:
                 raise WebError(400, "Укажите настройку продолжения после перезапуска.")
-            if "preflight_check" in data and type(data["preflight_check"]) is not bool:
-                raise WebError(400, "Предварительная проверка должна быть включена или выключена.")
+            if "preflight_check" in data:
+                raise WebError(400, "Предварительная проверка удалена. Обновите страницу панели.")
             if "remote_reconcile" in data and type(data["remote_reconcile"]) is not bool:
                 raise WebError(400, "Сверка с Облаком должна быть включена или выключена.")
             if "upload_large_files" in data:
                 raise WebError(400, "Настройка обычной загрузки больших файлов удалена. Обновите страницу панели.")
             self.service.settings(workers=workers, auto_resume=data["auto_resume"],
-                                  preflight_check=data.get("preflight_check"), remote_reconcile=data.get("remote_reconcile"))
+                                  remote_reconcile=data.get("remote_reconcile"),
+                                  regular_policy=data.get("regular_policy"),
+                                  unexpected_unlimited_action=data.get("unexpected_unlimited_action"),
+                                  timezone=data.get("timezone"))
         else:
             raise WebError(404, "Неизвестная команда.")
         return self.service.snapshot()

@@ -214,6 +214,28 @@ class UploadBehaviorTests(unittest.TestCase):
         self.assertEqual([v['verified'] for v in observations], [False, True])
         self.assertFalse(any('/private/add' in r['url'] for r in fake.requests))
 
+    def test_shared_quota_reservation_happens_before_any_regular_body_or_commit(self):
+        api, fake, _ = self.regular_api([response(404), self.quota_response(total=10000, cloud=250, mail=500)])
+        reserved = []
+        def deny(size, available):
+            reserved.append((size, available))
+            raise RemoteError(400, 'CONDITION/OVERQUOTA')
+        with self.assertRaises(RemoteError):
+            self.regular_upload(api, reserve_quota=deny)
+        self.assertEqual(reserved, [(self.identity.size, 9250)])
+        self.assertEqual([r['method'] for r in fake.requests], ['GET', 'GET'])
+        self.assertEqual(self.saved, [])
+
+    def test_saved_regular_commit_recovery_does_not_reserve_or_require_quota_again(self):
+        api, fake, _ = self.regular_api([self.stat_response()])
+        prior = {'cloud_hash': self.digest, 'remote_path': self.remote, 'storage_mode': 'regular',
+                 'regular_confirmed': True}
+        def no_reservation(*_):
+            self.fail('Existing committed object must not reserve space')
+        result = self.regular_upload(api, prior_intent=prior, account=None, reserve_quota=no_reservation)
+        self.assertTrue(result['recovered_commit'])
+        self.assertEqual([r['method'] for r in fake.requests], ['GET'])
+
     def test_stat_normalizes_nfd_and_encodes_unicode_as_uri_bytes(self):
         api, fake, _ = self.api([self.stat_response()])
         api.stat('/Семья/е\u0308ж & #?%.jpg')

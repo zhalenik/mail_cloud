@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import quote
 
 from mailru_photos.api import FileIdentity
 from mailru_photos.content import open_task_content
@@ -42,6 +43,29 @@ class FakeService:
 
     def clear_tasks(self, scope):
         self.calls.append(("clear_tasks", scope))
+
+    def preview_deletion(self, **kwargs):
+        self.calls.append(("preview_deletion", kwargs))
+        return {"token": "offline-preview-token", "tasks": 1, "bytes": 123}
+
+    def confirm_deletion(self, token, **kwargs):
+        self.calls.append(("confirm_deletion", token, kwargs))
+
+    def schedules(self):
+        self.calls.append(("schedules",))
+        return {"schedules": [], "timezone": "UTC"}
+
+    def save_schedule(self, value):
+        self.calls.append(("save_schedule", value))
+        return {"schedules": [value]}
+
+    def toggle_schedule(self, identifier, enabled):
+        self.calls.append(("toggle_schedule", identifier, enabled))
+        return {"ok": True}
+
+    def remove_schedule(self, identifier):
+        self.calls.append(("remove_schedule", identifier))
+        return {"ok": True}
 
     def jobs(self, **kwargs):
         self.calls.append(("jobs", kwargs))
@@ -125,7 +149,7 @@ class WebTests(unittest.TestCase):
         self.request('/api/session')
         self.assertEqual(self.request('/api/tasks/pause', method='POST', data={'id': 1})['status'], 401)
         self.authenticate()
-        for action in ('pause', 'resume', 'remove'):
+        for action in ('pause', 'resume', 'start', 'remove'):
             endpoint = '/api/tasks/' + action
             self.assertEqual(self.request(endpoint, method='POST', data={'id': 1}, csrf='bad')['status'], 403)
             self.assertEqual(self.request(endpoint, method='POST', data={'id': 1})['status'], 200)
@@ -150,7 +174,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.service.calls, before)
 
     def test_private_routes_require_panel_session(self):
-        for route in ("/api/state", "/api/folders", "/api/jobs", "/api/report"):
+        for route in ("/api/state", "/api/folders", "/api/jobs", "/api/report", "/api/schedules"):
             self.assertEqual(self.request(route)["status"], 401)
         self.assertEqual(self.service.calls, [])
 
@@ -182,22 +206,29 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request("/api/start", method="POST")["status"], 200)
         self.assertEqual(self.service.calls, [("start",)])
 
-    def test_settings_accept_explicit_preflight_boolean_and_preserve_omitted_value(self):
+    def test_removed_preflight_setting_is_rejected_without_reaching_service(self):
         self.authenticate()
-        for enabled in (False, True):
-            response = self.request('/api/settings', method='POST', data={
-                'workers': 2, 'auto_resume': True, 'preflight_check': enabled})
-            self.assertEqual(response['status'], 200)
-            self.assertIs(self.service.calls[-1][1]['preflight_check'], enabled)
         response = self.request('/api/settings', method='POST', data={'workers': 2, 'auto_resume': True})
         self.assertEqual(response['status'], 200)
-        self.assertIsNone(self.service.calls[-1][1]['preflight_check'])
+        self.assertNotIn('preflight_check', self.service.calls[-1][1])
         calls = len(self.service.calls)
-        for value in (None, 0, 1, 'false'):
+        for value in (True, False, None, 0, 1, 'false'):
             response = self.request('/api/settings', method='POST', data={
                 'workers': 2, 'auto_resume': True, 'preflight_check': value})
             self.assertEqual(response['status'], 400)
         self.assertEqual(len(self.service.calls), calls)
+
+    def test_storage_policy_settings_forward_explicit_choices_and_timezone(self):
+        self.authenticate()
+        for regular, unexpected in (("skip", "trash"), ("upload", "keep")):
+            response = self.request('/api/settings', method='POST', data={
+                'workers': 3, 'auto_resume': False, 'regular_policy': regular,
+                'unexpected_unlimited_action': unexpected, 'timezone': 'Europe/Moscow'})
+            self.assertEqual(response['status'], 200)
+            options = self.service.calls[-1][1]
+            self.assertEqual(options['regular_policy'], regular)
+            self.assertEqual(options['unexpected_unlimited_action'], unexpected)
+            self.assertEqual(options['timezone'], 'Europe/Moscow')
 
     def test_remote_reconcile_setting_and_quota_refresh_are_authenticated_mutations(self):
         self.request('/api/session')
@@ -402,7 +433,59 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request("/api/jobs?offset=-1")["status"], 400)
         self.assertEqual(self.request("/api/jobs?status=deleted")["status"], 400)
         self.assertEqual(self.request("/api/jobs?status=failed&offset=50&limit=50")["status"], 200)
-        self.assertEqual(self.service.calls[-1], ("jobs", {"status": "failed", "offset": 50, "limit": 50}))
+        self.assertEqual(self.service.calls[-1], ("jobs", {"status": "failed", "offset": 50, "limit": 50, "sort": "asc"}))
+        for status in ('uploaded_unlimited', 'uploaded_regular', 'uploaded_unknown'):
+            self.assertEqual(self.request('/api/jobs?status=' + status + '&sort=desc')['status'], 200)
+            self.assertEqual(self.service.calls[-1], ('jobs', {'status': status, 'offset': 0, 'limit': 50, 'sort': 'desc'}))
+
+    def test_deletion_preview_and_confirmation_require_auth_csrf_and_session_binding(self):
+        self.request('/api/session')
+        for route in ('/api/tasks/delete/preview', '/api/tasks/delete'):
+            self.assertEqual(self.request(route, method='POST', data={'id': 1, 'token': 'offline-preview-token'})['status'], 401)
+        self.authenticate()
+        for route in ('/api/tasks/delete/preview', '/api/tasks/delete'):
+            self.assertEqual(self.request(route, method='POST', data={'id': 1, 'token': 'offline-preview-token'}, csrf='bad')['status'], 403)
+        self.assertEqual(self.service.calls, [])
+        response = self.request('/api/tasks/delete/preview', method='POST', data={
+            'id': 7, 'delete_cloud': True, 'delete_local': True})
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(response['data']['token'], 'offline-preview-token')
+        options = self.service.calls[-1][1]
+        self.assertEqual(options['task_id'], 7)
+        self.assertTrue(options['delete_cloud'])
+        self.assertTrue(options['delete_local'])
+        self.assertEqual(options['owner'], self.csrf)
+        response = self.request('/api/tasks/delete', method='POST', data={
+            'token': 'offline-preview-token', 'local_confirmation': 'УДАЛИТЬ НАВСЕГДА'})
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('confirm_deletion', 'offline-preview-token',
+                                                {'local_confirmation': 'УДАЛИТЬ НАВСЕГДА', 'owner': self.csrf}))
+        self.assertEqual(self.request('/api/tasks/delete', method='POST', data={})['status'], 400)
+
+    def test_scheduler_routes_keep_mutations_behind_authentication_and_csrf(self):
+        payload = {'name': 'Ночные фото', 'source_ids': [1, 2], 'time': '23:15',
+                   'mode': 'weekly', 'weekdays': [1, 3, 5], 'enabled': True}
+        self.request('/api/session')
+        self.assertEqual(self.request('/api/schedules/save', method='POST', data=payload)['status'], 401)
+        self.authenticate()
+        self.assertEqual(self.request('/api/schedules/save', method='POST', data=payload, csrf='bad')['status'], 403)
+        self.assertEqual(self.request('/api/schedules')['status'], 200)
+        self.assertEqual(self.request('/api/schedules/save', method='POST', data=payload)['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('save_schedule', payload))
+        self.assertEqual(self.request('/api/schedules/toggle', method='POST', data={'id': 3, 'enabled': False})['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('toggle_schedule', 3, False))
+        self.assertEqual(self.request('/api/schedules/remove', method='POST', data={'id': 3})['status'], 200)
+        self.assertEqual(self.service.calls[-1], ('remove_schedule', 3))
+        for value in (True, -1, 0, 2**63, 'bad'):
+            self.assertEqual(self.request('/api/schedules/remove', method='POST', data={'id': value})['status'], 400)
+
+    def test_unicode_folder_query_round_trips_as_utf8(self):
+        self.authenticate()
+        path = '/photos/Фотографии/Семья и друзья'
+        response = self.request('/api/folders?path=' + quote(path, safe=''))
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(response['data']['path'], path)
+        self.assertIn('Семья'.encode('utf-8'), response['body'])
 
     def test_source_routes_forward_explicit_paths_and_keep_legacy_add(self):
         self.authenticate()

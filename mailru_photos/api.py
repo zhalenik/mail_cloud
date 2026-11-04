@@ -790,6 +790,7 @@ class CloudAPI:
                        prior_intent: dict[str, Any] | None = None, save_intent: Callable[[str], None],
                        save_confirmation: Callable[[str], None] | None = None,
                        save_observation: Callable[[dict[str, Any]], None] | None = None,
+                       reserve_quota: Callable[[int, int], None] | None = None,
                        progress=None, is_retried: bool = False,
                        account: AccountInfo | None = None) -> dict[str, Any]:
         """Explicit create-only upload into the account storage quota.
@@ -834,6 +835,10 @@ class CloudAPI:
                 return result
             raise RemoteConflict("Файл с этим путём уже есть в Облаке. Перезапись отключена.")
         body = encode_add_file(remote_path, identity.size, max(0, identity.mtime_ns // 1_000_000_000), digest)
+        # Batch workers share a reservation budget. Already committed objects
+        # above returned before reaching this point and need no new space.
+        if reserve_quota is not None:
+            reserve_quota(identity.size, available)
         self.ensure_parent(remote_path)
         self._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried, upload_type="MANUAL")
         try:

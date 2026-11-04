@@ -7,12 +7,14 @@ manual pause clears that intention, process shutdown deliberately preserves it.
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict, deque
 import contextlib
 import dataclasses
 import json
 import logging
-import math
 import os
+import secrets
+import hmac
 import sqlite3
 from pathlib import Path
 import threading
@@ -25,7 +27,10 @@ from .api import CloudAPI, FileIdentity, PROTOCOL_VERSION, ProtocolError, is_aut
 from .auth import AuthClient, AuthError, TokenManager, TokenStore
 from .cli import write_json
 from .queue import FileChangedError, Queue, QueueBusyError, QueueError, STATES, _file_lock
-from .runner import ProbeRequired, probe, process_job, process_probe_job, run
+from .runner import QuotaBudget, run
+from .scheduler import Scheduler, checked_timezone
+from .deletion import (DeletionJournal, LocalDeletionRecoveryRequired, LOCAL_CONFIRMATION, deletion_preview,
+                       delete_local_file, local_delete_supported, selected_tasks)
 from .transport import Cancelled, TransportError
 
 LOGGER = logging.getLogger("mailru_photos.service")
@@ -50,8 +55,7 @@ class WebService:
     def __init__(self, state_dir: Path, allowed_roots: list[Path], *,
                  api_factory: Callable[..., CloudAPI] = CloudAPI,
                  auth_client_factory: Callable[..., AuthClient] = AuthClient,
-                 event_factory: Callable[[], threading.Event] = threading.Event,
-                 probe_settle_seconds: float = 60):
+                 event_factory: Callable[[], threading.Event] = threading.Event):
         self.state_dir = Path(state_dir).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.allowed_roots = tuple(dict.fromkeys(Path(p).expanduser().resolve() for p in allowed_roots))
@@ -60,10 +64,18 @@ class WebService:
         self._api_factory = api_factory
         self._auth_client_factory = auth_client_factory
         self._event_factory = event_factory
-        self._settle_seconds = probe_settle_seconds
         self._lock = threading.RLock()
         self._stats_lock = threading.Lock()
         self._stats_cache: tuple[float, dict] | None = None
+        self._database_cache: tuple[float, dict] | None = None
+        self._jobs_cache = OrderedDict()
+        self._priority_jobs = deque()
+        self._task_starts_closed = True
+        self._deletion_previews = {}
+        self.scheduler = None
+        self._deletion = None
+        self._deletion_pending = False
+        self._auto_deletion = False
         self._thread: threading.Thread | None = None
         self._operation: str | None = None
         self._stop = event_factory()
@@ -75,15 +87,21 @@ class WebService:
         self._quota_cache: dict | None = None
         self._quota_error: str | None = None
         self._uploaded_in_run = 0
-        self._settings = {"workers": 2, "auto_resume": True, "preflight_check": True, "remote_reconcile": False}
+        self._settings = {"workers": 2, "auto_resume": True, "remote_reconcile": False,
+                          "regular_policy": "skip", "unexpected_unlimited_action": "trash",
+                          "timezone": checked_timezone(os.environ.get("MAILRU_TIMEZONE", "Europe/Moscow"))}
         stored = self._read_json("web_settings.json", {})
         if isinstance(stored, dict):
+            if isinstance(stored.get("timezone"), str):
+                self._settings["timezone"] = checked_timezone(stored["timezone"])
             if type(stored.get("workers")) is int and 1 <= stored["workers"] <= 16:
                 self._settings["workers"] = stored["workers"]
             if type(stored.get("auto_resume")) is bool:
                 self._settings["auto_resume"] = stored["auto_resume"]
-            if type(stored.get("preflight_check")) is bool:
-                self._settings["preflight_check"] = stored["preflight_check"]
+            if stored.get("regular_policy") in {"skip", "upload"}:
+                self._settings["regular_policy"] = stored["regular_policy"]
+            if stored.get("unexpected_unlimited_action") in {"trash", "keep"}:
+                self._settings["unexpected_unlimited_action"] = stored["unexpected_unlimited_action"]
             if type(stored.get("remote_reconcile")) is bool:
                 self._settings["remote_reconcile"] = stored["remote_reconcile"]
         previous = self._read_json("web_activity.json", {})
@@ -91,11 +109,17 @@ class WebService:
         self._logout_requested = isinstance(previous, dict) and previous.get("logout_requested") is True
         self._resume_upload = (isinstance(previous, dict) and previous.get("resume_upload") is True
                                and not self._logout_requested and not self._auth_required)
+        selected = previous.get("job_id") if isinstance(previous, dict) else None
+        self._resume_job_id = selected if type(selected) is int and selected > 0 else None
+        scope = previous.get("root_ids") if isinstance(previous, dict) else None
+        self._resume_root_ids = sorted(set(scope)) if isinstance(scope, list) and scope and all(type(i) is int and i > 0 for i in scope) else None
+        occurrence = previous.get("occurrence_id") if isinstance(previous, dict) else None
+        self._resume_occurrence_id = occurrence if isinstance(occurrence, str) and len(occurrence) == 32 else None
         self._auto_pending = self._resume_upload and self._settings["auto_resume"]
         self._activity = {"phase": "paused" if self._resume_upload else "idle",
                           "message": "Очередь восстановлена после остановки." if self._resume_upload else "Готово к работе.",
                           "last_error": None, "started_at": None, "scan": None,
-                          "current_files": [], "probe_wait_until": None}
+                          "current_files": []}
         old_events = self._read_json("web_events.json", [])
         self._events = [e for e in old_events[-100:] if isinstance(e, dict) and
                         isinstance(e.get("message"), str)][:100] if isinstance(old_events, list) else []
@@ -109,8 +133,18 @@ class WebService:
                 with self._queue() as queue, queue.exclusive_run():
                     recovered = queue.recover_running()
                     queue.upgrade_media_discovery()
+                    queue.apply_regular_policy(upload=self._settings["regular_policy"] == "upload")
                     if recovered:
                         self._activity["message"] = f"Восстановлено незавершённых заданий: {recovered}."
+            journal_path = self.state_dir / "deletions.sqlite3"
+            if journal_path.exists():
+                with DeletionJournal(journal_path) as journal:
+                    operation = journal.operation()
+                    if operation and operation.get("state") in {"confirmed", "running", "paused"}:
+                        self._deletion_pending = True
+                        self._auto_deletion = operation.get("state") in {"confirmed", "running"} and self._settings["auto_resume"]
+                        self._deletion = {**journal.summary(), "resume_available": True}
+                        self._activity.update(phase="paused", message="Незавершённое удаление сохранено. Нажмите «Продолжить».")
             self._authenticated = False
             if self._logout_requested:
                 self._complete_logout()
@@ -119,6 +153,25 @@ class WebService:
                 if self._auth_required:
                     self._quota_error = "Для обновления данных требуется повторный вход в Mail.ru."
                     self._activity.update(phase="paused", message="Для продолжения требуется повторный вход в Mail.ru.")
+            self.scheduler = Scheduler(self.state_dir / "schedules.sqlite3", timezone_name=self._settings["timezone"],
+                                       launch=self._start_scheduled, resume_interrupted=self._settings["auto_resume"])
+            if self._resume_occurrence_id:
+                saved_occurrence = self.scheduler.occurrence(self._resume_occurrence_id)
+                if saved_occurrence and saved_occurrence["status"] in {"complete", "error", "cancelled"}:
+                    self._resume_upload = self._auto_pending = False
+                    self._resume_occurrence_id = self._resume_root_ids = None
+                    if not self._deletion_pending:
+                        self._activity.update(phase="idle", message="Предыдущий запуск планировщика завершён.")
+                    self._persist_activity()
+                elif (saved_occurrence and saved_occurrence["status"] in {"queued", "running"}
+                      and isinstance(previous, dict) and previous.get("resume_upload") is False
+                      and previous.get("phase") in {"pausing", "paused", "logout"}):
+                    # pause() can be durable before the worker checkpoints its
+                    # occurrence. That manual decision wins after a crash.
+                    self.scheduler.finish(saved_occurrence["id"], "paused", "Выполнение приостановлено пользователем.")
+                    self._resume_upload = self._auto_pending = False
+                    self._activity.update(phase="paused", message="Запуск планировщика приостановлен. Нажмите «Продолжить».")
+                    self._persist_activity()
         except BaseException:
             self._server_lock.__exit__(None, None, None)
             raise
@@ -180,12 +233,6 @@ class WebService:
             raise ValueError("Укажите корректную папку назначения для источника.")
         return value
 
-    @staticmethod
-    def _invalidate_source_probe(queue: Queue) -> None:
-        previous = queue.get_metadata("probe")
-        if isinstance(previous, dict) and previous:
-            queue.set_metadata("probe", {**previous, "result": "invalidated", "reason": "sources_changed"})
-
     def _has_auth(self) -> bool:
         if self._auth_required:
             return False
@@ -195,25 +242,29 @@ class WebService:
         except AuthError:
             return False
 
-    def _display_stats(self, queue: Queue) -> dict:
-        """Share a bounded-lived display summary between dashboard requests.
-
-        Upload decisions always use Queue.stats() directly. Serializing cache
-        refreshes also avoids one full scan per browser tab at the same instant.
-        """
+    def _database_snapshot(self) -> dict:
+        """No SQLite opens or file stats for repeated idle dashboard polling."""
         with self._stats_lock:
-            if self._stats_cache is None or time.monotonic() - self._stats_cache[0] >= 5:
-                stats = queue.stats()
-                self._stats_cache = (time.monotonic(), stats)
-            return copy.deepcopy(self._stats_cache[1])
+            active = self._operation is not None
+            cached = self._database_cache
+            if cached is None or (active and time.monotonic() - cached[0] >= 5):
+                with self._queue() as queue:
+                    value = {"destination": queue.destination, "account": queue.account_id,
+                             "sources": [dataclasses.asdict(r) for r in queue.roots()],
+                             "stats": queue.stats(), "last_scan": queue.get_metadata("last_scan")}
+                self._database_cache = (time.monotonic(), value)
+            return copy.deepcopy(self._database_cache[1])
 
     def _invalidate_stats(self) -> None:
         with self._stats_lock:
             self._stats_cache = None
+            self._database_cache = None
+            self._jobs_cache.clear()
 
     def _persist_activity(self) -> None:
         write_json(self.state_dir / "web_activity.json", {
-            "version": 1, "resume_upload": self._resume_upload,
+            "version": 1, "resume_upload": self._resume_upload, "job_id": self._resume_job_id,
+            "root_ids": self._resume_root_ids, "occurrence_id": self._resume_occurrence_id,
             "logout_requested": self._logout_requested,
             "auth_required": self._auth_required,
             "phase": self._activity["phase"], "updated_at": time.time(),
@@ -232,11 +283,9 @@ class WebService:
             if self._logout_requested and phase != "logout":
                 return
             # A worker must not overwrite a visible pause request while it drains.
-            if self._pause_requested and phase in {"checking", "probing", "uploading", "scanning"}:
+            if self._pause_requested and phase in {"checking", "uploading", "scanning", "deleting"}:
                 return
             self._activity.update(phase=phase, message=message, last_error=error)
-            if phase != "probing":
-                self._activity["probe_wait_until"] = None
             self._persist_activity()
         self._event(message, "error" if error else "info")
         # Container logs carry fixed lifecycle fields only. User paths, email,
@@ -280,14 +329,13 @@ class WebService:
             remote_prefix = self._source_destination(remote_prefix)
         with self._lock:
             self._ensure_idle()
+            self._ensure_no_deletion()
             source = self._allowed_path(path)
             self._ensure_configuration()
             with self._queue() as queue, queue.exclusive_run():
                 previous = queue.roots()
                 root = queue.add_root(source, alias, remote_prefix=remote_prefix)
                 changed = root not in previous
-                if changed:
-                    self._invalidate_source_probe(queue)
             self._invalidate_stats()
             if changed:
                 self._event(f"Добавлена папка: {root.alias}.")
@@ -300,6 +348,7 @@ class WebService:
             alias = self._source_alias(alias)
         with self._lock:
             self._ensure_idle()
+            self._ensure_no_deletion()
             with self._queue() as queue, queue.exclusive_run():
                 previous = next((root for root in queue.roots() if root.id == source_id), None)
                 if previous is None:
@@ -307,8 +356,6 @@ class WebService:
                 self._allowed_path(previous.path, exists=False)
                 root = queue.update_root(source_id, remote_prefix=remote_prefix, alias=alias)
                 changed = root != previous
-                if changed:
-                    self._invalidate_source_probe(queue)
             self._invalidate_stats()
             if changed:
                 self._event(f"Изменён источник: {root.alias}. Уже загруженные файлы остаются на прежнем месте.")
@@ -318,18 +365,21 @@ class WebService:
         source_id = self._source_id(source_id)
         with self._lock:
             self._ensure_idle()
+            self._ensure_no_deletion()
             with self._queue() as queue, queue.exclusive_run():
                 root = next((root for root in queue.roots() if root.id == source_id), None)
                 if root is None:
                     raise ValueError("Исходная папка не найдена. Обновите страницу.")
+                if self.scheduler is not None:
+                    self.scheduler.remove_source(source_id)
                 removed = queue.remove_root(source_id)
-                self._invalidate_source_probe(queue)
             self._invalidate_stats()
             self._event(f"Убран источник: {root.alias}. Удалено задач: {removed:,}. Файлы на диске и в Облаке сохранены.")
         return {"ok": True, "removed_tasks": removed}
 
     def settings(self, workers: int | None = None, auto_resume: bool | None = None,
-                 preflight_check: bool | None = None, remote_reconcile: bool | None = None) -> dict:
+                 remote_reconcile: bool | None = None, regular_policy: str | None = None,
+                 unexpected_unlimited_action: str | None = None, timezone: str | None = None) -> dict:
         with self._lock:
             self._ensure_idle()
             updated = dict(self._settings)
@@ -337,20 +387,34 @@ class WebService:
                 if type(workers) is not int or not 1 <= workers <= 16:
                     raise ValueError("Число параллельных загрузок должно быть от 1 до 16.")
                 updated["workers"] = workers
-            if auto_resume is not None:
-                if type(auto_resume) is not bool:
-                    raise ValueError("Автоматическое продолжение должно быть включено или выключено.")
-                updated["auto_resume"] = auto_resume
-            if preflight_check is not None:
-                if type(preflight_check) is not bool:
-                    raise ValueError("Предварительная проверка должна быть включена или выключена.")
-                updated["preflight_check"] = preflight_check
-            if remote_reconcile is not None:
-                if type(remote_reconcile) is not bool:
-                    raise ValueError("Сверка с Облаком должна быть включена или выключена.")
-                updated["remote_reconcile"] = remote_reconcile
-            write_json(self.state_dir / "web_settings.json", updated)
+            for key, value in (("auto_resume", auto_resume), ("remote_reconcile", remote_reconcile)):
+                if value is not None:
+                    if type(value) is not bool:
+                        raise ValueError("Настройка должна быть включена или выключена.")
+                    updated[key] = value
+            for key, value, allowed in (("regular_policy", regular_policy, {"skip", "upload"}),
+                                       ("unexpected_unlimited_action", unexpected_unlimited_action, {"trash", "keep"})):
+                if value is not None:
+                    if not isinstance(value, str) or value not in allowed:
+                        raise ValueError("Некорректная политика хранения.")
+                    updated[key] = value
+            if timezone is not None:
+                updated["timezone"] = checked_timezone(timezone)
+            if self._configuration and updated["regular_policy"] != self._settings["regular_policy"]:
+                with self._queue() as queue, queue.exclusive_run():
+                    queue.apply_regular_policy(upload=updated["regular_policy"] == "upload")
+            try:
+                write_json(self.state_dir / "web_settings.json", updated)
+            except OSError:
+                if self._configuration and updated["regular_policy"] != self._settings["regular_policy"]:
+                    with self._queue() as queue, queue.exclusive_run():
+                        queue.apply_regular_policy(upload=self._settings["regular_policy"] == "upload")
+                self._invalidate_stats()
+                raise
             self._settings = updated
+            if self.scheduler is not None:
+                self.scheduler.set_timezone(updated["timezone"])
+            self._invalidate_stats()
             return {"ok": True, "settings": dict(self._settings)}
 
     def folders(self, path: str | None = None) -> dict:
@@ -449,7 +513,7 @@ class WebService:
     def _task_controls_available(self) -> bool:
         return (not self._closed and not self._shutting_down and not self._logout_requested
                 and self._configuration is not None
-                and self._operation in (None, "upload")
+                and self._operation in (None, "upload") and not self._deletion_pending
                 and self._activity["phase"] not in {"scanning", "reconciling"}
                 and not (self._pause_requested and self._operation is not None))
 
@@ -467,24 +531,51 @@ class WebService:
                 if current is not None and current[0] == job.claim_token:
                     self._task_signals.pop(job.id, None)
 
+    def _next_priority_job(self):
+        with self._lock:
+            return self._priority_jobs.popleft() if self._priority_jobs else None
+
     def control_task(self, task_id: int, action: str) -> dict:
         task_id = self._source_id(task_id)
-        if action not in {"pause", "resume", "remove"}:
+        if action not in {"pause", "start", "resume", "remove"}:
             raise ValueError("Неизвестное действие с задачей.")
+        if action == "resume":
+            action = "start"
         with self._lock:
             if not self._task_controls_available():
                 raise QueueBusyError("Дождитесь завершения текущей операции перед изменением задачи.")
+            if action == "start" and not self._authenticated:
+                raise ValueError("Сначала войдите в аккаунт Mail.")
+            if action == "start" and self._operation == "upload" and self._task_starts_closed:
+                raise QueueBusyError("Текущий запуск уже завершается. Повторите запуск задачи после его завершения.")
             with self._queue() as queue:
-                # Our upload thread owns the process run lock. Idle controls
-                # acquire it themselves so an external CLI cannot race them.
                 guard = queue.exclusive_run() if self._operation is None else contextlib.nullcontext()
                 with guard:
+                    row = queue.get_job(task_id)
+                    if row is None:
+                        raise ValueError("Задача не найдена. Обновите список.")
+                    if action == "start" and self._operation == "upload" and (
+                            (self._resume_job_id is not None and self._resume_job_id != task_id)
+                            or (self._resume_root_ids is not None and row["root_id"] not in self._resume_root_ids)):
+                        raise QueueBusyError("Завершите текущий выборочный запуск перед запуском задачи из другого источника.")
+                    if action == "pause" and row["status"] != "running":
+                        raise ValueError("Остановить можно только выполняющуюся задачу.")
+                    if action == "start" and row.get("planned_mode") == "regular" and self._settings["regular_policy"] == "skip":
+                        raise ValueError("Для этой задачи требуется квота. Сначала разрешите обычную загрузку в настройках.")
                     queue.request_control(task_id, action)
                 current = self._task_signals.get(task_id)
                 if current is not None and action in {"pause", "remove"}:
                     current[1].set()
             self._invalidate_stats()
-            messages = {"pause": "Запрошена пауза задачи", "resume": "Задача возвращена в очередь",
+            if action == "start":
+                if self._operation is None:
+                    self._resume_job_id = task_id
+                    self._resume_root_ids = None
+                    self._resume_occurrence_id = None
+                    return self._launch("upload", lambda: self._pipeline(job_id=task_id), upload_intent=True)
+                if task_id not in self._priority_jobs:
+                    self._priority_jobs.append(task_id)
+            messages = {"pause": "Запрошена остановка задачи", "start": "Запрошен запуск задачи",
                         "remove": "Задача убрана из очереди; исходный файл сохранён"}
             self._event(f"{messages[action]}: {task_id}.")
         return {"ok": True, "task_id": task_id, "action": action}
@@ -494,40 +585,251 @@ class WebService:
             raise ValueError("Выберите все задачи или обработанные задачи.")
         with self._lock:
             self._ensure_idle()
+            self._ensure_no_deletion()
             with self._queue() as queue, queue.exclusive_run():
                 removed = queue.clear_tasks(scope=scope)
             self._invalidate_stats()
             self._event(f"Из очереди убрано задач: {removed:,}. Файлы на диске и в Облаке сохранены.")
         return {"ok": True, "removed_tasks": removed}
 
-    def jobs(self, status: str | None = None, limit: int = 50, offset: int = 0) -> dict:
+    def _ensure_no_deletion(self):
+        if self._deletion_pending:
+            raise QueueBusyError("Сначала продолжите подтверждённое удаление. Его состояние сохранено.")
+
+    @staticmethod
+    def _delete_selection(task_id=None, scope="all", status=None):
+        if task_id is not None:
+            return {"id": WebService._source_id(task_id)}
+        if scope not in {"all", "finished", "filter"}:
+            raise ValueError("Неизвестный набор задач для удаления.")
         if status in ("", "all"):
             status = None
-        if status is not None and status not in (*STATES, "paused"):
+        if status is not None and status not in (*STATES, "paused", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
             raise ValueError("Неизвестный фильтр задач.")
-        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
+        return {"scope": scope, "status": status if scope == "filter" else None}
+
+    def preview_deletion(self, *, task_id=None, scope="all", status=None,
+                         delete_cloud=False, delete_local=False, owner=""):
+        if type(delete_cloud) is not bool or type(delete_local) is not bool:
+            raise ValueError("Выберите действия с помощью галочек.")
+        selection = self._delete_selection(task_id, scope, status)
+        with self._lock:
+            self._ensure_no_deletion()
+            if not self._task_controls_available():
+                raise QueueBusyError("Дождитесь завершения текущей операции.")
+            if delete_cloud or delete_local or task_id is None:
+                self._ensure_idle()
+            with self._queue() as queue:
+                guard = queue.exclusive_run() if self._operation is None else contextlib.nullcontext()
+                with guard:
+                    preview = deletion_preview(queue, selection, delete_cloud=delete_cloud, delete_local=delete_local)
+            if not preview["task_count"]:
+                raise ValueError("В выбранном списке нет задач.")
+            if delete_cloud and not self._authenticated:
+                raise ValueError("Для удаления из Облака сначала войдите в Mail.")
+            token = secrets.token_urlsafe(32)
+            expires_at = time.time() + 300
+            self._deletion_previews = {key: value for key, value in self._deletion_previews.items()
+                                       if value["expires_at"] > time.time()}
+            if len(self._deletion_previews) >= 32:
+                self._deletion_previews.pop(next(iter(self._deletion_previews)))
+            self._deletion_previews[token] = {**preview, "selection": selection, "delete_cloud": delete_cloud,
+                                             "delete_local": delete_local, "owner": owner, "expires_at": expires_at}
+            return {key: value for key, value in {**preview, "token": token, "expires_at": expires_at}.items()
+                    if key != "fingerprint"}
+
+    def confirm_deletion(self, token, *, local_confirmation="", owner=""):
+        if not isinstance(token, str) or len(token) > 200:
+            raise ValueError("Откройте окно удаления заново.")
+        with self._lock:
+            preview = self._deletion_previews.get(token)
+            if (not preview or preview["expires_at"] < time.time()
+                    or not hmac.compare_digest(str(preview["owner"]), str(owner))):
+                raise ValueError("Подтверждение удаления истекло. Откройте окно заново.")
+            self._ensure_no_deletion()
+            if preview["delete_local"]:
+                if local_confirmation != LOCAL_CONFIRMATION:
+                    raise ValueError("Для удаления исходников введите: " + LOCAL_CONFIRMATION)
+                if not preview["local_delete_allowed"]:
+                    raise ValueError("Источник доступен только для чтения или нет прав на удаление.")
+            physical = preview["delete_local"] or preview["delete_cloud"]
+            if physical or preview["selection"].get("id") is None:
+                self._ensure_idle()
+            if preview["delete_cloud"] and not self._authenticated:
+                raise ValueError("Сначала войдите в аккаунт Mail.")
+            self._deletion_previews.pop(token)
+            if not physical:
+                selected = preview["selection"]
+                if selected.get("id") is not None:
+                    return self.control_task(selected["id"], "remove")
+                with self._queue() as queue, queue.exclusive_run():
+                    current = deletion_preview(queue, selected)
+                    if current["fingerprint"] != preview["fingerprint"]:
+                        raise ValueError("Список задач изменился. Подтвердите новый список.")
+                    if selected["scope"] in {"all", "finished"}:
+                        removed = queue.clear_tasks(selected["scope"])
+                    else:
+                        removed = 0
+                        for row in selected_tasks(queue, selected):
+                            queue.delete_task_final(row["id"])
+                            removed += 1
+                self._invalidate_stats()
+                self._event(f"Удалено задач: {removed:,}. Файлы сохранены.")
+                return {"ok": True, "removed_tasks": removed}
+            # Freeze a durable, bounded snapshot before any remote/local deletion.
+            with self._queue() as queue, queue.exclusive_run(), DeletionJournal(self.state_dir / "deletions.sqlite3") as journal:
+                operation = journal.prepare(queue, preview)
+                self._deletion = {**journal.summary(), "resume_available": False}
+            self._deletion_pending = True
+            self._resume_upload = False
+            self._resume_job_id = None
+            self._resume_root_ids = None
+            self._resume_occurrence_id = None
+            return self._launch("deleting", self._perform_deletion)
+
+    def _perform_deletion(self):
+        api = None
+        with self._queue() as queue, queue.exclusive_run(), DeletionJournal(self.state_dir / "deletions.sqlite3") as journal:
+            operation = journal.operation()
+            if not operation or operation.get("state") not in {"confirmed", "running", "paused"}:
+                raise QueueError("Подтверждённое удаление не найдено.")
+            operation["state"] = "running"
+            journal.set_operation(operation)
+            try:
+                if operation["delete_cloud"]:
+                    api = self._new_api()
+                    api.require_account(queue.account_id)
+                self._phase("deleting", "Удаляем только выбранные задачи и подтверждённые файлы…")
+                after = 0
+                counters = journal.summary()
+                roots_by_id = {root.id: root for root in queue.roots()}
+                while True:
+                    entries = journal.pending(after_id=after)
+                    if not entries:
+                        break
+                    for entry in entries:
+                        self._check_stop()
+                        after = entry["id"]
+                        record = json.loads(entry["record"])
+                        current = queue.get_job(entry["id"], include_missing=True)
+                        try:
+                            if current is None:
+                                if ((not operation["delete_cloud"] or entry["cloud_done"])
+                                        and (not operation["delete_local"] or entry["local_done"])):
+                                    journal.done(entry["id"], "task_done")
+                                    counters["done"] += 1
+                                    continue
+                                raise ValueError("Задача была изменена или удалена; файлы не затронуты.")
+                            if current["status"] == "running":
+                                raise ValueError("Выполняющуюся задачу нельзя физически удалить.")
+                            identity_keys = ("root_id", "local_path", "size", "mtime_ns", "device", "inode")
+                            if any(str(current.get(key)) != str(record.get(key)) for key in identity_keys):
+                                raise ValueError("Исходник задачи изменился после подтверждения; удаление отменено.")
+                            if operation["delete_cloud"] and not entry["cloud_done"]:
+                                if record.get("cloud_present") and record.get("cloud_path") and record.get("cloud_hash"):
+                                    if any(current.get(key) != record.get(key) for key in ("cloud_path", "cloud_hash", "cloud_size")):
+                                        raise ValueError("Облачный объект задачи изменился после подтверждения.")
+                                    api.trash_file(record["cloud_path"], expected_hash=record["cloud_hash"],
+                                                   expected_size=record["cloud_size"])
+                                    if not queue.mark_cloud_deleted(entry["id"], expected_hash=record["cloud_hash"], expected_path=record["cloud_path"]):
+                                        raise QueueError("Не удалось сохранить подтверждение удаления облачного объекта.")
+                                journal.done(entry["id"], "cloud_done")
+                            if operation["delete_local"] and not entry["local_done"]:
+                                root = roots_by_id.get(record["root_id"])
+                                if root is None or str(root.path) != record["root"]:
+                                    raise ValueError("Подключение исходной папки изменилось; файл сохранён.")
+                                self._allowed_path(root.path, exists=False)
+                                expected = FileIdentity(record["size"], record["mtime_ns"], record["device"], int(record["inode"]))
+                                delete_local_file(Path(record["root"]), Path(record["local_path"]), expected, entry["stage"])
+                                journal.done(entry["id"], "local_done")
+                            queue.delete_task_final(entry["id"])
+                            journal.done(entry["id"], "task_done")
+                            counters["done"] += 1
+                        except (Cancelled, LocalDeletionRecoveryRequired):
+                            raise
+                        except (sqlite3.Error,):
+                            raise
+                        except Exception as error:
+                            if is_auth_failure(error):
+                                raise
+                            if (isinstance(error, TransportError) and self._stop.is_set()
+                                    and (self._pause_requested or self._shutting_down)):
+                                raise Cancelled("Подтверждённое удаление приостановлено; его можно продолжить.") from error
+                            message = str(error) if isinstance(error, (ValueError, QueueError, ProtocolError, TransportError)) else type(error).__name__
+                            journal.error(entry["id"], message)
+                            counters["errors"] += 1
+                            if current is not None:
+                                queue.record_task_error(entry["id"], "Удаление не завершено: " + message)
+                            self._event(f"Задача {entry['id']}: удаление не завершено. " + message, "warning")
+                        with self._lock:
+                            self._deletion = {**counters, "processed": counters["done"] + counters["errors"],
+                                              "resume_available": False}
+                        self._invalidate_stats()
+                operation["state"] = "complete"
+                operation["finished_at"] = time.time()
+                journal.set_operation(operation)
+                self._deletion_pending = False
+                summary = journal.summary()
+                with self._lock:
+                    self._deletion = {**summary, "resume_available": False}
+                if api is not None:
+                    try:
+                        api.quota()
+                    except (AuthError, ProtocolError, TransportError) as error:
+                        if is_auth_failure(error):
+                            self._invalidate_auth()
+                return "idle", f"Удалено задач: {summary['done']:,}. Ошибок удаления: {summary['errors']:,}."
+            except BaseException:
+                # Shutdown preserves a confirmed operation. A manual pause must
+                # wait for an explicit Continue instead of restarting silently.
+                operation["state"] = "running" if self._shutting_down else "paused"
+                journal.set_operation(operation)
+                self._deletion_pending = True
+                with self._lock:
+                    self._deletion = {**journal.summary(), "resume_available": True}
+                raise
+            finally:
+                if api is not None:
+                    api.close_thread()
+                self._invalidate_stats()
+
+    def jobs(self, status: str | None = None, limit: int = 50, offset: int = 0, sort: str = "asc") -> dict:
+        if status in ("", "all"):
+            status = None
+        if status is not None and status not in (*STATES, "paused", "uploaded_unlimited", "uploaded_regular", "uploaded_unknown"):
+            raise ValueError("Неизвестный фильтр задач.")
+        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0 or sort not in {"asc", "desc"}:
             raise ValueError("Некорректная страница списка задач.")
         if self._configuration is None:
-            return {"jobs": [], "total": 0, "offset": offset, "limit": limit}
-        fields = {"id", "root_id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
-                  "last_error", "skip_reason", "next_attempt", "uploaded_at", "storage_mode",
-                  "paused", "remove_requested"}
-        with self._queue() as queue:
-            rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True)
-            stats = self._display_stats(queue)
+            return {"jobs": [], "total": 0, "total_bytes": 0, "offset": offset, "limit": limit, "sort": sort}
+        key = (status, limit, offset, sort)
+        with self._stats_lock:
+            cached = self._jobs_cache.get(key)
+            if cached is None or (self._operation is not None and time.monotonic() - cached[0] >= 5):
+                with self._queue() as queue:
+                    rows = queue.list_jobs(status, limit=limit, offset=offset, summary=True, sort=sort)
+                    totals = queue.jobs_summary(status)
+                self._jobs_cache[key] = (time.monotonic(), rows, totals)
+                self._jobs_cache.move_to_end(key)
+                while len(self._jobs_cache) > 32:
+                    self._jobs_cache.popitem(last=False)
+            _, rows, totals = copy.deepcopy(self._jobs_cache[key])
         with self._lock:
             active = copy.deepcopy(self._files)
+        fields = {"id", "root_id", "relative_path", "local_path", "remote_path", "status", "size", "attempts",
+                  "last_error", "skip_reason", "next_attempt", "uploaded_at", "storage_mode", "created_at",
+                  "paused", "remove_requested", "planned_mode", "planned_reason", "observed_mode",
+                  "cloud_present", "cloud_verified", "cloud_path", "cloud_size", "cloud_observed_at", "cloud_deleted_at"}
         items = []
         for row in rows:
             item = {k: v for k, v in row.items() if k in fields}
-            item["paused"] = bool(row.get("paused"))
-            item["remove_requested"] = bool(row.get("remove_requested"))
+            for name in ("paused", "remove_requested", "cloud_present", "cloud_verified"):
+                item[name] = bool(row.get(name))
             content_url = f"/api/tasks/{row['id']}/content"
             item["download_url"] = content_url + "?download=1"
-            item["preview_url"] = (content_url + "?download=0"
-                                   if Path(row["local_path"]).suffix.casefold() in {".jpg", ".jpeg", ".png", ".webp", ".gif"} else None)
-            item["cloud_url"] = ("https://cloud.mail.ru/home" + quote(row["remote_path"], safe="/")
-                                 if row["status"] == "uploaded" or row.get("skip_reason") == "remote_exists" else None)
+            item["preview_url"] = content_url + "?download=0"
+            item["cloud_url"] = ("https://cloud.mail.ru/home" + quote(row["cloud_path"], safe="/")
+                                 if row.get("cloud_present") and row.get("cloud_path") else None)
             item["progress"] = None
             current = active.get(row["id"])
             if row["status"] == "running" and current:
@@ -537,8 +839,8 @@ class WebService:
                                     "percent": sent / total * 100 if total else 0,
                                     "stage": current.get("stage", "preparing")}
             items.append(item)
-        return {"jobs": items, "total": stats.get(status, 0) if status else stats["total"],
-                "offset": offset, "limit": limit}
+        return {"jobs": items, "total": totals["total"], "total_bytes": totals["total_bytes"],
+                "offset": offset, "limit": limit, "sort": sort}
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -550,9 +852,9 @@ class WebService:
             activity["current_files"] = copy.deepcopy(list(self._files.values()))
             result = {"version": __version__, "configured": self._configuration is not None,
                       "authenticated": self._authenticated, "auth_required": self._auth_required,
-                      "destination": None, "account": None,
-                      "sources": [], "stats": {**{s: 0 for s in STATES}, "total": 0, "total_bytes": 0,
-                                                "uploaded_bytes": 0, "ready": 0, "permanent_failures": 0},
+                      "destination": None, "account": None, "sources": [],
+                      "stats": {**{s: 0 for s in STATES}, "total": 0, "total_bytes": 0,
+                                "uploaded_bytes": 0, "ready": 0, "permanent_failures": 0},
                       "activity": activity, "settings": dict(self._settings),
                       "quota": quota, "quota_error": self._quota_error,
                       "quota_refreshing": self._operation == "quota",
@@ -560,41 +862,55 @@ class WebService:
                           and not self._closed and not self._logout_requested and not self._auto_pending,
                       "task_controls_available": self._task_controls_available(),
                       "queue_clear_available": self._configuration is not None and self._operation is None
-                          and not self._closed and not self._logout_requested,
-                      "last_scan": None, "probe": None, "events": copy.deepcopy(self._events)}
-        if self._configuration is not None:
-            with self._queue() as queue:
-                report = queue.get_metadata("probe", {})
-                result.update(destination=queue.destination, account=queue.account_id,
-                              sources=[dataclasses.asdict(r) for r in queue.roots()], stats=self._display_stats(queue),
-                              last_scan=queue.get_metadata("last_scan"))
-                if isinstance(report, dict) and report:
-                    result["probe"] = {k: report[k] for k in ("result", "started_at", "finished_at", "explanation", "error") if k in report}
-                    before = report.get("before", {}).get("used_bytes") if isinstance(report.get("before"), dict) else None
-                    if type(before) is int:
-                        result["probe"]["quota_deltas"] = [m["used_bytes"] - before for m in report.get("measurements", [])
-                                                            if isinstance(m, dict) and type(m.get("used_bytes")) is int]
+                          and not self._closed and not self._logout_requested and not self._deletion_pending,
+                      "local_delete_available": local_delete_supported(),
+                      "deletion": copy.deepcopy(self._deletion),
+                      "last_scan": None, "events": copy.deepcopy(self._events),
+                      "scheduler": self.scheduler.summary() if self.scheduler is not None else None}
+            if self._configuration is not None:
+                result.update(self._database_snapshot())
+        stats = result["stats"]
+        result["storage_plan"] = {key: {"count": stats.get(prefix + "_count", 0), "bytes": stats.get(prefix + "_bytes", 0)}
+            for key, prefix in (("unlimited", "planned_unlimited"), ("regular", "planned_regular"),
+                                ("uploaded", "uploaded_total"), ("uploaded_unlimited", "uploaded_unlimited"),
+                                ("uploaded_regular", "uploaded_regular"), ("uploaded_unknown", "uploaded_unknown"))}
         return result
 
     def _launch(self, name: str, function: Callable[[], tuple[str, str]], *, upload_intent: bool = False) -> dict:
         with self._lock:
             self._ensure_idle()
+            if name in {"upload", "scanning"}:
+                self._ensure_no_deletion()
             self._stop = self._event_factory()
             self._pause_requested = False
             self._shutting_down = False
             self._operation = name
             self._files.clear()
             self._task_signals.clear()
+            self._priority_jobs.clear()
+            self._task_starts_closed = name != "upload"
+            self._deletion_previews.clear()
             self._uploaded_in_run = 0
             self._invalidate_stats()
             self._resume_upload = upload_intent
             self._auto_pending = False
-            self._activity.update(phase=name if name in {"login", "scanning", "quota"} else "checking",
+            self._activity.update(phase=name if name in {"login", "scanning", "quota", "deleting"} else "checking",
                                   message="Запускаем операцию…", last_error=None, started_at=time.time(),
-                                  scan=None, probe_wait_until=None)
-            self._persist_activity()
-            self._thread = threading.Thread(target=self._execute, args=(function,), name="mailru-web-task", daemon=True)
-            self._thread.start()
+                                  scan=None)
+            try:
+                self._persist_activity()
+                self._thread = threading.Thread(target=self._execute, args=(function,), name="mailru-web-task", daemon=True)
+                self._thread.start()
+            except Exception:
+                # Do not strand a controller as busy if no worker was started.
+                self._operation = None
+                self._thread = None
+                self._task_starts_closed = True
+                self._resume_upload = self._auto_pending = False
+                self._activity.update(phase="paused", message="Не удалось начать операцию. Проверьте доступ к папке состояния и повторите запуск.")
+                with contextlib.suppress(OSError, QueueError):
+                    self._persist_activity()
+                raise
         return {"ok": True, "started": name}
 
     def _execute(self, function: Callable[[], tuple[str, str]]) -> None:
@@ -605,11 +921,17 @@ class WebService:
                     raise Cancelled("Приостановлено.")
                 if self._shutting_down and self._resume_upload:
                     with self._queue() as queue:
-                        stats = queue.stats()
-                    remaining = stats["remaining"]
+                        if self._resume_job_id is not None:
+                            row = queue.get_job(self._resume_job_id, include_missing=True)
+                            remaining = bool(row and row["present"] and not row["paused"] and not row["remove_requested"] and
+                                             (row["status"] in {"pending", "running"} or
+                                              (row["status"] == "failed" and row["next_attempt"] is not None)))
+                        else:
+                            remaining = queue.stats(root_ids=self._resume_root_ids)["remaining"]
                     if remaining:
                         raise Cancelled("Остановка процесса; сохранено намерение продолжить очередь.")
                 self._resume_upload = False
+                self._resume_job_id = None
             self._phase(phase, message)
         except Cancelled:
             with self._lock:
@@ -625,7 +947,7 @@ class WebService:
                         self._resume_upload = False
                 self._phase("paused", "Приостановлено. Очередь сохранена после завершения сетевого запроса.")
             else:
-                safe = str(error) if isinstance(error, (QueueError, AuthError, ProtocolError, TransportError, ProbeRequired, ValueError)) else f"Ошибка {type(error).__name__}; очередь сохранена."
+                safe = str(error) if isinstance(error, (QueueError, AuthError, ProtocolError, TransportError, ValueError)) else f"Ошибка {type(error).__name__}; очередь сохранена."
                 with self._lock:
                     self._resume_upload = False
                     if is_auth_failure(error):
@@ -636,7 +958,7 @@ class WebService:
                 self._invalidate_stats()
                 self._files.clear()
                 self._task_signals.clear()
-                self._activity["probe_wait_until"] = None
+                self._task_starts_closed = True
                 if self._logout_requested:
                     try:
                         self._complete_logout()
@@ -647,6 +969,8 @@ class WebService:
                         LOGGER.error("phase=logout error=True")
                 self._operation = None
                 self._persist_activity()
+                if self.scheduler is not None:
+                    self.scheduler.wake()
                 if self._closed:
                     self._release_server_lock()
 
@@ -667,9 +991,6 @@ class WebService:
         """
         if self._configuration is not None:
             with self._queue() as queue, queue.exclusive_run():
-                report = queue.get_metadata("probe")
-                if isinstance(report, dict) and report:
-                    queue.set_metadata("probe", {**report, "result": "invalidated", "reason": "logout"})
                 queue.set_metadata("last_auth", {"result": "logged_out", "at": time.time()})
                 TokenStore(self.state_dir / "auth.dat").clear()
         else:
@@ -693,7 +1014,7 @@ class WebService:
             self._pause_requested = True
             self._stop.set()
             self._activity.update(phase="logout", message="Завершаем текущую операцию и выходим из Mail.ru…",
-                                  last_error=None, probe_wait_until=None)
+                                  last_error=None)
             # Persist before signalling completion, including when a login or
             # token refresh is currently in flight and may still save tokens.
             self._persist_activity()
@@ -743,9 +1064,6 @@ class WebService:
                     self._check_stop()
                     # A quota read may refresh the in-memory token too.
                     TokenStore(self.state_dir / "auth.dat").save(memory.value)
-                    previous = queue.get_metadata("probe")
-                    if isinstance(previous, dict) and previous.get("result") == "provisional_pass":
-                        queue.set_metadata("probe", {**previous, "result": "invalidated", "reason": "new_login"})
                     queue.set_metadata("last_auth", {"result": "success", "at": time.time(), "stage": "user_info", "client_id": tokens.client_id})
                     with self._lock:
                         self._authenticated = True
@@ -763,7 +1081,7 @@ class WebService:
             self._ensure_configuration()
             return self._launch("login", perform)
 
-    def _scan_queue(self, queue: Queue) -> None:
+    def _scan_queue(self, queue: Queue, root_ids=None) -> None:
         self._phase("scanning", "Сканируем папки с фото и видео…")
         def on_progress(result):
             with self._lock:
@@ -772,20 +1090,37 @@ class WebService:
         with queue.exclusive_run():
             queue.recover_running()
             for source in queue.roots():
-                self._allowed_path(source.path)
+                if root_ids is None or source.id in root_ids:
+                    self._allowed_path(source.path)
             extensions = queue.discovery_extensions()
-            queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started"})
-            result = queue.scan(extensions, stop=self._stop, progress=on_progress)
-            queue.set_metadata("last_scan", dataclasses.asdict(result))
+            queue.set_metadata("last_scan", {"complete": False, "reason": "scan_started", "root_ids": root_ids})
+            result = queue.scan(extensions, stop=self._stop, progress=on_progress, root_ids=root_ids)
+            queue.set_metadata("last_scan", {**dataclasses.asdict(result), "root_ids": root_ids,
+                                             "occurrence_id": self._resume_occurrence_id})
             queue.set_metadata("extensions", sorted(extensions))
+            queue.apply_regular_policy(upload=self._settings["regular_policy"] == "upload", root_ids=root_ids)
         self._check_stop()
         if not result.complete:
             raise QueueError(f"Сканирование завершилось с ошибками: {result.error_count}. Проверьте доступ к папкам.")
         LOGGER.info("scan_complete seen=%d added=%d changed=%d",
                     result.seen, result.added, result.changed)
-        self._reconcile_queue(queue)
+        self._reconcile_queue(queue, root_ids=root_ids)
+        if self._authenticated:
+            api = None
+            try:
+                api = self._new_api()
+                api.require_account(queue.account_id)
+                api.quota()
+            except (ProtocolError, AuthError, TransportError) as error:
+                if is_auth_failure(error):
+                    self._invalidate_auth()
+                self._event("Сканирование завершено, но свежая квота недоступна. Обновите её перед обычной загрузкой.", "warning")
+            finally:
+                if api is not None:
+                    api.close_thread()
+        self._invalidate_stats()
 
-    def _reconcile_queue(self, queue: Queue) -> None:
+    def _reconcile_queue(self, queue: Queue, root_ids=None) -> None:
         if not self._settings["remote_reconcile"]:
             return
         if not self._authenticated:
@@ -807,7 +1142,7 @@ class WebService:
                 # Optional by construction: disabled installations do not even
                 # import the reconciliation implementation.
                 from .reconcile import reconcile
-                report = reconcile(queue, api, stop=self._stop, progress=progress)
+                report = reconcile(queue, api, stop=self._stop, progress=progress, root_ids=root_ids)
                 queue.set_metadata("last_reconcile", {"at": time.time(), **report})
                 progress(report)
                 if report.get("auth_required"):
@@ -850,8 +1185,8 @@ class WebService:
             elif event == "file_started":
                 self._files[data["job_id"]] = {"id": data["job_id"], "path": data["path"], "size": data["size"],
                                                "sent": 0, "stage": "preparing", "storage_mode": data.get("storage_mode")}
-            elif event == "large_files_skipped":
-                self._event(f"Пропущено файлов больше 2 ГБ: {data['count']:,}. Этот размер не поддерживается автозагрузкой.")
+            elif event == "regular_files_skipped":
+                self._event(f"Пропущено задач, требующих квоты: {data['count']:,}. Изменить правило можно в настройках.")
             elif event == "upload_progress":
                 item = self._files.get(data["job_id"])
                 if item:
@@ -860,150 +1195,17 @@ class WebService:
             elif event == "file_finished":
                 self._files.pop(data["job_id"], None)
                 self._invalidate_stats()
-            elif event == "probe_wait":
-                self._activity["probe_wait_until"] = time.time() + data["seconds"]
-                self._activity["message"] = "Проверяем, что фото и видео не расходуют квоту…"
             elif event == "uploaded":
                 self._uploaded_in_run += 1
                 if self._uploaded_in_run % 100 == 0:
                     self._event(f"За текущий запуск загружено файлов: {self._uploaded_in_run:,}.")
                     LOGGER.info("uploaded_in_run=%d", self._uploaded_in_run)
-            elif event in {"file_error", "file_changed", "skipped"}:
+            elif event in {"file_error", "file_changed", "skipped", "quota_warning"}:
                 self._event(str(data.get("reason", "Ошибка файла.")), "warning")
             elif event == "remote_error":
                 self._event(f"Ошибка сервера: HTTP {data.get('status')}, {data.get('code')}.", "warning")
             elif event == "retry":
                 self._event(f"Файл {data.get('job_id')}: соединение прервано, повторная попытка отложена.", "warning")
-
-    def _valid_probe(self, report: Any, account: str, destination: str) -> bool:
-        if not isinstance(report, dict):
-            return False
-        finished = report.get("finished_at")
-        before = report.get("before")
-        return (report.get("result") == "provisional_pass" and report.get("protocol") == PROTOCOL_VERSION
-                and report.get("account") == account and report.get("destination") == destination
-                and type(finished) in (int, float) and math.isfinite(finished) and 0 <= time.time() - finished <= 86400
-                and isinstance(before, dict) and type(before.get("used_bytes")) is int)
-
-    def _can_resume_probe(self, report: Any, account: str, destination: str) -> bool:
-        if not isinstance(report, dict) or report.get("result") not in {"incomplete", "interrupted"}:
-            return False
-        started = report.get("started_at")
-        before = report.get("before")
-        samples = report.get("samples")
-        return (report.get("protocol") == PROTOCOL_VERSION and report.get("account") == account
-                and report.get("destination") == destination and type(started) in (int, float)
-                and math.isfinite(started) and 0 <= time.time() - started <= 86400
-                and isinstance(before, dict) and type(before.get("used_bytes")) is int
-                and isinstance(samples, list) and len(samples) <= 10
-                and (samples or type(report.get("active_job_id")) is int)
-                and all(isinstance(s, dict) and s.get("is_unlim_upload") is True
-                        and s.get("stat_matched") is True
-                        and ((s.get("commit_accepted") is True and s.get("unlimited_evidence") == "commit_response")
-                             or (s.get("recovered_commit") is True and s.get("unlimited_evidence") == "saved_commit_response"))
-                        and type(s.get("job_id")) is int for s in samples))
-
-    @staticmethod
-    def _proof_belongs_to_probe(metadata: dict, started: float) -> bool:
-        if metadata.get("unlimited_evidence") == "commit_response":
-            return metadata.get("commit_accepted") is True
-        if metadata.get("unlimited_evidence") != "saved_commit_response":
-            return False
-        created = metadata.get("commit_intent_created_at")
-        confirmed = metadata.get("unlimited_confirmed_at")
-        return (metadata.get("recovered_commit") is True and type(created) in (int, float)
-                and type(confirmed) in (int, float) and started <= created <= confirmed <= time.time())
-
-    def _resume_probe(self, queue: Queue, api: CloudAPI, previous: dict) -> dict:
-        """Resume only a recent interrupted probe, keeping its original baseline.
-
-        File history/intents must prove that this probe performed the confirmed
-        commit. Both quota measurements restart; no unrelated new sample is used.
-        """
-        report = copy.deepcopy(previous)
-        with queue.exclusive_run():
-            report.update(result="incomplete", measurements=[], resumed_at=time.time())
-            report.pop("error", None)
-            queue.set_metadata("probe", report)
-            try:
-                active_id = report.get("active_job_id")
-                if type(active_id) is int:
-                    # The immutable origin ID also finds detached history after
-                    # the user removed a task during this interrupted probe.
-                    history = [row for row in queue.upload_history(active_id)
-                               if row.get("uploaded_at", 0) >= report["started_at"]
-                               and row["verified_metadata"].get("protocol") == PROTOCOL_VERSION
-                               and row["verified_metadata"].get("is_unlim_upload") is True
-                               and row["verified_metadata"].get("stat_matched") is True
-                               and self._proof_belongs_to_probe(row["verified_metadata"], report["started_at"])]
-                    if history and not any(sample.get("job_id") == active_id for sample in report["samples"]):
-                        report["samples"].append({"job_id": active_id, **history[-1]["verified_metadata"]})
-                    report.pop("active_job_id", None)
-                    queue.set_metadata("probe", report)
-                requested = report.get("requested_count", 1)
-                if type(requested) is not int or not 1 <= requested <= 10:
-                    raise ProtocolError("Некорректное число образцов сохранённой проверки.")
-                while len(report["samples"]) < requested:
-                    job = queue.claim(max_attempts=5, storage_mode="unlimited", stop=self._stop)
-                    if job is None:
-                        self._check_stop()
-                        retry_at = queue.stats(storage_mode="unlimited").get("next_retry_at")
-                        if retry_at is not None:
-                            if api.stop.wait(max(0.1, min(10, retry_at - time.time()))):
-                                raise Cancelled("Контрольная проверка приостановлена.")
-                            continue
-                        report["result"] = "insufficient_new_samples"
-                        raise ProbeRequired("Нет доступных новых задач для завершения контрольной проверки.")
-                    report["active_job_id"] = job.id
-                    queue.set_metadata("probe", report)
-                    result = process_probe_job(queue, api, job, baseline=report["before"]["used_bytes"],
-                                               emit=self._emit, file_progress=True, task_scope=self._task_scope)
-                    report.pop("active_job_id", None)
-                    if result is not None and self._proof_belongs_to_probe(result, report["started_at"]):
-                        report["samples"].append(result)
-                    else:
-                        report["other_candidates"] = report.get("other_candidates", 0) + 1
-                    queue.set_metadata("probe", report)
-                for sample in report["samples"]:
-                    evidence = [row for row in queue.upload_history(sample["job_id"])
-                                if row.get("uploaded_at", 0) >= report["started_at"]
-                                and row.get("remote_hash") == sample.get("hash")
-                                and row.get("source_size") == sample.get("size")
-                                and row["verified_metadata"].get("protocol") == PROTOCOL_VERSION
-                                and row["verified_metadata"].get("is_unlim_upload") is True
-                                and row["verified_metadata"].get("unlimited_evidence") in {"commit_response", "saved_commit_response"}
-                                and row["verified_metadata"].get("path") == sample.get("path")
-                                and self._proof_belongs_to_probe(row["verified_metadata"], report["started_at"])]
-                    if not evidence or api.stat(sample["path"]) != {"hash": sample["hash"], "size": sample["size"]}:
-                        raise ProtocolError("Не удалось подтвердить файл прерванной контрольной проверки.")
-                for step in range(2):
-                    self._emit("probe_wait", {"seconds": self._settle_seconds / 2, "measurement": step + 1})
-                    if api.stop.wait(self._settle_seconds / 2):
-                        raise Cancelled("Контрольная проверка приостановлена.")
-                    api.require_account(report["account"])
-                    quota = api.quota()
-                    report["measurements"].append({"at": time.time(), **quota})
-                    queue.set_metadata("probe", report)
-                unchanged = all(q["used_bytes"] == report["before"]["used_bytes"] for q in report["measurements"])
-                report["result"] = "provisional_pass" if unchanged else "quota_changed"
-                report["explanation"] = "Проверка безлимита завершена, квота не изменилась." if unchanged else "Квота изменилась; массовая загрузка не начата."
-            except Cancelled:
-                report["result"] = "interrupted"
-                raise
-            except TransportError:
-                if api.stop.is_set():
-                    report["result"] = "interrupted"
-                    raise Cancelled("Контрольная проверка приостановлена.") from None
-                report["result"] = "failed"
-                raise
-            except Exception:
-                if report.get("result") != "insufficient_new_samples":
-                    report["result"] = "failed"
-                raise
-            finally:
-                report["finished_at"] = time.time()
-                queue.set_metadata("probe", report)
-        return report
 
     @staticmethod
     def _completion(stats: dict) -> tuple[str, str]:
@@ -1018,94 +1220,101 @@ class WebService:
                                  "Подробности и повтор — в очереди задач.")
         return "completed", "Все фото и видео загружены и проверены."
 
-    def _pipeline(self) -> tuple[str, str]:
+    def _pipeline(self, job_id: int | None = None, *, root_ids=None, scan_first=False) -> tuple[str, str]:
         api = None
         with self._queue() as queue, queue.exclusive_run():
-            with queue.exclusive_run():
-                queue.recover_running()
-                if not queue.roots():
-                    raise ValueError("Добавьте хотя бы одну папку с фото и видео.")
-                for source in queue.roots():
-                    self._allowed_path(source.path)
+            queue.recover_running()
+            if not queue.roots():
+                raise ValueError("Добавьте хотя бы одну папку с фото и видео.")
             last_scan = queue.get_metadata("last_scan", {})
-            if not isinstance(last_scan, dict) or last_scan.get("complete") is not True:
-                self._scan_queue(queue)
+            scan_scope = last_scan.get("root_ids") if isinstance(last_scan, dict) else None
+            scope_covered = scan_scope is None or (root_ids is not None and set(root_ids).issubset(set(scan_scope)))
+            scheduled_scan_missing = (self._resume_occurrence_id is not None and
+                                      (not isinstance(last_scan, dict) or last_scan.get("occurrence_id") != self._resume_occurrence_id))
+            if scan_first or scheduled_scan_missing or not isinstance(last_scan, dict) or last_scan.get("complete") is not True or not scope_covered:
+                self._scan_queue(queue, root_ids=root_ids)
             self._check_stop()
             if not self._authenticated:
-                # The optional comparison may have discovered rejected
-                # credentials during this launch. Do not start an uploader
-                # with the same saved tokens after that explicit rejection.
-                raise AuthError("Для продолжения требуется повторный вход в Mail.ru.", code="auth_rejected")
-            skipped = queue.skip_large_disabled()
-            if skipped:
-                self._emit("large_files_skipped", {"count": skipped})
-                self._invalidate_stats()
-            stats = queue.stats()
-            remaining = stats["remaining"]
-            old_probe = queue.get_metadata("probe", {})
-            preflight_check = self._settings["preflight_check"]
-            resume_control = preflight_check and self._can_resume_probe(old_probe, queue.account_id, queue.destination)
-            small = queue.stats(storage_mode="unlimited")
-            remaining_small = small["remaining"]
-            preflight_check = preflight_check and (remaining_small > 0 or resume_control)
-            if not remaining and not resume_control:
-                return self._completion(stats)
+                raise AuthError("Для продолжения требуется вход в Mail.ru.", code="auth_rejected")
+            queue.apply_regular_policy(upload=self._settings["regular_policy"] == "upload", root_ids=root_ids)
+            with self._lock:
+                stats = queue.stats(root_ids=root_ids)
+                if not stats["remaining"] and not self._priority_jobs:
+                    self._task_starts_closed = True
+                    return self._completion(stats)
             api = self._new_api()
             try:
-                self._phase("checking", "Проверяем аккаунт и доступность безлимита…")
-                with queue.exclusive_run():
-                    account = api.require_account(queue.account_id)
-                    queue.bind_account(account.email)
-                    report = queue.get_metadata("probe", {})
-                    valid = preflight_check and self._valid_probe(report, account.email, queue.destination)
-                    if valid:
-                        valid = api.quota()["used_bytes"] == report["before"]["used_bytes"]
-                if preflight_check and not valid:
-                    self._phase("probing", "Проверяем безлимит на одном файле перед загрузкой архива…")
-                    try:
-                        if self._can_resume_probe(report, account.email, queue.destination):
-                            report = self._resume_probe(queue, api, report)
-                        else:
-                            stats = queue.stats(storage_mode="unlimited")
-                            retry_at = stats.get("next_retry_at")
-                            if stats["ready"] == 0 and retry_at is not None:
-                                self._phase("probing", "Ожидаем повторной попытки после временного сбоя…")
-                                if api.stop.wait(max(0, retry_at - time.time())):
-                                    raise Cancelled("Приостановлено.")
-                            report = probe(queue, api, count=1, settle_seconds=self._settle_seconds,
-                                           emit=self._emit, file_progress=True, task_scope=self._task_scope)
-                    except ProbeRequired:
-                        current_stats = queue.stats()
-                        if current_stats["remaining"] == 0:
-                            return self._completion(current_stats)
-                        raise
-                    if report.get("result") != "provisional_pass":
-                        raise ProbeRequired("Квота изменилась во время проверки. Загрузка приостановлена; повторите запуск при стабильной квоте.")
-                self._check_stop()
-                self._phase("uploading", "Загружаем фото и видео в безлимит…")
-                result = run(queue, api, workers=self._settings["workers"], emit=self._emit,
-                             file_progress=True, require_probe=preflight_check, task_scope=self._task_scope)
-                if result.get("auth_required"):
-                    # A user pause or shutdown can race the server rejection.
-                    # Preserve its meaning even when the visible phase should
-                    # remain paused while workers drain.
-                    self._invalidate_auth()
-                if self._pause_requested or self._shutting_down:
-                    raise Cancelled("Приостановлено.")
-                if result.get("stopped"):
+                self._phase("uploading", "Выполняем выбранную задачу…" if job_id else "Загружаем фото и видео…")
+                selected = job_id
+                budget = QuotaBudget()
+                while True:
+                    result = run(queue, api, workers=self._settings["workers"], emit=self._emit,
+                                 file_progress=True, task_scope=self._task_scope, job_id=selected,
+                                 priority_job=self._next_priority_job, root_ids=root_ids, quota_budget=budget,
+                                 regular_policy=self._settings["regular_policy"],
+                                 unexpected_unlimited_action=self._settings["unexpected_unlimited_action"])
                     if result.get("auth_required"):
-                        raise AuthError("Для продолжения требуется повторный вход в Mail.ru.", code="auth_rejected")
-                    raise ProtocolError((result.get("errors") or ["Загрузка остановлена; очередь сохранена."])[0])
-                return self._completion(queue.stats())
+                        self._invalidate_auth()
+                    if result.get("stopped") and result.get("errors"):
+                        if result.get("auth_required"):
+                            raise AuthError("Для продолжения требуется вход в Mail.ru.", code="auth_rejected")
+                        raise ProtocolError(result["errors"][0])
+                    with self._lock:
+                        if self._pause_requested or self._shutting_down or result.get("stopped"):
+                            raise Cancelled("Приостановлено; очередь сохранена.")
+                        # Workers can finish before the final quota request.
+                        # Every Start accepted in that interval must be drained
+                        # before atomically closing admission to this operation.
+                        if self._priority_jobs:
+                            selected = self._priority_jobs.popleft()
+                        else:
+                            self._task_starts_closed = True
+                            break
+                if job_id is not None:
+                    return "idle", "Выбранная задача обработана. Остальные задачи ожидают общего запуска."
+                return self._completion(queue.stats(root_ids=root_ids))
             finally:
+                with self._lock:
+                    self._task_starts_closed = True
                 api.close_thread()
 
-    def start(self) -> dict:
+    def start(self, *, job_id: int | None = None, root_ids=None, occurrence_id=None) -> dict:
+        if self._deletion_pending:
+            with DeletionJournal(self.state_dir / "deletions.sqlite3") as journal:
+                operation = journal.operation()
+            if operation and operation.get("delete_cloud") and not self._authenticated:
+                raise ValueError("Для продолжения удаления из Облака войдите в Mail.")
+            return self._launch("deleting", self._perform_deletion)
+        if occurrence_id is None and job_id is None and root_ids is None and self._resume_occurrence_id:
+            prior = self.scheduler.occurrence(self._resume_occurrence_id)
+            if prior and prior["status"] in {"paused", "running"}:
+                occurrence_id = prior["id"]
+        if occurrence_id is not None:
+            if not self._authenticated:
+                raise ValueError("Для продолжения планировщика войдите в аккаунт Mail.")
+            item = self.scheduler.occurrence(occurrence_id)
+            if item is None:
+                raise ValueError("Сохранённый запуск планировщика не найден.")
+            with self._lock:
+                if item["status"] == "running" and self._operation is None:
+                    # A failed disk write before thread.start may also prevent
+                    # the paused checkpoint. Explicit Continue retries it once
+                    # storage is writable again; it never replaces a live run.
+                    self.scheduler.finish(item["id"], "paused", "Повторный запуск после незавершённого старта.")
+                    item = self.scheduler.occurrence(item["id"])
+            if not self._start_scheduled(item, scan_first=False):
+                raise QueueBusyError("Дождитесь завершения текущей операции.")
+            return {"ok": True, "started": "scheduled_upload"}
         if self._configuration is None:
             raise ValueError("Добавьте хотя бы одну исходную папку с фото и видео.")
         if not self._authenticated:
             raise ValueError("Сначала войдите в аккаунт Mail.")
-        return self._launch("upload", self._pipeline, upload_intent=True)
+        with self._lock:
+            self._ensure_idle()
+            self._resume_job_id = job_id
+            self._resume_root_ids = root_ids
+            self._resume_occurrence_id = None
+            return self._launch("upload", lambda: self._pipeline(job_id=job_id, root_ids=root_ids), upload_intent=True)
 
     def pause(self) -> dict:
         with self._lock:
@@ -1115,6 +1324,8 @@ class WebService:
             self._auto_pending = False
             self._pause_requested = True
             self._stop.set()
+            if self.scheduler is not None:
+                self.scheduler.cancel_queued("Общая пауза: ожидавший запуск отменён. Будущие расписания сохранены.")
             self._activity.update(phase="pausing" if self._operation else "paused",
                                   message="Приостанавливаем операцию, сохраняем очередь…" if self._operation else "Приостановлено. Очередь сохранена.")
             self._persist_activity()
@@ -1132,12 +1343,27 @@ class WebService:
             return {"ok": True, "queued_again": count}
 
     def resume_if_requested(self) -> bool:
+        try:
+            return self._resume_if_requested()
+        finally:
+            if self.scheduler is not None:
+                self.scheduler.start()
+
+    def _resume_if_requested(self) -> bool:
         """Call after the HTTP listener is ready; no spontaneous fresh uploads."""
         with self._lock:
             requested = self._auto_pending and self._settings["auto_resume"] and not self._closed
-        if requested:
+        if self._auto_deletion:
+            self._auto_deletion = False
             try:
                 self.start()
+            except (ValueError, QueueError) as error:
+                self._phase("paused", str(error), error=str(error))
+                return False
+            return True
+        if requested:
+            try:
+                self.start(job_id=self._resume_job_id, root_ids=self._resume_root_ids, occurrence_id=self._resume_occurrence_id)
             except (ValueError, QueueError) as error:
                 with self._lock:
                     self._resume_upload = False
@@ -1146,6 +1372,78 @@ class WebService:
                 return False
             return True
         return False
+
+    def schedules(self):
+        return self.scheduler.list()
+
+    def save_schedule(self, data):
+        with self._lock:
+            if self._closed:
+                raise QueueBusyError("Приложение останавливается.")
+            roots = self._database_snapshot()["sources"] if self._configuration is not None else []
+            result = self.scheduler.save(data, [root["id"] for root in roots])
+            self._event("Сохранён планировщик: " + result["name"] + ".")
+            return self.scheduler.list()
+
+    def toggle_schedule(self, identifier, enabled):
+        with self._lock:
+            self.scheduler.toggle(self._source_id(identifier), enabled)
+            return self.scheduler.list()
+
+    def remove_schedule(self, identifier):
+        with self._lock:
+            self.scheduler.remove(self._source_id(identifier))
+            return self.scheduler.list()
+
+    def _start_scheduled(self, occurrence, *, scan_first=True):
+        with self._lock:
+            if (self._closed or self._shutting_down or self._operation is not None
+                    or self._deletion_pending or self._logout_requested or not self._authenticated):
+                return False
+            current = self.scheduler.occurrence(occurrence["id"])
+            if current is None or current["status"] not in {"queued", "paused"}:
+                return False
+            item = self.scheduler.begin(occurrence["id"])
+            self._resume_job_id = None
+            self._resume_root_ids = list(item["source_ids"])
+            self._resume_occurrence_id = item["id"]
+            try:
+                self._event("Запущен планировщик: " + item["name"] + ".")
+                self._launch("upload", lambda: self._scheduled_pipeline(item, scan_first=scan_first), upload_intent=True)
+            except Exception:
+                # begin() is durable before any work. A launch failure must be
+                # resumable now, without needing a process restart to recover it.
+                self._resume_upload = self._auto_pending = False
+                self._activity.update(phase="paused", message="Планировщик не смог начать работу. Проверьте папку состояния и нажмите «Продолжить».")
+                with contextlib.suppress(Exception):
+                    self.scheduler.finish(item["id"], "paused", "Не удалось начать работу. Запуск можно продолжить.")
+                with contextlib.suppress(OSError, QueueError):
+                    self._persist_activity()
+                raise
+            return True
+
+    def _scheduled_pipeline(self, occurrence, *, scan_first):
+        try:
+            result = self._pipeline(root_ids=occurrence["source_ids"], scan_first=scan_first)
+        except Cancelled:
+            status = "running" if self._shutting_down else "paused"
+            self.scheduler.finish(occurrence["id"], status, "Выполнение приостановлено; очередь сохранена.")
+            raise
+        except Exception as error:
+            safe = str(error) if isinstance(error, (ValueError, QueueError, ProtocolError, AuthError, TransportError)) else type(error).__name__
+            self.scheduler.finish(occurrence["id"], "error", safe)
+            with self._lock:
+                self._resume_upload = False
+                self._resume_occurrence_id = None
+                self._resume_root_ids = None
+            raise
+        else:
+            self.scheduler.finish(occurrence["id"], "complete", result[1])
+            with self._lock:
+                self._resume_upload = False
+                self._resume_occurrence_id = None
+                self._resume_root_ids = None
+            return result
 
     def _release_server_lock(self) -> None:
         with self._lock:
@@ -1158,6 +1456,8 @@ class WebService:
             if self._closed:
                 return
             self._closed = True
+            if self.scheduler is not None:
+                self.scheduler.close(wait=False)
             self._shutting_down = True
             self._stop.set()
             self._persist_activity()
@@ -1168,3 +1468,5 @@ class WebService:
         # A second controller must not reuse the same state concurrently.
         if task is None or not task.is_alive():
             self._release_server_lock()
+        if self.scheduler is not None:
+            self.scheduler.close()

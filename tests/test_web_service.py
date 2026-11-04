@@ -39,7 +39,7 @@ class UICloud(FakeCloud):
         self.upload_started = threading.Event()
     def account_info(self):
         return self.require_account()
-    def _upload_blob(self, path, digest, identity, *, progress=None, is_retried=False):
+    def _upload_blob(self, path, digest, identity, *, progress=None, is_retried=False, upload_type="AUTO"):
         self.upload_started.set()
         while self.block_upload:
             if self.stop.is_set() and self.stop_error is not None:
@@ -48,11 +48,13 @@ class UICloud(FakeCloud):
             time.sleep(0.002)
         if progress:
             progress(identity.size)
-        return super()._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried)
+        return super()._upload_blob(path, digest, identity, progress=progress, is_retried=is_retried,
+                                    upload_type=upload_type)
 
 
 class WebServiceTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict('os.environ', {'MAILRU_TIMEZONE': 'UTC'}))
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.photos = self.root / 'photos'
@@ -94,7 +96,6 @@ class WebServiceTests(unittest.TestCase):
         return path
 
 
-
     def done(self, service=None):
         service = service or self.service
         deadline = time.monotonic() + 5
@@ -103,22 +104,27 @@ class WebServiceTests(unittest.TestCase):
         self.assertIsNone(service._operation, 'Background operation did not finish')
         return service.snapshot()
 
-    def test_task_pause_resume_survives_restart_and_keeps_global_pause(self):
+    def test_task_pause_survives_restart_and_resume_starts_only_that_task(self):
         self.photos_count(2)
         self.service.scan(); self.done()
         task = self.service.jobs()['jobs'][0]
         self.service.pause()
-        self.service.control_task(task['id'], 'pause')
+        with self.service._queue() as queue:
+            queue.request_control(task['id'], 'pause')
+        self.service._invalidate_stats()
         self.assertTrue(self.service.jobs('paused')['jobs'][0]['paused'])
         self.assertEqual(self.service.jobs('paused')['total'], 1)
         self.service.close()
         replacement = self.make_service()
         self.assertEqual(replacement.snapshot()['stats']['paused'], 1)
         replacement.control_task(task['id'], 'resume')
-        self.assertEqual(replacement.snapshot()['stats']['paused'], 0)
+        state = self.done(replacement)
+        self.assertEqual(state['stats']['paused'], 0)
+        self.assertEqual(state['stats']['uploaded'], 1)
+        self.assertEqual(state['stats']['pending'], 1)
+        self.assertEqual(replacement.jobs('uploaded_unlimited')['jobs'][0]['id'], task['id'])
         self.assertIsNone(replacement._operation)
         self.assertFalse(replacement._resume_upload)
-        replacement.settings(preflight_check=False)
         replacement.start()
         self.assertEqual(self.done(replacement)['stats']['uploaded'], 2)
 
@@ -128,6 +134,7 @@ class WebServiceTests(unittest.TestCase):
         with self.service._queue() as queue:
             job = queue.claim()
             self.service._operation = 'upload'
+            self.service._task_starts_closed = False
             self.service._activity['phase'] = 'uploading'
             try:
                 with self.service._task_scope(job) as event:
@@ -146,6 +153,7 @@ class WebServiceTests(unittest.TestCase):
                 self.assertEqual(queue.stats()['remaining'], 1)
             finally:
                 self.service._operation = None
+                self.service._task_starts_closed = True
                 self.service._files.clear()
 
     def test_remove_and_clear_tasks_preserve_sources_files_and_completed_scan(self):
@@ -189,12 +197,14 @@ class WebServiceTests(unittest.TestCase):
                 self.service._operation = None
         self.assertEqual(self.service.snapshot()['stats']['total'], 1)
 
-    def test_only_individually_paused_tasks_finish_without_failed_probe(self):
+    def test_only_individually_paused_tasks_finish_without_error_or_network(self):
         self.photos_count(1)
         self.service.scan(); self.done()
         task_id = self.service.jobs()['jobs'][0]['id']
-        self.service.control_task(task_id, 'pause')
-        with patch('mailru_photos.web_service.probe', side_effect=AssertionError('No runnable tasks')):
+        with self.service._queue() as queue:
+            queue.request_control(task_id, 'pause')
+        self.service._invalidate_stats()
+        with patch.object(self.service, '_new_api', side_effect=AssertionError('No runnable tasks')):
             self.service.start()
             state = self.done()
         self.assertEqual(state['activity']['phase'], 'paused')
@@ -216,7 +226,7 @@ class WebServiceTests(unittest.TestCase):
                     time.sleep(0.002)
             return original(path, digest, identity, **kwargs)
         self.cloud._upload_blob = upload
-        self.service.settings(preflight_check=False, workers=2)
+        self.service.settings(workers=2)
         self.service.start()
         self.assertTrue(entered.wait(2))
         self.assertTrue(self.service.snapshot()['task_controls_available'])
@@ -229,13 +239,11 @@ class WebServiceTests(unittest.TestCase):
         self.assertFalse(self.service._stop.is_set())
         release.set()
         self.service.control_task(first['id'], 'resume')
-        self.service.start()
         self.assertEqual(self.done()['stats']['uploaded'], 2)
         self.assertEqual(len(self.cloud.commits), 2)
 
     def test_remove_at_positive_commit_preserves_receipt_without_false_success(self):
         self.photos_count(1)
-        self.service.settings(preflight_check=False)
         original = Queue.confirm_unlimited_commit
         def confirmed_then_remove(queue, job, digest):
             original(queue, job, digest)
@@ -251,7 +259,7 @@ class WebServiceTests(unittest.TestCase):
             self.assertEqual(queue._db.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0], 0)
         self.assertFalse(self.service._stop.is_set())
 
-    def test_probe_can_pause_its_current_task_and_continue_with_another(self):
+    def test_upload_can_pause_its_current_task_and_continue_with_another(self):
         self.photos_count(2)
         self.service.scan(); self.done()
         first = self.service.jobs()['jobs'][0]
@@ -267,10 +275,10 @@ class WebServiceTests(unittest.TestCase):
         self.cloud._upload_blob = upload
         self.service.start()
         self.assertTrue(entered.wait(2))
-        self.assertEqual(self.service.snapshot()['activity']['phase'], 'probing')
+        self.assertEqual(self.service.snapshot()['activity']['phase'], 'uploading')
         self.service.control_task(first['id'], 'pause')
         state = self.done()
-        self.assertEqual(state['probe']['result'], 'provisional_pass', state)
+        self.assertNotIn('probe', state)
         self.assertEqual(state['stats']['uploaded'], 1)
         self.assertEqual(state['stats']['paused'], 1)
         self.assertFalse(self.service._stop.is_set())
@@ -323,7 +331,6 @@ class WebServiceTests(unittest.TestCase):
     def test_failed_run_rejection_updates_auth_indicator_and_stales_quota(self):
         self.photos_count(2)
         self.service.scan(); self.done()
-        self.service.settings(preflight_check=False)
         first = self.service.jobs()['jobs'][0]
         self.cloud.failures[Path(first['local_path']).name] = [RemoteError(403)]
         self.service.start(); state = self.done()
@@ -375,13 +382,12 @@ class WebServiceTests(unittest.TestCase):
 
     def test_manual_pause_racing_auth_rejection_does_not_lose_the_rejection(self):
         self.photos_count(1)
-        self.service.settings(preflight_check=False)
         def reject_after_pause(*args, **kwargs):
             self.service.pause()
             raise RemoteError(403)
         with patch.object(self.cloud, '_upload_blob', side_effect=reject_after_pause):
             self.service.start(); state = self.done()
-        self.assertEqual(state['activity']['phase'], 'paused')
+        self.assertEqual(state['activity']['phase'], 'error')
         self.assertFalse(state['authenticated'])
         self.assertTrue(state['auth_required'])
         self.assertTrue(state['quota']['stale'])
@@ -413,11 +419,10 @@ class WebServiceTests(unittest.TestCase):
 
     def test_upload_measurements_update_quota_without_extra_cloud_calls(self):
         self.photos_count(1)
-        self.service.settings(preflight_check=False)
         self.service.start(); state = self.done()
         self.assertEqual(state['quota']['cloud_bytes'], 100)
         self.assertEqual(state['quota']['used_bytes'], 100)
-        self.assertEqual(self.cloud.quota_calls, 2, 'Use the existing baseline/final guard reads')
+        self.assertEqual(self.cloud.quota_calls, 3, 'One scan estimate and initial/final upload telemetry')
         self.service.logout(); state = self.done()
         self.assertIsNone(state['quota'])
         self.assertFalse(state['quota_refresh_available'])
@@ -444,7 +449,7 @@ class WebServiceTests(unittest.TestCase):
             self.assertFalse(reconcile.called)
         self.assertTrue(state['last_scan']['complete'])
         self.assertEqual(state['stats']['pending'], 1)
-        self.assertEqual(self.cloud.account_calls, 0)
+        self.assertEqual(self.cloud.account_calls, 1, 'Scan refreshes account quota for its storage estimate')
 
     def test_optional_reconciliation_marks_existing_without_new_upload_or_proof(self):
         self.photos_count(1)
@@ -476,7 +481,7 @@ class WebServiceTests(unittest.TestCase):
         self.assertTrue(state['last_scan']['complete'])
         self.assertEqual(state['stats']['pending'], 2)
         self.assertEqual(state['activity']['phase'], 'idle')
-        self.service.settings(remote_reconcile=False, preflight_check=False)
+        self.service.settings(remote_reconcile=False)
         self.service.start(); state = self.done()
         self.assertEqual(state['stats']['uploaded'], 2)
 
@@ -495,7 +500,7 @@ class WebServiceTests(unittest.TestCase):
 
     def test_pipeline_does_not_upload_after_optional_comparison_loses_auth(self):
         self.photos_count(2)
-        self.service.settings(remote_reconcile=True, preflight_check=False)
+        self.service.settings(remote_reconcile=True)
         with patch.object(self.cloud, 'stat', side_effect=RemoteError(403)):
             self.service.start(); state = self.done()
         self.assertFalse(state['authenticated'])
@@ -519,7 +524,6 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(task['preview_url'], f"/api/tasks/{task['id']}/content?download=0")
         self.assertEqual(task['download_url'], f"/api/tasks/{task['id']}/content?download=1")
         self.assertIsNone(task['cloud_url'])
-        self.service.settings(preflight_check=False)
         self.service.start(); self.done()
         uploaded = self.service.jobs()['jobs'][0]
         self.assertIn('%23%3F%25.JPG', uploaded['cloud_url'])
@@ -528,13 +532,13 @@ class WebServiceTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.service.task_source(task['id'])
 
-    def test_start_scans_automatically_probes_and_uploads_all_files(self):
+    def test_start_scans_automatically_and_uploads_without_a_probe(self):
         self.photos_count(3)
         self.service.start()
         state = self.done()
         self.assertEqual(state['activity']['phase'], 'completed', state)
         self.assertEqual(state['stats']['uploaded'], 3)
-        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertNotIn('probe', state)
         self.assertEqual(len(self.cloud.commits), 3)
         self.assertTrue(all(p['unlimited_upload'] is True for p in self.cloud.commits))
         activity = json.loads((self.state / 'web_activity.json').read_text())
@@ -543,25 +547,22 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(self.done()['stats']['uploaded'], 3)
         self.assertEqual(len(self.cloud.commits), 3, 'Repeated start must not upload completed work again')
 
-    def test_disabled_preflight_is_persisted_and_skips_control_upload_wait(self):
+    def test_restart_has_no_preflight_setting_or_control_upload_wait(self):
         self.photos_count(3)
-        self.service.settings(preflight_check=False)
         self.service.close()
         replacement = self.make_service()
-        self.assertFalse(replacement.snapshot()['settings']['preflight_check'])
-        with patch('mailru_photos.web_service.probe', side_effect=AssertionError('Probe must be skipped')):
-            replacement.start()
-            state = self.done(replacement)
+        self.assertNotIn('preflight_check', replacement.snapshot()['settings'])
+        replacement.start()
+        state = self.done(replacement)
         self.assertEqual(state['activity']['phase'], 'completed', state)
         self.assertEqual(state['stats']['uploaded'], 3)
-        self.assertIsNone(state['probe'])
+        self.assertNotIn('probe', state)
         self.assertEqual(self.cloud.stop.waits, [])
         self.assertTrue(all(item['unlimited_upload'] is True for item in self.cloud.commits))
 
     def test_mixed_photo_video_queue_uploads_and_preserves_both_after_restart(self):
         self.photos_count(1)
         (self.photos / 'clip.MOV').write_bytes(b'\x00\x00\x00\x18ftypqt  ' + b'offline-video' * 20)
-        self.service.settings(preflight_check=False)
         self.service.start()
         state = self.done()
         self.assertEqual(state['activity']['phase'], 'completed', state)
@@ -573,11 +574,10 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(self.done(replacement)['stats']['uploaded'], 2)
         self.assertEqual(len(self.cloud.commits), 2)
 
-    def test_large_media_default_is_visible_as_skipped_without_hashing_or_probe(self):
+    def test_large_media_default_is_visible_as_skipped_without_hashing(self):
         path = self.large_video()
         self.assertNotIn('upload_large_files', self.service.snapshot()['settings'])
-        with patch('mailru_photos.api.cloud_hash', side_effect=AssertionError('Large source must not be read')), \
-                patch('mailru_photos.web_service.probe', side_effect=AssertionError('No eligible probe sample')):
+        with patch('mailru_photos.api.cloud_hash', side_effect=AssertionError('Large source must not be read')):
             self.service.start()
             state = self.done()
         self.assertEqual(state['activity']['phase'], 'completed', state)
@@ -587,9 +587,9 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(state['stats']['pending'], 0)
         job = self.service.jobs(status='skipped')['jobs'][0]
         self.assertTrue(job['remote_path'].endswith(path.name))
-        self.assertEqual(job['skip_reason'], 'large_files_disabled')
+        self.assertEqual(job['skip_reason'], 'regular_size_disabled')
         self.assertIsNone(job['storage_mode'])
-        self.assertIsNone(state['probe'])
+        self.assertNotIn('probe', state)
         self.assertEqual(self.cloud.upload_calls, [])
         self.assertEqual(self.cloud.commits, [])
         self.service.close()
@@ -597,10 +597,6 @@ class WebServiceTests(unittest.TestCase):
         self.assertNotIn('upload_large_files', replacement.snapshot()['settings'])
         self.assertEqual(replacement.jobs(status='skipped')['jobs'][0]['id'], job['id'])
         self.assertFalse(replacement.resume_if_requested())
-
-
-
-
 
 
     def test_legacy_large_upload_setting_cannot_enable_ordinary_storage(self):
@@ -622,7 +618,6 @@ class WebServiceTests(unittest.TestCase):
     def test_upgrade_rescans_old_photo_filter_once_and_retains_completed_photos(self):
         from mailru_photos.queue import PHOTO_EXTENSIONS
         self.photos_count(1)
-        self.service.settings(preflight_check=False)
         self.service.start()
         self.assertEqual(self.done()['stats']['uploaded'], 1)
         self.service.close()
@@ -650,7 +645,7 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(state['account'], EMAIL)
         self.assertEqual(state['stats']['uploaded'], 2)
         self.assertFalse((self.state / 'auth.dat').exists())
-        self.assertEqual(state['probe']['result'], 'invalidated')
+        self.assertNotIn('probe', state)
         with self.assertRaises(ValueError):
             self.service.start()
         class Auth:
@@ -665,7 +660,7 @@ class WebServiceTests(unittest.TestCase):
 
     def test_logout_drains_workers_before_removing_refreshed_tokens(self):
         self.photos_count(2)
-        self.service.settings(workers=1, preflight_check=False)
+        self.service.settings(workers=1)
         entered, release = threading.Event(), threading.Event()
         def pending_refresh(*args, **kwargs):
             entered.set()
@@ -724,46 +719,19 @@ class WebServiceTests(unittest.TestCase):
         self.service.logout()
         self.assertFalse(self.done()['authenticated'])
 
-    def test_disabling_preflight_can_continue_after_interrupted_settling(self):
-        self.photos_count(3)
-        self.events.cancel_next = 1
-        self.service.start()
-        self.assertEqual(self.done()['probe']['result'], 'interrupted')
-        self.service.settings(preflight_check=False)
-        self.service.start()
-        state = self.done()
-        self.assertEqual(state['activity']['phase'], 'completed', state)
-        self.assertEqual(state['stats']['uploaded'], 3)
-        self.assertEqual(len(self.cloud.commits), 3)
-        self.assertEqual(self.cloud.stop.waits, [])
 
-    def test_reenabled_preflight_runs_for_new_files_after_skipping_it(self):
-        self.photos_count(1)
-        self.service.settings(preflight_check=False)
-        self.service.start()
-        self.assertEqual(self.done()['stats']['uploaded'], 1)
-        (self.photos / '001.jpg').write_bytes(b'new-offline-photo-' + b'x' * 64)
-        self.service.scan()
-        self.done()
-        self.service.settings(preflight_check=True)
-        self.service.start()
-        state = self.done()
-        self.assertEqual(state['probe']['result'], 'provisional_pass')
-        self.assertEqual(state['stats']['uploaded'], 2)
-        self.assertEqual(len(self.cloud.commits), 2)
-        self.assertEqual(self.cloud.stop.waits, [30, 30])
-
-    def test_old_settings_keep_preflight_enabled_and_invalid_update_is_atomic(self):
+    def test_legacy_preflight_settings_are_ignored_and_invalid_policy_update_is_atomic(self):
         before = self.service.snapshot()['settings']
-        self.assertTrue(before['preflight_check'])
+        self.assertNotIn('preflight_check', before)
         with self.assertRaises(ValueError):
-            self.service.settings(workers=4, preflight_check='false')
+            self.service.settings(workers=4, regular_policy='invalid')
         self.assertEqual(self.service.snapshot()['settings'], before)
         self.service.close()
-        write_json(self.state / 'web_settings.json', {'workers': 3, 'auto_resume': False})
+        write_json(self.state / 'web_settings.json', {'workers': 3, 'auto_resume': False, 'preflight_check': True})
         replacement = self.make_service()
         self.assertEqual(replacement.snapshot()['settings'],
-                         {'workers': 3, 'auto_resume': False, 'preflight_check': True, 'remote_reconcile': False})
+                         {'workers': 3, 'auto_resume': False, 'remote_reconcile': False, 'regular_policy': 'skip',
+                          'unexpected_unlimited_action': 'trash', 'timezone': 'UTC'})
 
     def test_container_lifecycle_logs_do_not_echo_private_messages(self):
         private_message = "test-only-sensitive-value"
@@ -773,49 +741,22 @@ class WebServiceTests(unittest.TestCase):
         self.assertIn("phase=error", logs)
         self.assertNotIn(private_message, logs)
 
-    def test_quota_change_blocks_mass_upload_and_keeps_confirmed_sample(self):
+    def test_quota_change_updates_telemetry_without_stopping_confirmed_uploads(self):
         self.photos_count(3)
         self.cloud.quota_values = [100, 101, 101]
         self.service.start()
         state = self.done()
-        self.assertEqual(state['activity']['phase'], 'error')
-        self.assertEqual(state['probe']['result'], 'quota_changed')
-        self.assertEqual(state['stats']['uploaded'], 1)
-        self.assertEqual(state['stats']['pending'], 2)
-        self.assertEqual(len(self.cloud.commits), 1)
+        self.assertEqual(state['activity']['phase'], 'completed')
+        self.assertNotIn('probe', state)
+        self.assertEqual(state['stats']['uploaded'], 3)
+        self.assertEqual(state['stats']['pending'], 0)
+        self.assertEqual(len(self.cloud.commits), 3)
+        self.assertEqual(state['quota']['used_bytes'], 101)
 
-    def test_pause_during_probe_settling_reuses_same_sample_even_if_queue_empty(self):
-        self.photos_count(1)
-        self.events.cancel_next = 1
-        self.service.start()
-        interrupted = self.done()
-        self.assertEqual(interrupted['probe']['result'], 'interrupted')
-        self.assertEqual(interrupted['stats']['uploaded'], 1)
-        self.service.start()
-        state = self.done()
-        self.assertEqual(state['activity']['phase'], 'completed', state)
-        self.assertEqual(state['probe']['result'], 'provisional_pass')
-        self.assertEqual(len(self.cloud.commits), 1)
-        self.assertEqual(len(self.cloud.upload_calls), 1)
 
-    def test_removed_probe_sample_retains_evidence_for_settling_after_restart(self):
-        self.photos_count(1)
-        self.events.cancel_next = 1
-        self.service.start()
-        state = self.done()
-        self.assertEqual(state['probe']['result'], 'interrupted')
-        task_id = self.service.jobs()['jobs'][0]['id']
-        self.service.control_task(task_id, 'remove')
-        self.service.close()
-        replacement = self.make_service()
-        replacement.start()
-        state = self.done(replacement)
-        self.assertEqual(state['probe']['result'], 'provisional_pass', state)
-        self.assertEqual(state['stats']['total'], 0)
-        self.assertEqual(len(self.cloud.commits), 1)
-
-    def test_pause_after_positive_add_before_stat_recovers_same_probe(self):
+    def test_pause_after_positive_add_before_stat_recovers_same_task(self):
         self.photos_count(2)
+        self.service.settings(workers=1)
         self.service.scan()
         self.done()
         first_job = self.service.jobs(limit=1)['jobs'][0]
@@ -829,12 +770,12 @@ class WebServiceTests(unittest.TestCase):
         self.service.start()
         state = self.done()
         self.assertEqual(state['activity']['phase'], 'completed', state)
-        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertNotIn('probe', state)
         self.assertEqual(state['stats']['uploaded'], 2)
         self.assertEqual(len(self.cloud.commits), 2)
         self.assertEqual(self.cloud.upload_calls.count(first_job['local_path']), 1)
 
-    def test_crash_between_mark_uploaded_and_probe_report_uses_durable_history(self):
+    def test_old_incomplete_probe_metadata_is_ignored_without_duplicate_upload(self):
         self.photos_count(1)
         with Queue(self.state / 'queue.sqlite3', destination='/Archive', account_id=EMAIL) as queue:
             queue.set_metadata('last_scan', asdict(queue.scan()))
@@ -849,20 +790,12 @@ class WebServiceTests(unittest.TestCase):
         self.service.start()
         state = self.done()
         self.assertEqual(state['activity']['phase'], 'completed', state)
-        self.assertEqual(state['probe']['result'], 'provisional_pass')
+        self.assertNotIn('probe', state)
         self.assertEqual(len(self.cloud.commits), 1)
 
-    def test_resumed_probe_claim_cancellation_remains_an_interruption(self):
+    def test_claim_cancellation_remains_an_interruption(self):
         self.photos_count(2)
         self.service.scan(); self.done()
-        with self.service._queue() as queue:
-            queue.bind_account(EMAIL)
-            first = queue.list_jobs()[0]
-            queue.set_metadata('probe', {
-                'result': 'interrupted', 'protocol': PROTOCOL_VERSION, 'account': EMAIL,
-                'destination': '/Archive', 'started_at': time.time(), 'before': {'used_bytes': 100},
-                'samples': [], 'active_job_id': first['id'], 'measurements': [],
-            })
         original = Queue.claim
         def cancel_claim(queue, *, stop=None, **kwargs):
             self.assertIs(stop, self.service._stop)
@@ -871,34 +804,12 @@ class WebServiceTests(unittest.TestCase):
         with patch.object(Queue, 'claim', new=cancel_claim):
             self.service.start(); state = self.done()
         self.assertEqual(state['activity']['phase'], 'paused')
-        self.assertEqual(state['probe']['result'], 'interrupted')
+        self.assertNotIn('probe', state)
         self.assertEqual(state['stats']['pending'], 2)
         self.assertTrue(state['authenticated'])
         self.assertFalse(state['auth_required'])
         self.assertEqual(self.cloud.commits, [])
 
-    def test_old_confirmation_cannot_be_used_as_new_probe_sample(self):
-        self.photos_count(1)
-        with Queue(self.state / 'queue.sqlite3', destination='/Archive', account_id=EMAIL) as queue:
-            queue.set_metadata('last_scan', asdict(queue.scan()))
-            job = queue.claim()
-            digest, identity = cloud_hash(job.local_path)
-            queue.save_commit_intent(job, digest)
-            queue.confirm_unlimited_commit(job, digest)
-            self.cloud.remote[job.remote_path] = {'hash': digest, 'size': identity.size}
-            started = time.time()
-            process_job(queue, self.cloud, job)
-            queue.set_metadata('probe', {
-                'result': 'incomplete', 'protocol': PROTOCOL_VERSION, 'account': EMAIL,
-                'destination': '/Archive', 'started_at': started, 'before': {'used_bytes': 100},
-                'samples': [], 'active_job_id': job.id, 'measurements': [],
-            })
-        self.service.start()
-        state = self.done()
-        self.assertEqual(state['activity']['phase'], 'completed')
-        self.assertEqual(state['probe']['result'], 'insufficient_new_samples')
-        self.assertNotEqual(state['probe']['result'], 'provisional_pass')
-        self.assertEqual(len(self.cloud.commits), 0)
 
     def test_manual_pause_preserves_queue_but_does_not_auto_resume_on_restart(self):
         self.photos_count(1)
@@ -938,7 +849,7 @@ class WebServiceTests(unittest.TestCase):
         self.photos_count(1)
         self.service.scan()
         self.done()
-        def shutdown_before_result_is_committed():
+        def shutdown_before_result_is_committed(job_id=None, **kwargs):
             self.service.close(timeout=0)
             return "completed", "Result raced with shutdown"
         self.service._pipeline = shutdown_before_result_is_committed
@@ -951,12 +862,12 @@ class WebServiceTests(unittest.TestCase):
         self.assertTrue(replacement.resume_if_requested())
         self.assertEqual(self.done(replacement)['stats']['uploaded'], 1)
 
-    def test_pipeline_holds_token_lock_between_preflight_probe_and_run(self):
+    def test_pipeline_holds_token_lock_during_upload(self):
         self.photos_count(2)
         phases = []
         original_phase = self.service._phase
         def phase(name, message, **kwargs):
-            if name in {'probing', 'uploading'}:
+            if name in {'uploading'}:
                 with Queue(self.state / 'queue.sqlite3', destination='/Archive') as competing_cli:
                     with self.assertRaises(QueueBusyError):
                         with competing_cli.exclusive_run():
@@ -966,9 +877,9 @@ class WebServiceTests(unittest.TestCase):
         self.service._phase = phase
         self.service.start()
         self.assertEqual(self.done()['activity']['phase'], 'completed')
-        self.assertEqual(phases, ['probing', 'uploading'])
+        self.assertEqual(phases, ['uploading'])
 
-    def test_shutdown_timeout_in_probe_is_interruption_not_permanent_failure(self):
+    def test_shutdown_timeout_in_upload_is_interruption_not_permanent_failure(self):
         self.photos_count(1)
         self.cloud.block_upload = True
         self.cloud.stop_error = TransportError('Offline timeout after stop', category='timeout')
@@ -977,7 +888,7 @@ class WebServiceTests(unittest.TestCase):
         self.service.close(timeout=2)
         state = self.service.snapshot()
         self.assertEqual(state['activity']['phase'], 'paused')
-        self.assertEqual(state['probe']['result'], 'interrupted')
+        self.assertNotIn('probe', state)
         self.assertEqual(state['stats']['pending'], 1)
         self.assertEqual(state['stats']['permanent_failures'], 0)
         self.assertTrue(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
@@ -988,8 +899,9 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(self.done(replacement)['stats']['uploaded'], 1)
         self.assertEqual(len(self.cloud.commits), 1)
 
-    def test_shutdown_timeout_during_probe_quota_keeps_original_sample(self):
+    def test_shutdown_timeout_during_final_quota_keeps_committed_task(self):
         self.photos_count(1)
+        self.service.scan(); self.done()
         reached_quota = threading.Event()
         original_quota = self.cloud.quota
         calls = 0
@@ -1008,17 +920,17 @@ class WebServiceTests(unittest.TestCase):
         self.service.close(timeout=2)
         state = self.service.snapshot()
         self.assertEqual(state['activity']['phase'], 'paused')
-        self.assertEqual(state['probe']['result'], 'interrupted')
+        self.assertNotIn('probe', state)
         self.assertEqual(state['stats']['uploaded'], 1)
         self.assertTrue(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
         self.cloud.quota = original_quota
         replacement = self.make_service()
         self.assertTrue(replacement.resume_if_requested())
         final = self.done(replacement)
-        self.assertEqual(final['probe']['result'], 'provisional_pass')
+        self.assertNotIn('probe', final)
         self.assertEqual(len(self.cloud.commits), 1)
 
-    def test_shutdown_does_not_hide_protocol_failure_as_user_pause(self):
+    def test_shutdown_preserves_permanent_file_failure_instead_of_requeuing_it(self):
         self.photos_count(1)
         self.cloud.block_upload = True
         self.cloud.stop_error = ProtocolError('Offline server confirmation failure')
@@ -1026,9 +938,19 @@ class WebServiceTests(unittest.TestCase):
         self.assertTrue(self.cloud.upload_started.wait(2))
         self.service.close(timeout=2)
         state = self.service.snapshot()
-        self.assertEqual(state['activity']['phase'], 'error')
+        self.assertEqual(state['activity']['phase'], 'paused')
         self.assertEqual(state['stats']['permanent_failures'], 1)
-        self.assertFalse(json.loads((self.state / 'web_activity.json').read_text())['resume_upload'])
+        failed = self.service.jobs('failed')['jobs']
+        self.assertEqual(len(failed), 1)
+        self.assertIn('confirmation failure', failed[0]['last_error'])
+        self.assertIsNone(failed[0]['next_attempt'])
+        self.cloud.block_upload = False
+        self.cloud.stop_error = None
+        replacement = self.make_service()
+        replacement.resume_if_requested()
+        final = self.done(replacement)
+        self.assertEqual(final['stats']['permanent_failures'], 1)
+        self.assertEqual(len(self.cloud.commits), 0)
 
     def test_disabled_auto_resume_keeps_queue_available_for_manual_continue(self):
         self.service.settings(workers=3, auto_resume=False)
@@ -1037,10 +959,11 @@ class WebServiceTests(unittest.TestCase):
         replacement = self.make_service()
         self.assertFalse(replacement.resume_if_requested())
         state = replacement.snapshot()
-        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'preflight_check': True, 'remote_reconcile': False})
+        self.assertEqual(state['settings'], {'workers': 3, 'auto_resume': False, 'remote_reconcile': False,
+                                            'regular_policy': 'skip', 'unexpected_unlimited_action': 'trash', 'timezone': 'UTC'})
         self.assertEqual(state['activity']['phase'], 'paused')
 
-    def test_dashboard_and_jobs_share_stats_until_expiry_without_sharing_mutable_data(self):
+    def test_idle_dashboard_and_jobs_cache_until_mutation_without_sharing_mutable_data(self):
         self.photos_count(4)
         self.service.scan()
         self.done()
@@ -1058,7 +981,10 @@ class WebServiceTests(unittest.TestCase):
                 self.assertEqual(stats.call_count, 1)
             with patch('mailru_photos.web_service.time.monotonic', return_value=106):
                 self.service.snapshot()
-                self.assertEqual(stats.call_count, 2)
+                self.assertEqual(stats.call_count, 1)
+            self.service._invalidate_stats()
+            self.service.snapshot()
+            self.assertEqual(stats.call_count, 2)
 
     def test_stats_refresh_after_scan_and_retry_controls(self):
         self.assertEqual(self.service.snapshot()['stats']['total'], 0)
@@ -1140,7 +1066,7 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(self.done(fresh)['stats']['total'], 1)
         self.assertEqual(fresh.jobs()['jobs'][0]['remote_path'], '/Camera/Family/000.jpg')
 
-    def test_source_destination_update_is_independent_and_invalidates_probe(self):
+    def test_source_destination_update_is_independent(self):
         first_dir, second_dir = self.photos / 'one', self.photos / 'two'
         first_dir.mkdir()
         second_dir.mkdir()
@@ -1151,8 +1077,6 @@ class WebServiceTests(unittest.TestCase):
         second = fresh.add_folder(str(second_dir), 'Two', remote_prefix='/Second')['source']
         fresh.scan()
         self.assertEqual(self.done(fresh)['stats']['pending'], 2)
-        with fresh._queue() as queue:
-            queue.set_metadata('probe', {'result': 'provisional_pass', 'finished_at': time.time()})
         updated = fresh.update_source(first['id'], remote_prefix='/Changed/OnlyOne', alias='Renamed')['source']
         self.assertEqual(updated['remote_prefix'], '/Changed/OnlyOne')
         self.assertEqual(updated['alias'], 'Renamed')
@@ -1160,7 +1084,7 @@ class WebServiceTests(unittest.TestCase):
         state = fresh.snapshot()
         self.assertIn(second, state['sources'])
         self.assertFalse(state['last_scan']['complete'])
-        self.assertEqual(state['probe']['result'], 'invalidated')
+        self.assertNotIn('probe', state)
         self.assertEqual({row['remote_path'] for row in fresh.jobs()['jobs']},
                          {'/Changed/OnlyOne/one.jpg', '/Second/two.jpg'})
         self.assertEqual(state['stats']['total'], 2)
@@ -1182,7 +1106,7 @@ class WebServiceTests(unittest.TestCase):
         self.assertEqual(self.service.jobs()['jobs'], [])
         self.assertTrue(state['authenticated'])
         self.assertEqual(state['account'], EMAIL)
-        self.assertEqual(state['probe']['result'], 'invalidated')
+        self.assertNotIn('probe', state)
         self.assertTrue((self.state / 'auth.dat').exists())
         self.assertEqual(len(list(self.photos.glob('*.jpg'))), 2)
         self.assertEqual(len(self.cloud.commits), 2)
@@ -1190,14 +1114,14 @@ class WebServiceTests(unittest.TestCase):
             self.assertEqual(database.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0], 2)
             self.assertEqual(database.execute('SELECT COUNT(*) FROM upload_results WHERE job_id IS NULL').fetchone()[0], 2)
 
-    def test_readding_same_source_keeps_scan_and_probe_valid(self):
+    def test_readding_same_source_keeps_scan_valid(self):
         self.photos_count(1)
         self.service.start()
         before = self.done()
         self.service.add_folder(str(self.photos), 'Photos')
         after = self.service.snapshot()
         self.assertEqual(after['last_scan'], before['last_scan'])
-        self.assertEqual(after['probe'], before['probe'])
+        self.assertNotIn('probe', after)
         self.assertEqual(after['sources'], before['sources'])
         self.assertEqual(after['stats']['uploaded'], 1)
 
@@ -1264,15 +1188,13 @@ class WebServiceTests(unittest.TestCase):
         replacement = self.make_service()
         self.assertTrue(replacement.snapshot()['authenticated'])
 
-    def test_login_rejected_by_quota_does_not_replace_saved_credentials_or_probe(self):
+    def test_login_rejected_by_quota_does_not_replace_saved_credentials_or_queue(self):
         class Auth:
             def login(self, email, password):
                 return Tokens('rejected-new-access', 'rejected-new-refresh', email)
         self.service._auth_client_factory = Auth
         original_tokens = (self.state / 'auth.dat').read_bytes()
-        original_probe = {'result': 'provisional_pass', 'offline_fixture': True}
-        with self.service._queue() as queue:
-            queue.set_metadata('probe', original_probe)
+        original_sources = self.service.snapshot()['sources']
         self.service.refresh_quota(); self.done()
         for error in (AuthError('Rejected refresh fixture'), RemoteError(401), RemoteError(403)):
             with self.subTest(error=type(error).__name__):
@@ -1282,8 +1204,8 @@ class WebServiceTests(unittest.TestCase):
                 self.assertEqual(state['activity']['phase'], 'error')
                 self.assertTrue(state['quota']['stale'])
                 self.assertEqual((self.state / 'auth.dat').read_bytes(), original_tokens)
+                self.assertEqual(state['sources'], original_sources)
                 with self.service._queue() as queue:
-                    self.assertEqual(queue.get_metadata('probe'), original_probe)
                     self.assertEqual(queue.get_metadata('last_auth')['result'], 'failed')
                 self.assertNotIn('rejected-new-', json.dumps(state))
                 self.assertNotIn('disposable-fixture-password', json.dumps(state))
@@ -1366,6 +1288,265 @@ class WebServiceTests(unittest.TestCase):
             self.assertEqual(database.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
             self.assertEqual(database.execute('SELECT COUNT(*) FROM upload_results').fetchone()[0], 126)
             self.assertEqual(database.execute('SELECT COUNT(*) FROM commit_intents').fetchone()[0], 0)
+
+    def test_idle_polling_opens_no_queue_tokens_or_state_files_after_warming_caches(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        self.service.snapshot()
+        self.service.jobs()
+        self.service.jobs('failed')
+        with patch.object(self.service, '_queue', side_effect=AssertionError('Idle polling reopened SQLite')), \
+                patch.object(TokenStore, 'load', side_effect=AssertionError('Idle polling reread account token')), \
+                patch.object(Path, 'open', side_effect=AssertionError('Idle polling opened a state file')), \
+                patch.object(Path, 'stat', side_effect=AssertionError('Idle polling touched the filesystem')):
+            for now in (100, 106, 3600, 86400):
+                with patch('mailru_photos.web_service.time.monotonic', return_value=now):
+                    state = self.service.snapshot()
+                    self.assertEqual(state['stats']['total'], 2)
+                    self.assertEqual(self.service.jobs()['total'], 2)
+                    self.assertEqual(self.service.jobs('failed')['total'], 0)
+
+    def test_single_start_and_retry_process_only_the_selected_task(self):
+        self.photos_count(3)
+        self.service.scan(); self.done()
+        target = self.service.jobs()['jobs'][1]
+        self.cloud.failures[Path(target['local_path']).name] = [ProtocolError('One file failed')]
+        self.service.control_task(target['id'], 'start')
+        failed = self.done()
+        self.assertEqual((failed['stats']['failed'], failed['stats']['pending']), (1, 2))
+        self.assertEqual(failed['activity']['phase'], 'idle')
+        self.assertEqual(self.cloud.commits, [])
+        self.service.control_task(target['id'], 'resume')
+        finished = self.done()
+        self.assertEqual((finished['stats']['failed'], finished['stats']['uploaded'], finished['stats']['pending']), (0, 1, 2))
+        self.assertEqual(self.service.jobs('uploaded_unlimited')['jobs'][0]['id'], target['id'])
+        self.assertEqual([item['path'] for item in self.cloud.commits], [target['remote_path']])
+        other = self.service.jobs('pending')['jobs'][0]
+        with self.assertRaises(ValueError):
+            self.service.control_task(other['id'], 'pause')
+        self.assertEqual(self.service.jobs('pending')['total'], 2)
+
+    def test_restart_resumes_only_the_interrupted_single_task(self):
+        self.photos_count(3)
+        self.service.scan(); self.done()
+        target = self.service.jobs()['jobs'][1]
+        self.cloud.block_upload = True
+        self.service.control_task(target['id'], 'start')
+        self.assertTrue(self.cloud.upload_started.wait(2))
+        self.service.close(timeout=2)
+        saved = json.loads((self.state / 'web_activity.json').read_text())
+        self.assertTrue(saved['resume_upload'])
+        self.assertEqual(saved['job_id'], target['id'])
+        self.cloud.block_upload = False
+        replacement = self.make_service()
+        self.assertTrue(replacement.resume_if_requested())
+        state = self.done(replacement)
+        self.assertEqual((state['stats']['uploaded'], state['stats']['pending']), (1, 2))
+        self.assertEqual([item['path'] for item in self.cloud.commits], [target['remote_path']])
+
+    def test_file_failure_does_not_stop_remaining_tasks_or_set_global_error(self):
+        self.photos_count(3)
+        self.service.settings(workers=1)
+        self.cloud.failures['000.jpg'] = [ProtocolError('File-specific rejection')]
+        self.service.start()
+        state = self.done()
+        self.assertEqual(state['activity']['phase'], 'completed')
+        self.assertEqual((state['stats']['uploaded'], state['stats']['failed'], state['stats']['pending']), (2, 1, 0))
+        self.assertEqual(self.service.jobs('failed')['jobs'][0]['relative_path'], '000.jpg')
+        self.assertFalse(self.service._stop.is_set())
+        self.assertTrue(state['authenticated'])
+
+    def test_storage_estimate_and_tabs_include_failed_quota_objects_without_double_counting(self):
+        for name, size in (('unexpected.jpg', 100), ('confirmed.jpg', 200), ('ordinary.m4v', 300)):
+            (self.photos / name).write_bytes(bytes(size))
+        self.service.scan(); scanned = self.done()
+        self.assertEqual(scanned['storage_plan']['unlimited'], {'count': 2, 'bytes': 300})
+        self.assertEqual(scanned['storage_plan']['regular'], {'count': 1, 'bytes': 300})
+        self.assertEqual(scanned['stats']['skipped'], 1)
+        self.assertIsNotNone(scanned['quota']['free_bytes'])
+        self.service.settings(regular_policy='upload', unexpected_unlimited_action='keep')
+        unexpected = next(row for row in self.service.jobs()['jobs'] if row['relative_path'] == 'unexpected.jpg')
+        self.cloud.unlimited_flags[unexpected['remote_path']] = False
+        self.service.start(); state = self.done()
+        self.assertEqual(state['activity']['phase'], 'completed')
+        self.assertEqual((state['stats']['uploaded'], state['stats']['failed']), (2, 1))
+        self.assertEqual(state['storage_plan']['uploaded'], {'count': 3, 'bytes': 600})
+        self.assertEqual(state['storage_plan']['uploaded_unlimited'], {'count': 1, 'bytes': 200})
+        self.assertEqual(state['storage_plan']['uploaded_regular'], {'count': 2, 'bytes': 400})
+        self.assertEqual(state['storage_plan']['unlimited'], {'count': 0, 'bytes': 0})
+        regular = self.service.jobs('uploaded_regular', sort='desc', limit=1)
+        self.assertEqual((regular['total'], regular['total_bytes'], len(regular['jobs'])), (2, 400, 1))
+        self.assertEqual(self.service.jobs('failed')['total_bytes'], 100)
+        self.assertEqual(self.service.jobs('uploaded_unlimited')['total_bytes'], 200)
+        self.assertTrue(self.service.jobs('failed')['jobs'][0]['cloud_url'])
+        self.assertEqual(len(self.cloud.regular_commits), 1)
+        original_commits = len(self.cloud.commits)
+        self.service.settings(unexpected_unlimited_action='trash')
+        self.service.control_task(unexpected['id'], 'start')
+        cleaned = self.done()
+        self.assertEqual(len(self.cloud.commits), original_commits, 'Known false receipt must not be uploaded again')
+        self.assertEqual(cleaned['stats']['failed'], 1)
+        self.assertEqual(self.service.jobs('uploaded_regular')['total'], 1)
+        self.assertIsNone(self.service.jobs('failed')['jobs'][0]['cloud_url'])
+
+    def test_policy_settings_validate_atomically_and_restore_queue_after_disk_failure(self):
+        (self.photos / 'ordinary.m4v').write_bytes(b'ordinary fixture')
+        self.service.scan(); self.done()
+        before = self.service.snapshot()['settings']
+        before_jobs = self.service.jobs()
+        for field in ('regular_policy', 'unexpected_unlimited_action'):
+            for value in ([], {}, True, 1, 'invalid'):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    self.service.settings(**{field: value, 'workers': 4})
+                self.assertEqual(self.service.snapshot()['settings'], before)
+        with self.assertRaises(ValueError):
+            self.service.settings(regular_policy='upload', timezone='Invalid/NoSuchZone')
+        self.assertEqual(self.service.jobs(), before_jobs)
+        self.assertEqual(self.service.snapshot()['settings'], before)
+        with patch('mailru_photos.web_service.write_json', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.service.settings(regular_policy='upload', unexpected_unlimited_action='keep')
+        self.assertEqual(self.service.snapshot()['settings'], before)
+        self.assertEqual(self.service.jobs()['jobs'][0]['status'], 'skipped')
+        self.service.settings(regular_policy='upload', unexpected_unlimited_action='keep')
+        self.assertEqual(self.service.jobs()['jobs'][0]['status'], 'pending')
+        self.service.close()
+        replacement = self.make_service()
+        self.assertEqual(replacement.snapshot()['settings']['regular_policy'], 'upload')
+        self.assertEqual(replacement.snapshot()['settings']['unexpected_unlimited_action'], 'keep')
+        self.assertEqual(replacement.jobs()['jobs'][0]['status'], 'pending')
+
+    def test_unicode_source_folders_scan_upload_and_links_remain_utf8(self):
+        folder = self.photos / 'Фотографии семьи'
+        folder.mkdir()
+        source = folder / 'Отпуск №1.JPG'
+        source.write_bytes(b'unicode fixture' * 8)
+        listed = self.service.folders(str(self.photos))['directories']
+        self.assertIn(folder.name, [item['name'] for item in listed])
+        self.service.scan(); state = self.done()
+        self.assertTrue(state['last_scan']['complete'])
+        task = self.service.jobs()['jobs'][0]
+        self.assertEqual(task['relative_path'], 'Фотографии семьи/Отпуск №1.JPG')
+        self.service.start(); self.done()
+        uploaded = self.service.jobs('uploaded_unlimited')['jobs'][0]
+        self.assertEqual(self.cloud.commits[0]['path'], task['remote_path'])
+        self.assertIn('%D0', uploaded['cloud_url'])
+        self.assertIn('%20', uploaded['cloud_url'])
+        self.assertEqual(self.service.task_source(task['id'])[1], source)
+
+    def test_task_start_accepted_during_final_quota_is_not_lost_after_workers_exit(self):
+        self.photos_count(1)
+        self.service.settings(workers=1)
+        self.service.scan(); self.done()
+        target = self.service.jobs()['jobs'][0]
+        self.cloud.failures[Path(target['local_path']).name] = [ProtocolError('First attempt rejected')]
+        reached_final, finish_quota = threading.Event(), threading.Event()
+        original_quota = self.cloud.quota
+        calls = 0
+        def quota():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                reached_final.set()
+                if not finish_quota.wait(5):
+                    raise AssertionError('Test did not release final quota')
+            return original_quota()
+        self.cloud.quota = quota
+        self.service.start()
+        try:
+            self.assertTrue(reached_final.wait(2))
+            self.assertEqual(self.service.jobs('failed')['total'], 1)
+            self.service.control_task(target['id'], 'start')
+        finally:
+            finish_quota.set()
+        state = self.done()
+        self.assertEqual(state['stats']['uploaded'], 1, 'An accepted Start must execute after the current workers drain')
+        self.assertEqual(state['stats']['pending'], 0)
+        self.assertEqual([item['path'] for item in self.cloud.commits], [target['remote_path']])
+
+    def test_task_start_after_admission_closes_rejects_before_changing_failed_job(self):
+        self.photos_count(1)
+        self.service.settings(workers=1)
+        self.service.scan(); self.done()
+        target = self.service.jobs()['jobs'][0]
+        self.cloud.failures[Path(target['local_path']).name] = [ProtocolError('Rejected source')]
+        closed, finish = threading.Event(), threading.Event()
+        original_completion = self.service._completion
+        def completion(stats):
+            closed.set()
+            if not finish.wait(5):
+                raise AssertionError('Test did not release completed operation')
+            return original_completion(stats)
+        with patch.object(self.service, '_completion', side_effect=completion):
+            self.service.start()
+            try:
+                self.assertTrue(closed.wait(2))
+                self.assertTrue(self.service._task_starts_closed)
+                with self.service._queue() as queue:
+                    before = queue.get_job(target['id'])
+                with self.assertRaises(QueueBusyError):
+                    self.service.control_task(target['id'], 'start')
+                with self.service._queue() as queue:
+                    self.assertEqual(queue.get_job(target['id']), before)
+                self.assertEqual(list(self.service._priority_jobs), [])
+            finally:
+                finish.set()
+            state = self.done()
+        self.assertEqual((state['stats']['failed'], state['stats']['pending']), (1, 0))
+        self.assertEqual(self.cloud.commits, [])
+
+    def test_single_task_resume_accepted_while_old_attempt_drains_is_not_lost(self):
+        self.photos_count(2)
+        self.service.scan(); self.done()
+        target = self.service.jobs()['jobs'][0]
+        entered, draining, finish_cancel = threading.Event(), threading.Event(), threading.Event()
+        original_upload = self.cloud._upload_blob
+        calls = 0
+        def upload(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                deadline = time.monotonic() + 5
+                while not self.cloud.request_stop.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.002)
+                draining.set()
+                if not finish_cancel.wait(5):
+                    raise AssertionError('Test did not release cancelled upload')
+                self.cloud._check_stopped()
+            return original_upload(*args, **kwargs)
+        self.cloud._upload_blob = upload
+        self.service.control_task(target['id'], 'start')
+        try:
+            self.assertTrue(entered.wait(2))
+            self.service.control_task(target['id'], 'pause')
+            self.assertTrue(draining.wait(2))
+            self.service.control_task(target['id'], 'resume')
+        finally:
+            finish_cancel.set()
+        state = self.done()
+        self.assertEqual((state['stats']['uploaded'], state['stats']['pending']), (1, 1))
+        self.assertEqual([item['path'] for item in self.cloud.commits], [target['remote_path']])
+
+    def test_deletion_timeout_after_pause_keeps_the_confirmed_operation_resumable(self):
+        self.photos_count(1)
+        self.service.start(); self.done()
+        target = self.service.jobs()['jobs'][0]
+        preview = self.service.preview_deletion(task_id=target['id'], delete_cloud=True, owner='test-session')
+        def interrupted_trash(*args, **kwargs):
+            self.service.pause()
+            raise TransportError('Timeout while a requested pause was draining', category='timeout')
+        with patch.object(self.cloud, 'trash_file', side_effect=interrupted_trash):
+            self.service.confirm_deletion(preview['token'], owner='test-session')
+            paused = self.done()
+        self.assertTrue(paused['deletion']['resume_available'], 'Pause must preserve the confirmed deletion intention')
+        self.assertEqual(paused['deletion']['errors'], 0)
+        self.service.start()
+        resumed = self.done()
+        self.assertEqual(resumed['stats']['total'], 0)
+        self.assertEqual(self.cloud.trashed, [target['remote_path']])
+        self.assertEqual(len(self.cloud.commits), 1, 'Continue deletion must not start another upload')
+        self.assertTrue(Path(target['local_path']).exists())
 
     def test_second_controller_cannot_open_same_state_while_first_is_running(self):
         with self.assertRaises(QueueBusyError):

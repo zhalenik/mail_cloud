@@ -149,7 +149,7 @@ class ReconcileTests(unittest.TestCase):
                 self.assertEqual((report["matched"], report["errors"]), (0, 0))
                 self.assertEqual(self.queue.get_job(row["id"]), row)
 
-    def test_paused_removed_intent_uploaded_empty_and_oversized_tasks_are_excluded(self):
+    def test_paused_removed_intent_uploaded_and_empty_tasks_are_excluded_but_large_files_can_be_compared(self):
         names = ("eligible.jpg", "paused.jpg", "intent.jpg", "uploaded.jpg", "removed.jpg")
         for name in names:
             self.photo(name)
@@ -173,12 +173,12 @@ class ReconcileTests(unittest.TestCase):
                     self.queue.request_control(job.id, "remove")
                 self.queue.release(job)
         candidates = self.queue.reconcile_candidates()
-        self.assertEqual([row["relative_path"] for row in candidates], ["eligible.jpg"])
-        eligible = candidates[0]
+        self.assertEqual({row["relative_path"] for row in candidates}, {"eligible.jpg", "large.mp4"})
+        eligible = next(row for row in candidates if row["relative_path"] == "eligible.jpg")
         digest, _ = cloud_hash(eligible["local_path"])
         api = ReadOnlyAPI({eligible["remote_path"]: {"size": eligible["size"], "hash": digest}})
         report = reconcile(self.queue, api, stop=self.stop)
-        self.assertEqual((report["checked"], report["matched"]), (1, 1))
+        self.assertEqual((report["checked"], report["matched"]), (2, 1))
         self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM upload_results").fetchone()[0], 1)
         self.assertEqual(self.queue._db.execute("SELECT COUNT(*) FROM commit_intents").fetchone()[0], 1)
 
@@ -357,9 +357,9 @@ class ReconcileTests(unittest.TestCase):
         api = ReadOnlyAPI(self.objects())
         fetch = self.queue.reconcile_candidates
         pages = []
-        def bounded_page(*, after_id=0, limit=500):
+        def bounded_page(*, after_id=0, limit=500, root_ids=None):
             self.assertLessEqual(limit, 500)
-            rows = fetch(after_id=after_id, limit=limit)
+            rows = fetch(after_id=after_id, limit=limit, root_ids=root_ids)
             self.assertTrue(all(row["id"] > after_id for row in rows))
             pages.append((after_id, len(rows)))
             return rows

@@ -1,10 +1,9 @@
-"""Persistent queue execution, a small live probe, and ongoing quota monitoring."""
+"""Persistent, independently controlled uploads with durable storage receipts."""
 
 from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-import math
 import random
 import re
 import sqlite3
@@ -21,14 +20,6 @@ from .transport import Cancelled, SourceReadError, TaskCancelled, TransportError
 
 
 TaskScope = Callable[[Job], ContextManager[threading.Event | None]]
-
-
-class ProbeRequired(RuntimeError):
-    pass
-
-
-class QuotaChanged(ProtocolError):
-    pass
 
 
 class _TaskStop:
@@ -99,337 +90,312 @@ def _job_scope(queue: Queue, api: CloudAPI, job: Job, task_scope: TaskScope | No
 
 
 def process_job(queue: Queue, api: CloudAPI, job: Job, *, emit=None,
-                task_scope: TaskScope | None = None) -> dict[str, Any]:
-    """Upload one claim; UI observation and cancellation do not relax proof."""
+                task_scope: TaskScope | None = None,
+                unexpected_unlimited_action: str = "trash", quota_budget=None) -> dict[str, Any]:
     if emit is not None:
-        emit("file_started", {"job_id": job.id, "path": job.remote_path, "size": job.size, "storage_mode": "unlimited"})
+        emit("file_started", {"job_id": job.id, "path": job.remote_path,
+                              "size": job.size, "storage_mode": job.planned_mode})
     try:
         with _job_scope(queue, api, job, task_scope):
             return _process_job(queue, api, job, progress=(lambda size: emit(
-                "upload_progress", {"job_id": job.id, "bytes": size})) if emit is not None else None)
+                "upload_progress", {"job_id": job.id, "bytes": size})) if emit is not None else None,
+                unexpected_unlimited_action=unexpected_unlimited_action, quota_budget=quota_budget)
     finally:
+        if quota_budget is not None and quota_budget.has_reservation(job.claim_token):
+            try:
+                uncertain = bool(queue.get_commit_intent(job))
+            except (QueueError, sqlite3.Error):
+                uncertain = True
+            quota_budget.finish(job.claim_token, uncertain=uncertain)
+        if quota_budget is not None:
+            quota_budget.close_claim(job.claim_token)
         if emit is not None:
             emit("file_finished", {"job_id": job.id})
 
 
-def _process_job(queue: Queue, api: CloudAPI, job: Job, *, progress=None) -> dict[str, Any]:
+def _process_job(queue: Queue, api: CloudAPI, job: Job, *, progress=None,
+                 unexpected_unlimited_action: str = "trash", quota_budget=None) -> dict[str, Any]:
+    mode = job.planned_mode
+    if mode not in {"unlimited", "regular"}:
+        raise ProtocolError("Неизвестный план хранения задачи. Пересканируйте источник.")
     expected = FileIdentity(job.size, job.mtime_ns, job.device, job.inode)
     prior = queue.get_commit_intent(job)
-    if prior and prior.get("storage_mode", "unlimited") != "unlimited":
-        raise ProtocolError("Сохранённое подтверждение относится к обычному хранению; файл не изменён.")
-    result = api.upload_photo(job.local_path, job.remote_path, expected=expected,
-                              prior_intent=prior,
-                              save_intent=lambda digest: queue.save_commit_intent(job, digest),
-                              save_confirmation=lambda digest: queue.confirm_unlimited_commit(job, digest),
-                              is_retried=job.attempts > 1,
-                              **({"progress": progress} if progress is not None else {}))
+    if quota_budget is not None and mode == "regular" and prior is None:
+        quota_budget.precheck(job.size)
+    if prior and prior.get("storage_mode", "unlimited") != mode:
+        raise ProtocolError("Сохранённая попытка относится к другому режиму хранения; проверьте задачу.")
+
+    def observe(value):
+        if not isinstance(value, dict) or value.get("mode") not in {"unlimited", "regular", "unknown"}:
+            raise ProtocolError("Некорректное подтверждение результата хранения.")
+        queue.record_cloud_observation(job, mode=value["mode"], remote_hash=value["hash"],
+                                       remote_id=value.get("nodeid"), metadata=value)
+        if quota_budget is not None and value["mode"] == "regular" and value.get("commit_accepted") is True:
+            quota_budget.observed(job.claim_token, value["size"])
+
+    upload = api.upload_photo if mode == "unlimited" else api.upload_regular
+    confirm = queue.confirm_unlimited_commit if mode == "unlimited" else queue.confirm_regular_commit
+    try:
+        result = upload(job.local_path, job.remote_path, expected=expected, prior_intent=prior,
+                        save_intent=lambda digest: queue.save_commit_intent(job, digest, storage_mode=mode),
+                        save_confirmation=lambda digest: confirm(job, digest), save_observation=observe,
+                        is_retried=job.attempts > 1,
+                        **({"reserve_quota": lambda size, available: quota_budget.reserve(job.claim_token, size, available)}
+                           if mode == "regular" and quota_budget is not None else {}),
+                        **({"progress": progress} if progress is not None else {}))
+    except UnlimitedNotConfirmed as error:
+        # The observation was committed before the API's final stat. A crash or
+        # failed cleanup must never erase a file that is known to consume quota.
+        observation = getattr(error, "observation", None)
+        row = queue.get_job(job.id, include_missing=True)
+        if (unexpected_unlimited_action == "trash" and row and row.get("cloud_present")
+                and row.get("observed_mode") == "regular"):
+            try:
+                api.trash_file(row["cloud_path"], expected_hash=row["cloud_hash"],
+                               expected_size=row["cloud_size"])
+                if not queue.mark_cloud_deleted(job.id, expected_hash=row["cloud_hash"],
+                                                expected_path=row["cloud_path"]):
+                    raise QueueError("Подтверждение удаления не совпало с сохранённым объектом.")
+            except (Cancelled, TaskCancelled, QueueError, sqlite3.Error):
+                raise
+            except Exception as cleanup:
+                if is_auth_failure(cleanup):
+                    raise
+                detail = str(cleanup) if isinstance(cleanup, (ProtocolError, TransportError)) else type(cleanup).__name__
+                raise UnlimitedNotConfirmed(
+                    "Сервер не подтвердил безлимит. Файл оставлен в Облаке: перенос в корзину не завершён. " + detail,
+                    observation=observation) from None
+            raise UnlimitedNotConfirmed(
+                "Сервер не подтвердил безлимит. Файл перемещён в корзину Облака; квота может обновиться позже.",
+                observation=observation) from None
+        raise
     if (not isinstance(result, dict) or result.get("stat_matched") is not True
             or not isinstance(result.get("hash"), str)
             or not re.fullmatch(r"[0-9A-Fa-f]{40}", result["hash"])
-            or isinstance(result.get("size"), bool) or result.get("size") != job.size
+            or type(result.get("size")) is not int or result["size"] != job.size
             or result.get("path") != job.remote_path
-            or result.get("storage_mode", "unlimited") != "unlimited"
-            or result.get("is_unlim_upload") is not True
-            or not ((result.get("commit_accepted") is True and result.get("recovered_commit") is False
-                     and result.get("unlimited_evidence") == "commit_response")
-                    or (result.get("commit_accepted") is False and result.get("recovered_commit") is True
-                        and result.get("unlimited_evidence") == "saved_commit_response"))):
-        raise FileVerificationError("Не получено полное подтверждение безлимита, commit, пути, хеша и размера файла.")
+            or result.get("storage_mode", "unlimited") != mode):
+        raise FileVerificationError("Не подтверждены путь, хеш, размер и режим хранения файла.")
+    fresh = result.get("commit_accepted") is True and result.get("recovered_commit") is False
+    recovered = result.get("commit_accepted") is False and result.get("recovered_commit") is True
+    if mode == "unlimited":
+        proven = (result.get("is_unlim_upload") is True
+                  and ((fresh and result.get("unlimited_evidence") == "commit_response")
+                       or (recovered and result.get("unlimited_evidence") == "saved_commit_response")))
+    else:
+        proven = ((fresh and result.get("regular_evidence") == "metadata_commit_response")
+                  or (recovered and result.get("regular_evidence") == "saved_commit_response"))
+    if not proven:
+        raise FileVerificationError("Сервер не подтвердил создание файла в выбранном режиме хранения.")
     confirmation = queue.get_commit_intent(job)
-    if (not confirmation or confirmation.get("unlimited_confirmed") is not True
-            or confirmation.get("storage_mode", "unlimited") != "unlimited"
+    if (not confirmation or confirmation.get(mode + "_confirmed") is not True
+            or confirmation.get("storage_mode", "unlimited") != mode
             or not isinstance(confirmation.get("cloud_hash"), str)
             or confirmation["cloud_hash"].casefold() != result["hash"].casefold()):
-        raise ProtocolError("Подтверждение безлимита от сервера не сохранено для этого файла; завершение не отмечено.")
-    result = {**result, "storage_mode": "unlimited"}
+        raise ProtocolError("Подтверждение создания не сохранено для этой задачи; завершение не отмечено.")
+    result = {**result, "storage_mode": mode}
     queue.mark_uploaded(job, remote_hash=result["hash"], remote_id=result.get("nodeid"),
                         verified_metadata={"protocol": PROTOCOL_VERSION, **result,
-                                           "unlimited_confirmed_at": confirmation.get("unlimited_confirmed_at"),
-                                           "commit_intent_created_at": confirmation.get("created_at")})
+                            mode + "_confirmed_at": confirmation.get(mode + "_confirmed_at"),
+                            "commit_intent_created_at": confirmation.get("created_at")})
     return {"job_id": job.id, **result}
 
 
-def require_scanned(queue: Queue) -> None:
+def require_scanned(queue: Queue, root_ids=None) -> None:
     scan = queue.get_metadata("last_scan", {})
-    if not isinstance(scan, dict) or scan.get("complete") is not True:
-        raise ProbeRequired("Сначала выполните scan. Ошибки обхода папок нужно устранить до загрузки.")
+    scope = scan.get("root_ids") if isinstance(scan, dict) else None
+    covered = scope is None or (root_ids is not None and set(root_ids).issubset(set(scope)))
+    if not isinstance(scan, dict) or scan.get("complete") is not True or not covered:
+        raise QueueError("Сначала завершите сканирование выбранных исходных папок.")
 
 
-def process_probe_job(queue: Queue, api: CloudAPI, job: Job, *, baseline: int,
-                      emit: Callable[[str, dict], None] | None = None,
-                      file_progress: bool = False, task_scope: TaskScope | None = None) -> dict[str, Any] | None:
-    """Process one probe candidate, preserving global safeguards.
+class QuotaBudget:
+    """Conservative byte reservations shared by all ordinary-upload workers.
 
-    None means this task was paused, removed, unsupported or failed locally;
-    the caller may take another candidate. Auth/protocol/state failures and
-    global cancellation still propagate. This helper is also safe for a probe
-    resumed by the web controller after a process restart.
+    Per-file account/quota checks remain in CloudAPI. Reservations prevent two
+    workers from each spending the same free bytes. A fresh known-quota AUTO
+    commit consumes this budget too, even if moved to the quota-bearing trash.
     """
-    emit = emit or (lambda event, data: None)
-    try:
-        emit("probe_upload", {"job_id": job.id, "path": job.remote_path})
-        return process_job(queue, api, job, emit=emit if file_progress else None, task_scope=task_scope)
-    except TaskCancelled:
-        queue.release(job, "Task paused or removed during probe; preserve any remote commit")
-        emit("task_cancelled", {"job_id": job.id})
-    except (Cancelled, KeyboardInterrupt):
-        queue.release(job, "Interrupted probe; reconcile any remote commit before retry")
-        raise
-    except FileChangedError as error:
-        emit("file_changed", {"job_id": job.id, "reason": str(error)})
-    except UnsupportedPhoto as error:
-        queue.mark_skipped(job, str(error))
-        emit("skipped", {"job_id": job.id, "reason": str(error)})
-    except (SourceChanged, SourceReadError, RemoteConflict, FileVerificationError, UnlimitedNotConfirmed) as error:
-        queue.mark_failed(job, str(error), retry_delay=None)
-        emit("file_error", {"job_id": job.id, "reason": str(error)})
-        if isinstance(error, UnlimitedNotConfirmed):
-            api.require_account(queue.account_id)
-            if api.quota()["used_bytes"] != baseline:
-                raise QuotaChanged("Использование квоты изменилось после неподтверждённой задачи. Загрузка приостановлена.")
-    except RemoteError as error:
-        if error.unsupported:
-            queue.mark_skipped(job, str(error))
-        else:
-            delay = min(900, 2 ** job.attempts) if error.retryable and job.attempts < 5 else None
-            queue.mark_failed(job, str(error), retry_delay=delay)
-        emit("remote_error", {"job_id": job.id, "status": error.status, "code": error.code})
-        if error.fatal:
-            raise
-    except TransportError as error:
-        if api.stop.is_set():
-            queue.release(job, "Probe request interrupted by global pause/shutdown")
-            raise Cancelled("Проверка приостановлена; сетевой запрос завершился после остановки.") from None
-        queue.mark_failed(job, str(error), retry_delay=min(900, 2 ** job.attempts) if job.attempts < 5 else None)
-        emit("file_error", {"job_id": job.id, "reason": str(error)})
-    except (ProtocolError, AuthError) as error:
-        queue.mark_failed(job, str(error), retry_delay=None)
-        raise
-    return None
+    def __init__(self, quota=None):
+        self._lock = threading.Lock()
+        self._initial = (max(0, quota["total_bytes"] - quota["combined_used_bytes"])
+                         if isinstance(quota, dict) else None)
+        self._spent = 0
+        self._reserved = {}
+        self._observed = set()
+
+    def prime(self, quota):
+        """Initialize once; extra explicitly started tasks share earlier spending."""
+        if isinstance(quota, dict):
+            with self._lock:
+                if self._initial is None:
+                    self._initial = max(0, quota["total_bytes"] - quota["combined_used_bytes"])
+
+    def precheck(self, size):
+        with self._lock:
+            if self._initial is None:
+                return
+            free = max(0, self._initial - self._spent - sum(self._reserved.values()))
+            if size > free:
+                raise ProtocolError(f"Недостаточно места в квоте: файл {size:,} байт, доступно с учётом текущих загрузок {free:,} байт. Передача не начата.")
+
+    def exhausted(self):
+        with self._lock:
+            self._initial = self._spent
+
+    def reserve(self, token, size, available):
+        with self._lock:
+            if token in self._reserved:
+                return
+            if self._initial is None:
+                self._initial = max(0, available)
+            free = max(0, min(available, self._initial - self._spent) - sum(self._reserved.values()))
+            if size > free:
+                raise ProtocolError(f"Недостаточно места в квоте: файл {size:,} байт, доступно с учётом текущих загрузок {free:,} байт. Передача не начата.")
+            self._reserved[token] = size
+
+    def observed(self, token, size):
+        with self._lock:
+            if token not in self._observed:
+                self._spent += size
+                self._observed.add(token)
+            self._reserved.pop(token, None)
+
+    def has_reservation(self, token):
+        with self._lock:
+            return token in self._reserved
+
+    def close_claim(self, token):
+        with self._lock:
+            self._observed.discard(token)
+
+    def finish(self, token, *, uncertain=False):
+        with self._lock:
+            size = self._reserved.pop(token, 0)
+            if uncertain and token not in self._observed:
+                self._spent += size
+                self._observed.add(token)
 
 
-def probe(queue: Queue, api: CloudAPI, *, count: int = 3, settle_seconds: float = 60,
-          emit: Callable[[str, dict], None] | None = None, file_progress: bool = False,
-          task_scope: TaskScope | None = None) -> dict[str, Any]:
-    """Upload a few queued photos, then measure cloud usage twice.
-
-    Each file requires an explicit is_unlim_upload=True add response, persisted
-    before stat, plus matching hash/size. Equal quota measurements also guard
-    the batch, while delayed quota changes still remain possible.
-    """
-    if not 1 <= count <= 10 or not math.isfinite(settle_seconds) or not 30 <= settle_seconds <= 86400:
-        raise ValueError("Probe count must be 1..10 and settling period at least 30 seconds")
-    emit = emit or (lambda event, data: None)
-    with queue.exclusive_run():
-        queue.recover_running()
-        require_scanned(queue)
-        account = api.require_account(queue.account_id)
-        queue.bind_account(account.email)
-        before = api.quota()
-        report: dict[str, Any] = {
-            "protocol": PROTOCOL_VERSION, "account": account.email,
-            "destination": queue.destination, "started_at": time.time(),
-            "settle_seconds": settle_seconds, "before": before, "samples": [],
-            "requested_count": count,
-            "measurements": [], "result": "incomplete", "live_test": True,
-            "per_file_unlimited_flag": "is_unlim_upload_in_add_response",
-        }
-        queue.set_metadata("probe", report)
-        try:
-            accepted_count = 0
-            while accepted_count < count:
-                if api.stop.is_set():
-                    raise Cancelled("Проверка приостановлена.")
-                job = queue.claim(max_attempts=5, storage_mode="unlimited", stop=api.stop)
-                if job is None:
-                    if api.stop.is_set():
-                        raise Cancelled("Проверка приостановлена.")
-                    retry_at = queue.stats(storage_mode="unlimited").get("next_retry_at")
-                    if retry_at is None:
-                        break
-                    if api.stop.wait(max(0.1, min(10, retry_at - time.time()))):
-                        raise Cancelled("Проверка приостановлена во время ожидания повторной попытки.")
-                    continue
-                report["active_job_id"] = job.id
-                queue.set_metadata("probe", report)
-                result = process_probe_job(queue, api, job, baseline=before["used_bytes"],
-                                           emit=emit, file_progress=file_progress, task_scope=task_scope)
-                if result is not None and result.get("commit_accepted") is True:
-                    report["samples"].append(result)
-                    accepted_count += 1
-                else:
-                    # Keep report size bounded even when a large queue has
-                    # many failed candidates or recovered older commits.
-                    report["other_candidates"] = report.get("other_candidates", 0) + 1
-                report.pop("active_job_id", None)
-                # An interrupt during settling must retain already verified
-                # uploads in the report, as well as their queue states.
-                queue.set_metadata("probe", report)
-            accepted = [sample for sample in report["samples"] if sample.get("commit_accepted") is True]
-            if len(accepted) < count:
-                report["result"] = "insufficient_new_samples"
-                raise ProbeRequired("Для проверки не хватило новых подтверждённых загрузок. Проверьте задачи с ошибками и на паузе, добавьте файлы или уменьшите --count.")
-            for step in range(2):
-                emit("probe_wait", {"seconds": settle_seconds / 2, "measurement": step + 1})
-                if api.stop.wait(settle_seconds / 2):
-                    raise Cancelled("Проверка остановлена; загруженные файлы сохранены в очереди.")
-                api.require_account(account.email)
-                quota = api.quota()
-                report["measurements"].append({"at": time.time(), **quota})
-                queue.set_metadata("probe", report)
-                emit("probe_quota", {"delta_bytes": quota["used_bytes"] - before["used_bytes"]})
-        except BaseException as error:
-            interrupted_network = isinstance(error, TransportError) and api.stop.is_set()
-            if isinstance(error, (Cancelled, KeyboardInterrupt)) or interrupted_network:
-                report["result"] = "interrupted"
-                report["error"] = "Проверка прервана; для разрешения массовой загрузки требуется завершённая probe."
-            else:
-                if report["result"] == "incomplete":
-                    report["result"] = "failed"
-                report["error"] = str(error) if isinstance(error, (ProtocolError, AuthError, TransportError, ProbeRequired)) else type(error).__name__
-            report["finished_at"] = time.time()
-            queue.set_metadata("probe", report)
-            if interrupted_network:
-                raise Cancelled("Проверка приостановлена; контроль квоты можно продолжить.") from None
-            raise
-        unchanged = all(item["used_bytes"] == before["used_bytes"] for item in report["measurements"])
-        report["result"] = "provisional_pass" if unchanged else "quota_changed"
-        report["finished_at"] = time.time()
-        report["explanation"] = (
-            "Сервер подтвердил is_unlim_upload=true для каждого файла, hash/size совпали, "
-            "две проверки used.cloud не показали изменения. "
-            "Это предварительное подтверждение; отложенный пересчёт квоты не исключён."
-            if unchanged else "Квота изменилась. Массовая загрузка не разрешена; проверьте другие операции аккаунта и ответы сервера."
-        )
-        queue.set_metadata("probe", report)
-        return report
-
-
-class QuotaGuard:
-    def __init__(self, api: CloudAPI, account: str, baseline: int, *, seconds: float = 30, every_files: int = 50):
-        self.api, self.account, self.baseline = api, account, baseline
+class QuotaTelemetry:
+    """Refresh real quota during work; a change is not a reason to stop a batch."""
+    def __init__(self, api, account, emit, *, seconds=60, every_files=100):
+        self.api, self.account, self.emit = api, account, emit
         self.seconds, self.every_files = seconds, every_files
         self._lock = threading.Lock()
-        self._last = time.monotonic()
-        self._completed = 0
-        self.last_quota: dict[str, int] | None = None
+        self._last, self._completed = time.monotonic(), 0
+        self.last_quota = None
 
-    def completed(self) -> None:
+    def completed(self):
         with self._lock:
             self._completed += 1
 
-    def check(self, *, force: bool = False) -> None:
+    def check(self, *, force=False):
         with self._lock:
             if not force and self._completed < self.every_files and time.monotonic() - self._last < self.seconds:
                 return
-            self.api.require_account(self.account)
-            quota = self.api.quota()
-            self.last_quota = quota
-            if quota["used_bytes"] != self.baseline:
-                raise QuotaChanged("Использование квоты Облака изменилось. Загрузка приостановлена; очередь сохранена.")
             self._last, self._completed = time.monotonic(), 0
+            try:
+                self.last_quota = self.api.quota()
+            except (AuthError, ProtocolError, TransportError) as error:
+                if is_auth_failure(error):
+                    raise
+                self.emit("quota_warning", {"reason": "Не удалось обновить квоту; задачи продолжаются."})
 
 
 def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
         emit: Callable[[str, dict], None] | None = None, file_progress: bool = False,
-        require_probe: bool = True, task_scope: TaskScope | None = None) -> dict[str, Any]:
+        regular_policy: str = "skip", unexpected_unlimited_action: str = "trash",
+        job_id: int | None = None, root_ids=None, task_scope: TaskScope | None = None,
+        priority_job: Callable[[], int | None] | None = None,
+        quota_budget: QuotaBudget | None = None) -> dict[str, Any]:
     if not 1 <= workers <= 16 or not 1 <= max_attempts <= 20:
         raise ValueError("workers must be 1..16, max_attempts 1..20")
-    if type(require_probe) is not bool:
-        raise ValueError("require_probe must be a boolean")
+    if regular_policy not in {"skip", "upload"} or unexpected_unlimited_action not in {"trash", "keep"}:
+        raise ValueError("Некорректная политика хранения.")
+    if job_id is not None and (type(job_id) is not int or job_id <= 0):
+        raise ValueError("Некорректный номер задачи.")
     emit = emit or (lambda event, data: None)
     started = time.time()
     errors: list[str] = []
     error_lock = threading.Lock()
-    needs_recheck = False
-    recheck_reason = ""
     auth_required = False
 
-    def stop_with(error: Exception, *, invalidate_probe: bool = False) -> None:
-        nonlocal needs_recheck, recheck_reason, auth_required
+    def stop_with(error):
+        nonlocal auth_required
         with error_lock:
-            # Another worker may already have recorded a different fatal
-            # failure. Never lose a later, explicit authentication rejection.
             auth_required = auth_required or is_auth_failure(error)
-            needs_recheck = needs_recheck or invalidate_probe
-            if invalidate_probe and not recheck_reason:
-                recheck_reason = str(error)
-            if not errors:
+            if len(errors) < 100:
                 errors.append(str(error))
         api.stop.set()
 
     with queue.exclusive_run():
         queue.recover_running()
-        require_scanned(queue)
-        skipped = queue.skip_large_disabled()
-        if skipped:
-            emit("large_files_skipped", {"count": skipped})
-        require_probe = require_probe and queue.stats(storage_mode="unlimited")["total"] > 0
+        require_scanned(queue, root_ids=root_ids)
+        policy = queue.apply_regular_policy(upload=regular_policy == "upload", root_ids=root_ids)
+        if policy.get("skipped"):
+            emit("regular_files_skipped", {"count": policy["skipped"]})
         account = api.require_account(queue.account_id)
         queue.bind_account(account.email)
-        evidence = queue.get_metadata("probe", {})
-        evidence = evidence if isinstance(evidence, dict) else {}
-        if require_probe:
-            finished_at = evidence.get("finished_at")
-            valid_timestamp = (isinstance(finished_at, (int, float)) and not isinstance(finished_at, bool)
-                               and math.isfinite(finished_at) and 0 <= time.time() - finished_at <= 86400)
-            if (evidence.get("result") != "provisional_pass"
-                    or evidence.get("protocol") != PROTOCOL_VERSION or evidence.get("account") != account.email
-                    or evidence.get("destination") != queue.destination
-                    or not valid_timestamp or not isinstance(evidence.get("before"), dict)
-                    or not isinstance(evidence["before"].get("used_bytes"), int)
-                    or isinstance(evidence["before"].get("used_bytes"), bool)):
-                raise ProbeRequired("Сначала выполните probe: требуется успешная предварительная проверка в этом аккаунте за последние 24 часа.")
-        # Skipping the settling probe does not disable per-file confirmation or
-        # quota monitoring. Use a fresh baseline without inventing probe proof.
-        baseline = api.quota()["used_bytes"]
-        if require_probe and baseline != evidence["before"]["used_bytes"]:
-            raise ProbeRequired("После probe квота изменилась. Нужна новая проверка перед массовой загрузкой.")
-        guard = QuotaGuard(api, account.email, baseline)
+        telemetry = QuotaTelemetry(api, account.email, emit)
+        telemetry.check(force=True)
+        budget = quota_budget if quota_budget is not None else QuotaBudget()
+        budget.prime(telemetry.last_quota)
 
-        def worker() -> None:
+        def worker():
             local = Queue(queue.path, destination=queue.destination, account_id=account.email)
             try:
                 while not api.stop.is_set():
                     try:
-                        guard.check()
+                        telemetry.check()
                     except Cancelled:
                         api.stop.set()
                         return
-                    except (ProtocolError, AuthError, TransportError) as error:
-                        stop_with(error, invalidate_probe=isinstance(error, (ProtocolError, AuthError)))
+                    except (AuthError, ProtocolError) as error:
+                        stop_with(error)
                         return
-                    job = local.claim(max_attempts=max_attempts, storage_mode="unlimited", stop=api.stop)
+                    selected = job_id
+                    if selected is None and priority_job is not None:
+                        selected = priority_job()
+                    mode = "unlimited" if regular_policy == "skip" else None
+                    job = local.claim(max_attempts=max_attempts, storage_mode=mode,
+                                      stop=api.stop, job_id=selected, root_ids=root_ids)
                     if job is None:
-                        if api.stop.is_set():
+                        if selected is not None and job_id is None:
+                            continue  # An already claimed/paused priority ID does not stop other tasks.
+                        if api.stop.is_set() or job_id is not None:
                             return
-                        state = local.stats(storage_mode="unlimited")
-                        next_retry = state.get("next_retry_at")
+                        next_retry = local.stats(storage_mode=mode, root_ids=root_ids).get("next_retry_at")
                         if next_retry is None:
                             return
                         api.stop.wait(max(0.1, min(10, next_retry - time.time())))
                         continue
                     try:
-                        result = process_job(local, api, job, emit=emit if file_progress else None, task_scope=task_scope)
-                        guard.completed()
-                        emit("uploaded", {"job_id": job.id, "path": job.remote_path,
-                                          "size": job.size, "recovered_commit": result["recovered_commit"]})
-                    except (UnsupportedPhoto,) as error:
+                        result = process_job(local, api, job, emit=emit if file_progress else None,
+                            task_scope=task_scope, unexpected_unlimited_action=unexpected_unlimited_action, quota_budget=budget)
+                        telemetry.completed()
+                        emit("uploaded", {"job_id": job.id, "path": job.remote_path, "size": job.size,
+                            "storage_mode": result["storage_mode"], "recovered_commit": result["recovered_commit"]})
+                    except TaskCancelled:
+                        local.release(job, "Task paused or removed; preserve any remote commit")
+                        emit("task_cancelled", {"job_id": job.id})
+                    except Cancelled:
+                        local.release(job, "Interrupted; safe to resume")
+                        api.stop.set()
+                        return
+                    except FileChangedError as error:
+                        emit("file_changed", {"job_id": job.id, "reason": str(error)})
+                    except UnsupportedPhoto as error:
                         local.mark_skipped(job, str(error))
                         emit("skipped", {"job_id": job.id, "reason": str(error)})
                     except RemoteError as error:
-                        if error.fatal:
-                            # Record the global cause before a database write
-                            # or UI observer could itself fail. In particular,
-                            # that secondary error must not erase auth_required.
-                            stop_with(error, invalidate_probe=True)
-                        if error.unsupported:
-                            local.mark_skipped(job, str(error))
-                        elif error.retryable and job.attempts < max_attempts:
-                            delay = max(error.retry_after or 0, min(900, 2 ** job.attempts + random.random() * 3))
-                            local.mark_failed(job, str(error), retry_delay=delay)
-                        else:
-                            local.mark_failed(job, str(error), retry_delay=None)
+                        if error.code == "CONDITION/OVERQUOTA":
+                            budget.exhausted()
+                        if is_auth_failure(error):
+                            stop_with(error)
+                        delay = (max(error.retry_after or 0, min(900, 2 ** job.attempts + random.random() * 3))
+                                 if error.retryable and job.attempts < max_attempts and not is_auth_failure(error) else None)
+                        local.mark_failed(job, str(error), retry_delay=delay)
                         emit("remote_error", {"job_id": job.id, "status": error.status, "code": error.code})
                     except TransportError as error:
                         if api.stop.is_set():
@@ -438,42 +404,28 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                         delay = min(900, 2 ** job.attempts + random.random() * 3) if job.attempts < max_attempts else None
                         local.mark_failed(job, str(error), retry_delay=delay)
                         emit("retry", {"job_id": job.id, "retry_in": delay})
-                    except (SourceChanged, SourceReadError, RemoteConflict, FileVerificationError, UnlimitedNotConfirmed) as error:
+                    except (ProtocolError, AuthError, SourceReadError) as error:
+                        if is_auth_failure(error):
+                            stop_with(error)
                         local.mark_failed(job, str(error), retry_delay=None)
                         emit("file_error", {"job_id": job.id, "reason": str(error)})
-                        if isinstance(error, UnlimitedNotConfirmed):
-                            try:
-                                guard.check(force=True)
-                            except Cancelled:
-                                api.stop.set()
-                                return
-                            except (ProtocolError, AuthError, TransportError) as guard_error:
-                                stop_with(guard_error, invalidate_probe=isinstance(guard_error, (ProtocolError, AuthError)))
-                                return
-                    except FileChangedError as error:
-                        # Queue already invalidated this claim and preserved history.
-                        emit("file_changed", {"job_id": job.id, "reason": str(error)})
-                    except TaskCancelled:
-                        local.release(job, "Task paused or removed; preserve any remote commit")
-                        emit("task_cancelled", {"job_id": job.id})
-                    except Cancelled:
-                        local.release(job, "Interrupted; safe to resume")
-                        api.stop.set()
-                        return
-                    except (ProtocolError, AuthError) as error:
-                        stop_with(error, invalidate_probe=True)
-                        local.mark_failed(job, str(error), retry_delay=None)
                     except (QueueError, sqlite3.Error) as error:
                         stop_with(ProtocolError(f"Ошибка сохранения очереди: {type(error).__name__}. Загрузка остановлена."))
                     except Exception as error:
-                        # Never put arbitrary exception reprs/HTTP payloads in logs.
-                        stop_with(ProtocolError(f"Локальная ошибка {type(error).__name__}. Очередь сохранена."))
+                        # Unknown file failures are isolated too. Never log arbitrary
+                        # exception payloads, network bodies or credentials.
+                        message = f"Локальная ошибка задачи: {type(error).__name__}."
+                        local.mark_failed(job, message, retry_delay=None)
+                        emit("file_error", {"job_id": job.id, "reason": message})
+                    if job_id is not None:
+                        return  # Exactly one selected task; never drain unrelated work.
             finally:
                 local.close()
                 api.close_thread()
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="photo-upload")
-        futures = [executor.submit(worker) for _ in range(workers)]
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1 if job_id else workers,
+                                                          thread_name_prefix="media-upload")
+        futures = [executor.submit(worker) for _ in range(1 if job_id else workers)]
         try:
             while True:
                 _, pending = concurrent.futures.wait(futures, timeout=10)
@@ -486,32 +438,27 @@ def run(queue: Queue, api: CloudAPI, *, workers: int = 4, max_attempts: int = 5,
                 except Cancelled:
                     api.stop.set()
                 except Exception as error:
-                    stop_with(ProtocolError(f"Локальная ошибка worker: {type(error).__name__}. Очередь сохранена."))
+                    stop_with(ProtocolError(f"Ошибка сохранения/исполнения очереди: {type(error).__name__}."))
         except KeyboardInterrupt:
             api.stop.set()
-            errors.append("Остановлено пользователем. Повторный run продолжит очередь.")
+            errors.append("Остановлено пользователем. Повторный запуск продолжит очередь.")
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
         if not api.stop.is_set():
             try:
-                guard.check(force=True)
+                telemetry.check(force=True)
             except Cancelled:
                 api.stop.set()
-            except (ProtocolError, AuthError, TransportError) as error:
-                stop_with(error, invalidate_probe=isinstance(error, (ProtocolError, AuthError)))
-        final_stats = queue.stats()
-        outcome = ("stopped" if api.stop.is_set() else
+            except (AuthError, ProtocolError) as error:
+                stop_with(error)
+        final_stats = queue.stats(root_ids=root_ids)
+        outcome = ("stopped" if api.stop.is_set() else "single_finished" if job_id else
                    "paused_tasks" if final_stats.get("paused", 0) and final_stats.get("remaining") == 0 else
                    "finished_with_errors" if final_stats["failed"] or final_stats["pending"] or final_stats["running"] else
                    "finished_with_skips" if final_stats["skipped"] else "complete")
         result = {"started_at": started, "finished_at": time.time(), "stopped": api.stop.is_set(),
-                  "outcome": outcome, "errors": errors, "stats": final_stats, "baseline_cloud_bytes": baseline,
-                  "last_quota": guard.last_quota, "protocol": PROTOCOL_VERSION,
-                  "preflight_check": require_probe, "auth_required": auth_required}
+                  "outcome": outcome, "errors": errors, "stats": final_stats,
+                  "last_quota": telemetry.last_quota, "protocol": PROTOCOL_VERSION,
+                  "auth_required": auth_required, "job_id": job_id}
         queue.set_metadata("last_run", result)
-        if needs_recheck:
-            invalid = dict(evidence)
-            invalid["result"] = "needs_recheck"
-            invalid["reason"] = recheck_reason
-            queue.set_metadata("probe", invalid)
         return result
